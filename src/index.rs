@@ -1,0 +1,111 @@
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+
+const MAGIC: &[u8; 8] = b"FSEARCH\0";
+const VERSION: u32 = 1;
+
+pub fn default_cache_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(".cache")
+        });
+    base.join("fsearch").join("index.bin")
+}
+
+pub fn save(paths: &[String], path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+        w.write_all(MAGIC)?;
+        w.write_all(&VERSION.to_le_bytes())?;
+        w.write_all(&(paths.len() as u64).to_le_bytes())?;
+        for p in paths {
+            w.write_all(&(p.len() as u32).to_le_bytes())?;
+            w.write_all(p.as_bytes())?;
+        }
+        w.flush()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+pub fn load(path: &Path) -> Option<Vec<String>> {
+    let mut r = BufReader::new(std::fs::File::open(path).ok()?);
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic).ok()?;
+    if &magic != MAGIC {
+        return None;
+    }
+    let mut u32buf = [0u8; 4];
+    r.read_exact(&mut u32buf).ok()?;
+    if u32::from_le_bytes(u32buf) != VERSION {
+        return None;
+    }
+    let mut u64buf = [0u8; 8];
+    r.read_exact(&mut u64buf).ok()?;
+    let count = u64::from_le_bytes(u64buf) as usize;
+    let mut paths = Vec::with_capacity(count.min(4_000_000));
+    for _ in 0..count {
+        r.read_exact(&mut u32buf).ok()?;
+        let len = u32::from_le_bytes(u32buf) as usize;
+        let mut bytes = vec![0u8; len];
+        r.read_exact(&mut bytes).ok()?;
+        paths.push(String::from_utf8(bytes).ok()?);
+    }
+    Some(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        let paths = vec![
+            "/a/b.txt".to_string(),
+            "/c/déjà vu.md".to_string(),
+            String::new(),
+        ];
+        save(&paths, &file).unwrap();
+        assert_eq!(load(&file).unwrap(), paths);
+    }
+
+    #[test]
+    fn missing_file_is_none() {
+        assert!(load(std::path::Path::new("/nonexistent/index.bin")).is_none());
+    }
+
+    #[test]
+    fn corrupt_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        std::fs::write(&file, b"garbage").unwrap();
+        assert!(load(&file).is_none());
+    }
+
+    #[test]
+    fn truncated_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        save(&["/a/very/long/path/to/a/file.txt".to_string()], &file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::write(&file, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(load(&file).is_none());
+    }
+
+    #[test]
+    fn version_mismatch_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        save(&["/a".to_string()], &file).unwrap();
+        let mut bytes = std::fs::read(&file).unwrap();
+        bytes[8] = 99; // stomp the version field
+        std::fs::write(&file, &bytes).unwrap();
+        assert!(load(&file).is_none());
+    }
+}
