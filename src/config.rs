@@ -5,7 +5,9 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".git",
     "node_modules",
     "target",
+    ".bun",
     ".cache",
+    ".cargo",
     ".npm",
     ".Trash",
     ".venv",
@@ -13,6 +15,11 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "Library/Caches",
     "Library/Containers",
     "Library/Application Support/MobileSync",
+    // cloud-synced trees are excluded by default; remove these entries from
+    // config.toml to opt in (iCloud Drive = Mobile Documents; Box/Dropbox/
+    // Google Drive/OneDrive live under Cloud Storage)
+    "Library/Mobile Documents",
+    "Library/Cloud Storage",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +70,8 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # fsearch configuration
 # roots: directories to index (~ expands to your home directory)
 # excludes: directory or file names/paths never indexed
+#   cloud drives are excluded by default; delete \"Library/Mobile Documents\"
+#   (iCloud) or \"Library/Cloud Storage\" (Box, Dropbox, ...) to index them
 # max_content_filesize: content search skips files larger than this (bytes)
 ";
 
@@ -102,6 +111,19 @@ mod tests {
         assert_eq!(c.roots, vec![dirs::home_dir().unwrap()]);
         assert!(c.excludes.iter().any(|e| e == ".git"));
         assert_eq!(c.max_content_filesize, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn package_caches_and_cloud_drives_excluded_by_default() {
+        let c = Config::default();
+        for e in [
+            ".cargo",
+            ".bun",
+            "Library/Mobile Documents",
+            "Library/Cloud Storage",
+        ] {
+            assert!(c.excludes.iter().any(|x| x == e), "missing exclude: {e}");
+        }
     }
 
     #[test]
