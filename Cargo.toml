@@ -1,0 +1,26 @@
+[package]
+name = "fsearch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast Alfred-style file search for the terminal"
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+nucleo-matcher = "0.3"
+ratatui = "0.30"
+rayon = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
