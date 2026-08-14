@@ -95,3 +95,39 @@ fn content_search_typed_char_by_char() {
     }
     wait_until(&mut engine, Duration::from_secs(5), |e| !e.results().is_empty());
 }
+
+#[test]
+fn results_sorted_by_last_modified_desc() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let hour = Duration::from_secs(3600);
+    let now = std::time::SystemTime::now();
+    for (name, age) in [("old.txt", 3), ("newest.txt", 0), ("mid.txt", 1)] {
+        let path = p.join(name);
+        std::fs::write(&path, "x\n").unwrap();
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(now - age * hour).unwrap();
+    }
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(config_for(p), cache_dir.path().join("index.bin"));
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().indexed == 3
+    });
+
+    // empty query: newest first
+    engine.set_query("", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| e.results().len() == 3);
+    let order: Vec<&str> = engine
+        .results()
+        .iter()
+        .map(|r| r.path.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(order, ["newest.txt", "mid.txt", "old.txt"]);
+
+    // regex matches too
+    engine.set_query(r"\.txt$", true);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 3 && e.results()[0].path.ends_with("newest.txt")
+    });
+    assert!(engine.results()[2].path.ends_with("old.txt"));
+}

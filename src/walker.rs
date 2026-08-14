@@ -19,7 +19,8 @@ pub fn build_exclude_set(excludes: &[String]) -> anyhow::Result<GlobSet> {
     Ok(b.build()?)
 }
 
-pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<String>) -> WalkStats {
+/// Sends `(path, mtime)` pairs; mtime is seconds since the Unix epoch (0 when unavailable).
+pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, i64)>) -> WalkStats {
     let mut roots = roots.iter().filter(|r| r.exists());
     let Some(first) = roots.next() else {
         return WalkStats::default();
@@ -46,7 +47,13 @@ pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<String>) -> WalkS
             match entry {
                 Ok(e) if e.file_type().is_some_and(|t| t.is_file()) => {
                     files.fetch_add(1, Ordering::Relaxed);
-                    if tx.send(e.path().to_string_lossy().into_owned()).is_err() {
+                    let mtime = e
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs() as i64);
+                    if tx.send((e.path().to_string_lossy().into_owned(), mtime)).is_err() {
                         return WalkState::Quit;
                     }
                 }
@@ -91,9 +98,22 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let stats = walk(&[PathBuf::from(root)], &set, &tx);
         drop(tx);
-        let paths: Vec<String> = rx.into_iter().collect();
+        let paths: Vec<String> = rx.into_iter().map(|(p, _)| p).collect();
         assert_eq!(stats.files as usize, paths.len());
         paths
+    }
+
+    #[test]
+    fn emits_plausible_mtimes() {
+        let dir = tree();
+        let set = build_exclude_set(&[]).unwrap();
+        let (tx, rx) = mpsc::channel();
+        walk(&[PathBuf::from(dir.path())], &set, &tx);
+        drop(tx);
+        let entries: Vec<(String, i64)> = rx.into_iter().collect();
+        assert!(!entries.is_empty());
+        // every freshly created file has an mtime after 2020-01-01
+        assert!(entries.iter().all(|(_, m)| *m > 1_577_836_800));
     }
 
     #[test]
