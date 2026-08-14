@@ -38,21 +38,26 @@ fn run_ui() {
 fn edit_config() {
     load_config(); // ensures the file exists with defaults
     let path = config::default_config_path();
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .ok()
-        .filter(|e| !e.is_empty());
-    let Some(editor) = editor else {
-        println!("{}", path.display());
-        return;
-    };
-    match std::process::Command::new(&editor).arg(&path).status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("fsearch: failed to run {editor}: {e}");
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    match cli::choose_config_open(visual.as_deref(), editor.as_deref()) {
+        cli::ConfigOpen::Editor(editor) => {
+            match std::process::Command::new(&editor).arg(&path).status() {
+                Ok(s) if s.success() => {}
+                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Err(e) => {
+                    eprintln!("fsearch: failed to run {editor}: {e}");
+                    println!("{}", path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+        cli::ConfigOpen::Reveal => {
             println!("{}", path.display());
-            std::process::exit(1);
+            if let Err(e) = fsearch::actions::reveal(path.to_string_lossy().as_ref()) {
+                eprintln!("fsearch: failed to reveal in Finder: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

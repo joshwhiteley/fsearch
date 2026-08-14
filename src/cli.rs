@@ -13,7 +13,8 @@ fsearch — fast Alfred-style file search for the terminal
 
 usage:
   fsearch              launch the interactive search ui
-  fsearch --config     open the config file in $EDITOR (or print its path)
+  fsearch --config     open the config file in $VISUAL/$EDITOR,
+                       or reveal it in Finder when neither is set
   fsearch --reindex    rebuild the file index now
   fsearch --help       show this help
   fsearch --version    print the version
@@ -36,6 +37,21 @@ files:
   config               ~/.config/fsearch/config.toml
   index cache          ~/.cache/fsearch/index.bin
 ";
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigOpen {
+    Editor(String),
+    Reveal,
+}
+
+/// $VISUAL wins over $EDITOR; with neither set, reveal the file in Finder.
+pub fn choose_config_open(visual: Option<&str>, editor: Option<&str>) -> ConfigOpen {
+    visual
+        .into_iter()
+        .chain(editor)
+        .find(|e| !e.is_empty())
+        .map_or(ConfigOpen::Reveal, |e| ConfigOpen::Editor(e.to_string()))
+}
 
 /// Parses argv (without the program name) into a command.
 pub fn parse(args: &[String]) -> Command {
@@ -99,6 +115,21 @@ mod tests {
             parse_strs(&["--help", "x"]),
             Command::Unknown("x".to_string())
         );
+    }
+
+    #[test]
+    fn config_opens_visual_then_editor_then_finder() {
+        assert_eq!(
+            choose_config_open(Some("code -w"), Some("vim")),
+            ConfigOpen::Editor("code -w".to_string())
+        );
+        assert_eq!(
+            choose_config_open(None, Some("vim")),
+            ConfigOpen::Editor("vim".to_string())
+        );
+        assert_eq!(choose_config_open(None, None), ConfigOpen::Reveal);
+        // empty strings count as unset
+        assert_eq!(choose_config_open(Some(""), Some("")), ConfigOpen::Reveal);
     }
 
     #[test]

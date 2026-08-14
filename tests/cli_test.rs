@@ -36,7 +36,10 @@ fn unknown_flag_fails_with_help() {
 }
 
 #[test]
-fn config_without_editor_prints_the_path_and_creates_it() {
+fn config_runs_the_editor_and_creates_the_file() {
+    // /usr/bin/true stands in for an editor: accepts the path arg, exits 0.
+    // (The no-editor branch reveals the file in Finder — covered by a unit
+    // test on cli::choose_config_open so test runs don't open real windows.)
     let dir = tempfile::tempdir().unwrap();
     let xdg = dir.path().join("xdg");
     let out = fsearch(
@@ -44,14 +47,26 @@ fn config_without_editor_prints_the_path_and_creates_it() {
         &[
             ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
             ("VISUAL", ""),
-            ("EDITOR", ""),
+            ("EDITOR", "/usr/bin/true"),
         ],
     );
     assert!(out.status.success());
-    let printed = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    let expected = xdg.join("fsearch").join("config.toml");
-    assert_eq!(printed, expected.to_str().unwrap());
-    assert!(expected.exists());
+    assert!(xdg.join("fsearch").join("config.toml").exists());
+}
+
+#[test]
+fn config_propagates_editor_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let xdg = dir.path().join("xdg");
+    let out = fsearch(
+        &["--config"],
+        &[
+            ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+            ("VISUAL", "/usr/bin/false"),
+            ("EDITOR", ""),
+        ],
+    );
+    assert!(!out.status.success());
 }
 
 #[test]
