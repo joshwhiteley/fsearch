@@ -77,3 +77,21 @@ fn end_to_end_filename_and_content_search() {
     let mut engine2 = Engine::new(config_for(tree.path()), cache);
     wait_until(&mut engine2, Duration::from_secs(2), |e| e.status().indexed == 2);
 }
+
+#[test]
+fn content_search_typed_char_by_char() {
+    let tree = make_tree();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(config_for(tree.path()), cache_dir.path().join("index.bin"));
+    wait_until(&mut engine, Duration::from_secs(5), |e| !e.status().indexing);
+
+    // simulate the TUI: one set_query per keystroke, ticking in between
+    let input = "> needle";
+    for end in 1..=input.len() {
+        engine.set_query(&input[..end], false);
+        engine.tick();
+        std::thread::sleep(Duration::from_millis(30));
+        engine.tick();
+    }
+    wait_until(&mut engine, Duration::from_secs(5), |e| !e.results().is_empty());
+}
