@@ -115,8 +115,6 @@ impl Engine {
             let walk_thread = std::thread::spawn(move || walker::walk(&roots, &excludes, &path_tx));
             // the index is ordered newest-first, so head-of-list results,
             // regex hits (index order) and fuzzy score ties all favor recency
-            let by_mtime_desc =
-                |a: &(String, i64), b: &(String, i64)| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0));
             let mut fresh: Vec<(String, i64)> = Vec::new();
             let mut last_publish = Instant::now();
             for entry in path_rx {
@@ -127,7 +125,7 @@ impl Engine {
                 {
                     last_publish = Instant::now();
                     let mut snapshot = fresh.clone();
-                    snapshot.sort_unstable_by(by_mtime_desc);
+                    snapshot.sort_unstable_by(walker::mtime_cmp);
                     let _ = indexer_tx.send(Msg::IndexSnapshot {
                         paths: Arc::new(snapshot.into_iter().map(|(p, _)| p).collect()),
                         indexing: true,
@@ -135,7 +133,7 @@ impl Engine {
                 }
             }
             let _ = walk_thread.join();
-            fresh.sort_unstable_by(by_mtime_desc);
+            fresh.sort_unstable_by(walker::mtime_cmp);
             let paths = Arc::new(fresh.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
             let _ = indexer_tx.send(Msg::IndexSnapshot { paths: paths.clone(), indexing: false });
             let _ = index::save(&paths, &cache_path);

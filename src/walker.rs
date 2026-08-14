@@ -19,6 +19,21 @@ pub fn build_exclude_set(excludes: &[String]) -> anyhow::Result<GlobSet> {
     Ok(b.build()?)
 }
 
+/// Newest first; equal mtimes fall back to path order for determinism.
+pub fn mtime_cmp(a: &(String, i64), b: &(String, i64)) -> std::cmp::Ordering {
+    b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+}
+
+/// Walks the roots and returns all file paths ordered newest-first.
+pub fn collect_sorted(roots: &[PathBuf], excludes: &GlobSet) -> (Vec<String>, WalkStats) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stats = walk(roots, excludes, &tx);
+    drop(tx);
+    let mut entries: Vec<(String, i64)> = rx.into_iter().collect();
+    entries.sort_unstable_by(mtime_cmp);
+    (entries.into_iter().map(|(p, _)| p).collect(), stats)
+}
+
 /// Sends `(path, mtime)` pairs; mtime is seconds since the Unix epoch (0 when unavailable).
 pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, i64)>) -> WalkStats {
     let mut roots = roots.iter().filter(|r| r.exists());
@@ -101,6 +116,24 @@ mod tests {
         let paths: Vec<String> = rx.into_iter().map(|(p, _)| p).collect();
         assert_eq!(stats.files as usize, paths.len());
         paths
+    }
+
+    #[test]
+    fn collect_sorted_returns_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+        let now = std::time::SystemTime::now();
+        for (name, age) in [("old.txt", 2), ("new.txt", 0)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "x").unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(now - age * hour).unwrap();
+        }
+        let set = build_exclude_set(&[]).unwrap();
+        let (paths, stats) = collect_sorted(&[dir.path().to_path_buf()], &set);
+        assert_eq!(stats.files, 2);
+        assert!(paths[0].ends_with("new.txt"));
+        assert!(paths[1].ends_with("old.txt"));
     }
 
     #[test]
