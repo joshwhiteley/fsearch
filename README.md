@@ -21,7 +21,8 @@ cargo build --release
 
 ```
 fsearch              launch the interactive search ui
-fsearch --config     open the config file in $EDITOR (or print its path)
+fsearch --config     open the config file in $VISUAL/$EDITOR, or reveal
+                     it in Finder when neither is set
 fsearch --reindex    rebuild the file index now
 fsearch --help       show help
 fsearch --version    print the version
