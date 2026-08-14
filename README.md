@@ -29,6 +29,10 @@ Run `fsearch` and start typing:
 Both filename and content search are smart-case: all-lowercase queries are
 case-insensitive, any uppercase makes them case-sensitive.
 
+Results favor recency: an empty query and regex matches list files newest
+first (by modification time), and fuzzy matches use recency to break ranking
+ties.
+
 The first launch walks your home directory and builds the index; later
 launches load the cached index instantly and refresh it in the background.
 
@@ -54,9 +58,10 @@ launches load the cached index instantly and refresh it in the background.
 roots = ["~"]
 
 # directory or file names/paths never indexed
-excludes = [".git", "node_modules", "target", ".cache", ".npm", ".Trash",
-            ".venv", "__pycache__", "Library/Caches", "Library/Containers",
-            "Library/Application Support/MobileSync"]
+excludes = [".git", "node_modules", "target", ".bun", ".cache", ".cargo",
+            ".npm", ".Trash", ".venv", "__pycache__", "Library/Caches",
+            "Library/Containers", "Library/Application Support/MobileSync",
+            "Library/Mobile Documents", "Library/Cloud Storage"]
 
 # content search skips files larger than this (bytes)
 max_content_filesize = 2097152
@@ -64,6 +69,11 @@ max_content_filesize = 2097152
 
 Hidden files are indexed; `.gitignore` files are deliberately ignored — if
 it's on disk, you can find it.
+
+Cloud-synced trees are excluded by default so the walker never touches
+placeholder files. To search them, delete `"Library/Mobile Documents"`
+(iCloud Drive) or `"Library/Cloud Storage"` (Box, Dropbox, Google Drive,
+OneDrive) from `excludes`.
 
 ## How it works
 
