@@ -19,6 +19,14 @@ cargo build --release
 
 ## Usage
 
+```
+fsearch              launch the interactive search ui
+fsearch --config     open the config file in $EDITOR (or print its path)
+fsearch --reindex    rebuild the file index now
+fsearch --help       show help
+fsearch --version    print the version
+```
+
 Run `fsearch` and start typing:
 
 - **Type plainly** — fuzzy match against file names and paths (like fzf).
