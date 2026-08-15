@@ -5,6 +5,7 @@ pub enum Command {
     Version,
     Config,
     Reindex,
+    Doctor,
     Print(String),
     Unknown(String),
 }
@@ -19,6 +20,7 @@ usage:
   fsearch --reindex    rebuild the file index now
   fsearch -p QUERY     print matches to stdout (no ui); \"> pattern\"
                        searches file contents
+  fsearch --doctor     print what the terminal probe detected
   fsearch --help       show this help
   fsearch --version    print the version
 
@@ -75,6 +77,7 @@ pub fn parse(args: &[String]) -> Command {
             "--version" | "-V" => Command::Version,
             "--config" => Command::Config,
             "--reindex" => Command::Reindex,
+            "--doctor" => Command::Doctor,
             other => return Command::Unknown(other.to_string()),
         };
         if cmd != Command::Run {

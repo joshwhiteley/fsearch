@@ -334,19 +334,91 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(status, area);
 }
 
-pub fn run(engine: Engine) -> anyhow::Result<()> {
-    // query the terminal background, graphics protocol, and warm syntax
-    // dumps — all before raw mode / the event loop consumes stdin
+/// A generous cell-size guess for terminals that support a graphics protocol
+/// but answer no font-size query (multiplexers, notably). Kitty/iTerm2 scale
+/// the image into the target cell rect, so overshooting just supersamples.
+const GUESSED_FONT_SIZE: ratatui_image::FontSize = ratatui_image::FontSize {
+    width: 16,
+    height: 32,
+};
+
+// from_fontsize is deprecated in favor of auto-detection, but this path
+// exists precisely because auto-detection fails on terminals that ACK a
+// graphics protocol while ignoring font-size queries
+#[allow(deprecated)]
+fn forced_picker(protocol: ratatui_image::picker::ProtocolType) -> Picker {
+    let mut picker = Picker::from_fontsize(GUESSED_FONT_SIZE);
+    picker.set_protocol_type(protocol);
+    picker
+}
+
+/// Asks the terminal directly whether it speaks the Kitty graphics protocol.
+/// Some terminals (e.g. the Herdr multiplexer) ACK Kitty graphics but ignore
+/// font-size queries, which makes ratatui-image's own detection give up and
+/// fall back to halfblocks. Only call on a terminal that answers queries.
+fn kitty_ack_probe() -> bool {
+    use ratatui::crossterm::terminal;
+    use std::io::{Read, Write};
+    if terminal::enable_raw_mode().is_err() {
+        return false;
+    }
+    let mut stdout = std::io::stdout();
+    // kitty graphics query, then DA1 (which every real terminal answers)
+    let _ = stdout.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c");
+    let _ = stdout.flush();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut chunk = [0u8; 256];
+        let mut reply: Vec<u8> = Vec::new();
+        loop {
+            match stdin.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    reply.extend_from_slice(&chunk[..n]);
+                    // DA1 terminates the exchange: ESC [ ? ... c
+                    if reply.windows(2).any(|w| w == b"[?") && reply.ends_with(b"c") {
+                        let _ = tx.send(reply);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let reply = rx
+        .recv_timeout(Duration::from_millis(800))
+        .unwrap_or_default();
+    let _ = terminal::disable_raw_mode();
+    reply.windows(2).any(|w| w == b"_G")
+}
+
+/// Runs the full pre-init terminal probe: appearance, responsiveness, and
+/// graphics picker selection (honoring `FSEARCH_IMAGES=off|halfblocks|
+/// kitty|iterm2`). Performs stdio queries — call before raw mode / the
+/// event loop consumes stdin.
+pub fn probe_terminal() -> (highlight::TerminalTraits, Option<Picker>) {
+    use ratatui_image::picker::ProtocolType;
     let traits = highlight::detect_terminal();
-    // FSEARCH_IMAGES=halfblocks|off overrides graphics-protocol detection
     let picker = match std::env::var("FSEARCH_IMAGES").as_deref() {
         Ok("off") => None,
         Ok("halfblocks") => Some(Picker::halfblocks()),
+        Ok("kitty") => Some(forced_picker(ProtocolType::Kitty)),
+        Ok("iterm2") => Some(forced_picker(ProtocolType::Iterm2)),
         _ if traits.responsive => {
-            Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
+            let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+            if picker.protocol_type() == ProtocolType::Halfblocks && kitty_ack_probe() {
+                Some(forced_picker(ProtocolType::Kitty))
+            } else {
+                Some(picker)
+            }
         }
         _ => Some(Picker::halfblocks()),
     };
+    (traits, picker)
+}
+
+pub fn run(engine: Engine) -> anyhow::Result<()> {
+    let (traits, picker) = probe_terminal();
     highlight::preload();
     let mut terminal = ratatui::init(); // installs a terminal-restoring panic hook
     let mut app = App::new(engine);

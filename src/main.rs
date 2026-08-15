@@ -9,6 +9,7 @@ fn main() {
         Command::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Command::Config => edit_config(),
         Command::Reindex => reindex(),
+        Command::Doctor => doctor(),
         Command::Print(query) => print_search(&query),
         Command::Unknown(arg) => {
             eprintln!("fsearch: unexpected argument {arg:?}\n");
@@ -25,6 +26,22 @@ fn load_config() -> config::Config {
             eprintln!("fsearch: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Prints what the terminal probe detects — for debugging preview quality
+/// in multiplexers and unusual terminals.
+fn doctor() {
+    let (traits, picker) = tui::probe_terminal();
+    println!("terminal answers queries: {}", traits.responsive);
+    println!("background: {:?}", traits.appearance);
+    match picker {
+        Some(p) => {
+            let f = p.font_size();
+            println!("image protocol: {:?}", p.protocol_type());
+            println!("cell size: {}x{} px", f.width, f.height);
+        }
+        None => println!("image previews: off (FSEARCH_IMAGES=off)"),
     }
 }
 

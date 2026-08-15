@@ -76,8 +76,10 @@ excluded folders, content-search size limit. Cloud drives (iCloud, Dropbox,
 Box…) are skipped by default; remove them from `excludes` to index them.
 `fsearch --reindex` rebuilds the index after changes.
 
-Set `FSEARCH_IMAGES=halfblocks` to force cell-based image rendering, or
-`FSEARCH_IMAGES=off` to disable image previews.
+Image previews auto-negotiate the best protocol, including inside
+multiplexers that support Kitty graphics but ignore font-size queries.
+`fsearch --doctor` shows what was detected; `FSEARCH_IMAGES` overrides it
+(`kitty`, `iterm2`, `halfblocks`, or `off`).
 
 ## How it works
 
