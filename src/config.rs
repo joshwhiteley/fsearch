@@ -10,16 +10,24 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".cargo",
     ".npm",
     ".Trash",
+    ".DS_Store",
     ".venv",
+    ".venvs",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
     "__pycache__",
     "Library/Caches",
     "Library/Containers",
+    "Library/Logs",
     "Library/Application Support/MobileSync",
     // cloud-synced trees are excluded by default; remove these entries from
     // config.toml to opt in (iCloud Drive = Mobile Documents; Box/Dropbox/
-    // Google Drive/OneDrive live under Cloud Storage)
+    // Google Drive/OneDrive live under CloudStorage)
     "Library/Mobile Documents",
-    "Library/Cloud Storage",
+    "Library/CloudStorage",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,7 +81,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # roots: directories to index (~ expands to your home directory)
 # excludes: directory or file names/paths never indexed
 #   cloud drives are excluded by default; delete \"Library/Mobile Documents\"
-#   (iCloud) or \"Library/Cloud Storage\" (Box, Dropbox, ...) to index them
+#   (iCloud) or \"Library/CloudStorage\" (Box, Dropbox, ...) to index them
 # max_content_filesize: content search skips files larger than this (bytes)
 ";
 
@@ -121,11 +129,17 @@ mod tests {
         for e in [
             ".cargo",
             ".bun",
+            ".DS_Store",
+            ".venvs",
+            "venv",
+            "Library/Logs",
             "Library/Mobile Documents",
-            "Library/Cloud Storage",
+            "Library/CloudStorage",
         ] {
             assert!(c.excludes.iter().any(|x| x == e), "missing exclude: {e}");
         }
+        // the real macOS folder has no space; the old entry never matched
+        assert!(!c.excludes.iter().any(|x| x == "Library/Cloud Storage"));
     }
 
     #[test]
