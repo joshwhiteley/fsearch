@@ -35,14 +35,15 @@ pub fn load(path: &str, max_bytes: u64) -> Result<DynamicImage, String> {
     }
 }
 
-/// The terminal cell grid is small; don't rasterize SVGs above this edge.
-const MAX_SVG_EDGE: f32 = 1600.0;
+/// Vector art is resolution-free: always rasterize with the long edge at
+/// this many pixels so previews stay crisp at any zoom.
+const SVG_EDGE: f32 = 1600.0;
 
 fn rasterize_svg(data: &[u8]) -> Result<DynamicImage, String> {
     let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default())
         .map_err(|e| e.to_string())?;
     let size = tree.size();
-    let scale = (MAX_SVG_EDGE / size.width().max(size.height())).min(1.0);
+    let scale = SVG_EDGE / size.width().max(size.height());
     let (w, h) = (
         (size.width() * scale).round().max(1.0) as u32,
         (size.height() * scale).round().max(1.0) as u32,
@@ -94,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn rasterizes_svg_at_native_size() {
+    fn rasterizes_svg_scaled_up_for_crisp_previews() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("box.svg");
         std::fs::write(
@@ -103,9 +104,10 @@ mod tests {
         )
         .unwrap();
         let img = load(path.to_str().unwrap(), MAX_IMAGE_BYTES).unwrap();
-        assert_eq!((img.width(), img.height()), (40, 20));
+        // long edge lands on SVG_EDGE, aspect preserved
+        assert_eq!((img.width(), img.height()), (1600, 800));
         // the rect actually rendered
-        let px = img.to_rgba8().get_pixel(5, 5).0;
+        let px = img.to_rgba8().get_pixel(100, 100).0;
         assert_eq!(px, [0, 255, 0, 255]);
     }
 
