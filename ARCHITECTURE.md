@@ -105,7 +105,11 @@ All communication is `std::sync::mpsc`; the UI never blocks on a search.
   results in recency order.
 - **Content** (`> pattern`): ripgrep's engine over indexed files, skipping
   binaries (NUL detection) and files over `max_content_filesize`, capped at
-  20 hits per file / 1000 total, streamed into the UI as found.
+  20 hits per file / 1000 total, streamed into the UI as found. PDFs are
+  greppable too: their text is extracted (pdf-extract behind a panic guard)
+  and cached by path + mtime + size next to the index cache.
+- **Filters** (`ext:`, `path:`, `dir:`): parsed out of any query and applied
+  in every mode — including scoping which files a content search greps.
 
 ## Previews
 

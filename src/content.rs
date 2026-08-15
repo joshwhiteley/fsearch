@@ -1,7 +1,9 @@
+use crate::pdf;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use rayon::prelude::*;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
@@ -18,6 +20,7 @@ pub fn search(
     paths: &[String],
     pattern: &str,
     max_filesize: u64,
+    pdf_cache: &Path,
     cancel: &AtomicBool,
     tx: &Sender<ContentMatch>,
 ) -> Result<(), String> {
@@ -31,8 +34,9 @@ pub fn search(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
+        let is_pdf = pdf::is_pdf_path(path);
         match std::fs::metadata(path) {
-            Ok(m) if m.len() <= max_filesize && m.is_file() => {}
+            Ok(m) if m.is_file() && (is_pdf || m.len() <= max_filesize) => {}
             _ => return,
         }
         let mut searcher = SearcherBuilder::new()
@@ -40,26 +44,31 @@ pub fn search(
             .line_number(true)
             .build();
         let mut sent = 0usize;
-        let _ = searcher.search_path(
-            &matcher,
-            path,
-            UTF8(|line_number, line| {
-                if cancel.load(Ordering::Relaxed) || sent >= PER_FILE_CAP {
-                    return Ok(false);
-                }
-                let hit = ContentMatch {
-                    path: path.clone(),
-                    line_number,
-                    line: line.trim_end().to_string(),
-                };
-                sent += 1;
-                if tx.send(hit).is_err() {
-                    cancel.store(true, Ordering::Relaxed);
-                    return Ok(false);
-                }
-                Ok(true)
-            }),
-        );
+        let mut on_line = |line_number: u64, line: &str| {
+            if cancel.load(Ordering::Relaxed) || sent >= PER_FILE_CAP {
+                return Ok(false);
+            }
+            let hit = ContentMatch {
+                path: path.clone(),
+                line_number,
+                line: line.trim_end().to_string(),
+            };
+            sent += 1;
+            if tx.send(hit).is_err() {
+                cancel.store(true, Ordering::Relaxed);
+                return Ok(false);
+            }
+            Ok(true)
+        };
+        if is_pdf {
+            // grep the extracted (and cached) text instead of the raw bytes
+            let Ok(text) = pdf::extract_cached(path, pdf_cache) else {
+                return;
+            };
+            let _ = searcher.search_slice(&matcher, text.as_bytes(), UTF8(&mut on_line));
+        } else {
+            let _ = searcher.search_path(&matcher, path, UTF8(&mut on_line));
+        }
     });
     Ok(())
 }
@@ -84,7 +93,7 @@ mod tests {
         }
         let (tx, rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        search(&paths, pattern, max, &cancel, &tx)?;
+        search(&paths, pattern, max, &dir.join("pdfcache"), &cancel, &tx)?;
         drop(tx);
         Ok(rx.into_iter().collect())
     }
@@ -132,6 +141,24 @@ mod tests {
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("ok.txt"));
+    }
+
+    #[test]
+    fn pdf_text_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let hits = run(
+            dir.path(),
+            &[(
+                "doc.pdf",
+                &crate::pdf::minimal_pdf("annual Needle report") as &[u8],
+            )],
+            "needle",
+            1024, // far below the pdf's size: pdfs bypass max_filesize
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("doc.pdf"));
+        assert!(hits[0].line.contains("Needle"));
     }
 
     #[test]

@@ -9,5 +9,6 @@ pub mod highlight;
 pub mod images;
 pub mod index;
 pub mod matcher;
+pub mod pdf;
 pub mod tui;
 pub mod walker;

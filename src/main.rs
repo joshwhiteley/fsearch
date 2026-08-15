@@ -73,7 +73,8 @@ fn print_search(query: &str) {
         let max = config.max_content_filesize;
         let result = std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let r = fsearch::content::search(&paths, &pattern, max, &cancel, &tx);
+                let pdf_cache = fsearch::pdf::default_cache_dir();
+                let r = fsearch::content::search(&paths, &pattern, max, &pdf_cache, &cancel, &tx);
                 drop(tx);
                 r
             });

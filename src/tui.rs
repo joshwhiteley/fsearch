@@ -135,6 +135,36 @@ impl App {
             self.preview = PreviewContent::Lines(directory_listing(&row.path));
             return;
         }
+        if crate::pdf::is_pdf_path(&row.path) {
+            self.preview = PreviewContent::Lines(
+                match crate::pdf::extract_cached(&row.path, &crate::pdf::default_cache_dir()) {
+                    Ok(text) => match row.line_number {
+                        Some(n) => {
+                            let start = (n as usize).saturating_sub(6);
+                            let gutter = Style::default().fg(Color::DarkGray);
+                            text.lines()
+                                .enumerate()
+                                .skip(start)
+                                .take(40)
+                                .map(|(i, l)| {
+                                    Line::from(vec![
+                                        Span::styled(format!("{:>5} ", i + 1), gutter),
+                                        Span::raw(l.to_string()),
+                                    ])
+                                })
+                                .collect()
+                        }
+                        None => text
+                            .lines()
+                            .take(100)
+                            .map(|l| Line::from(l.to_string()))
+                            .collect(),
+                    },
+                    Err(e) => vec![Line::from(format!("(pdf: {e})"))],
+                },
+            );
+            return;
+        }
         if images::is_image_path(&row.path) {
             self.preview = match (
                 &self.picker,

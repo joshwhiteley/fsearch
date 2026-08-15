@@ -29,7 +29,9 @@ Run `fsearch` and start typing.
 
 - plain text — fuzzy search on file names, matches highlighted
 - `ctrl-r` — regex on the full path
-- `> pattern` — regex search inside files, streamed as `path:line`
+- `> pattern` — regex search inside files, streamed as `path:line`;
+  PDFs are searched through their extracted text (cached, so repeats are
+  instant)
 - `ext:pdf`, `path:term` — narrow any search (content search included,
   so `> ext:md TODO` greps only markdown)
 - `dir:` — search folders instead of files (preview lists their contents)

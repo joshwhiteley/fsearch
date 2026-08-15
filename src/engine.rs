@@ -82,6 +82,7 @@ pub struct Engine {
     generation: u64,
     query: String,
     max_content_filesize: u64,
+    pdf_cache: PathBuf,
     filters: Filters,
     pending_content: Option<(String, Instant)>,
     content_cancel: Option<Arc<AtomicBool>>,
@@ -209,6 +210,10 @@ fn unix_now() -> i64 {
 
 impl Engine {
     pub fn new(config: Config, cache_path: PathBuf, history_path: PathBuf) -> Engine {
+        let pdf_cache = cache_path
+            .parent()
+            .map(|p| p.join("pdftext"))
+            .unwrap_or_else(crate::pdf::default_cache_dir);
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
 
@@ -318,6 +323,7 @@ impl Engine {
             generation: 0,
             query: String::new(),
             max_content_filesize,
+            pdf_cache,
             filters: Filters::default(),
             pending_content: None,
             content_cancel: None,
@@ -467,13 +473,21 @@ impl Engine {
         let tx = self.msg_tx.clone();
         let generation = self.generation;
         let max = self.max_content_filesize;
+        let pdf_cache = self.pdf_cache.clone();
         std::thread::spawn(move || {
             let (hit_tx, hit_rx) = mpsc::channel::<ContentMatch>();
             let search_cancel = cancel.clone();
             let search_paths = paths.clone();
             let pattern2 = pattern.clone();
             let searcher = std::thread::spawn(move || {
-                content::search(&search_paths, &pattern2, max, &search_cancel, &hit_tx)
+                content::search(
+                    &search_paths,
+                    &pattern2,
+                    max,
+                    &pdf_cache,
+                    &search_cancel,
+                    &hit_tx,
+                )
             });
             for hit in hit_rx {
                 if tx.send(Msg::ContentHit { generation, hit }).is_err() {
