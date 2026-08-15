@@ -100,7 +100,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().any(|h| h.line_number == 2 && h.line.contains("two needle two")));
+        assert!(
+            hits.iter()
+                .any(|h| h.line_number == 2 && h.line.contains("two needle two"))
+        );
         assert!(hits.iter().any(|h| h.line_number == 4));
     }
 

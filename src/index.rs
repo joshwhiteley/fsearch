@@ -8,7 +8,9 @@ pub fn default_cache_path() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(".cache")
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".cache")
         });
     base.join("fsearch").join("index.bin")
 }

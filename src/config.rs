@@ -61,7 +61,9 @@ pub fn default_config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(".config")
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".config")
         });
     base.join("fsearch").join("config.toml")
 }

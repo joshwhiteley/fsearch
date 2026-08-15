@@ -68,7 +68,10 @@ pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, i64)>) -
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map_or(0, |d| d.as_secs() as i64);
-                    if tx.send((e.path().to_string_lossy().into_owned(), mtime)).is_err() {
+                    if tx
+                        .send((e.path().to_string_lossy().into_owned(), mtime))
+                        .is_err()
+                    {
                         return WalkState::Quit;
                     }
                 }

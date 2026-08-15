@@ -98,7 +98,10 @@ mod tests {
     fn fuzzy_is_smart_case() {
         let p = paths(&["/docs/README.md", "/docs/readme-draft.md"]);
         // lowercase query matches both
-        assert_eq!(search(&p, "readme", FilenameMode::Fuzzy, 10).unwrap().len(), 2);
+        assert_eq!(
+            search(&p, "readme", FilenameMode::Fuzzy, 10).unwrap().len(),
+            2
+        );
         // uppercase query matches only the uppercase path
         let r = search(&p, "README", FilenameMode::Fuzzy, 10).unwrap();
         assert_eq!(r, vec![0]);
@@ -114,8 +117,14 @@ mod tests {
     #[test]
     fn regex_is_smart_case() {
         let p = paths(&["/a/README.md", "/a/readme.md"]);
-        assert_eq!(search(&p, "readme", FilenameMode::Regex, 10).unwrap().len(), 2);
-        assert_eq!(search(&p, "README", FilenameMode::Regex, 10).unwrap(), vec![0]);
+        assert_eq!(
+            search(&p, "readme", FilenameMode::Regex, 10).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            search(&p, "README", FilenameMode::Regex, 10).unwrap(),
+            vec![0]
+        );
     }
 
     #[test]

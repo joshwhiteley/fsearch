@@ -44,9 +44,19 @@ pub struct EngineStatus {
 }
 
 enum Msg {
-    IndexSnapshot { paths: Arc<Vec<String>>, indexing: bool },
-    FilenameResults { generation: u64, indices: Vec<usize>, error: Option<String> },
-    ContentHit { generation: u64, hit: ContentMatch },
+    IndexSnapshot {
+        paths: Arc<Vec<String>>,
+        indexing: bool,
+    },
+    FilenameResults {
+        generation: u64,
+        indices: Vec<usize>,
+        error: Option<String>,
+    },
+    ContentHit {
+        generation: u64,
+        hit: ContentMatch,
+    },
 }
 
 struct FilenameJob {
@@ -89,7 +99,11 @@ impl Engine {
                         Err(e) => (Vec::new(), Some(format!("invalid pattern: {e}"))),
                     };
                 if worker_tx
-                    .send(Msg::FilenameResults { generation: job.generation, indices, error })
+                    .send(Msg::FilenameResults {
+                        generation: job.generation,
+                        indices,
+                        error,
+                    })
                     .is_err()
                 {
                     return;
@@ -102,12 +116,16 @@ impl Engine {
         let max_content_filesize = config.max_content_filesize;
         std::thread::spawn(move || {
             if let Some(cached) = index::load(&cache_path) {
-                let _ = indexer_tx
-                    .send(Msg::IndexSnapshot { paths: Arc::new(cached), indexing: true });
+                let _ = indexer_tx.send(Msg::IndexSnapshot {
+                    paths: Arc::new(cached),
+                    indexing: true,
+                });
             }
             let Ok(excludes) = walker::build_exclude_set(&config.excludes) else {
-                let _ = indexer_tx
-                    .send(Msg::IndexSnapshot { paths: Arc::new(Vec::new()), indexing: false });
+                let _ = indexer_tx.send(Msg::IndexSnapshot {
+                    paths: Arc::new(Vec::new()),
+                    indexing: false,
+                });
                 return;
             };
             let (path_tx, path_rx) = mpsc::channel::<(String, i64)>();
@@ -135,7 +153,10 @@ impl Engine {
             let _ = walk_thread.join();
             fresh.sort_unstable_by(walker::mtime_cmp);
             let paths = Arc::new(fresh.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
-            let _ = indexer_tx.send(Msg::IndexSnapshot { paths: paths.clone(), indexing: false });
+            let _ = indexer_tx.send(Msg::IndexSnapshot {
+                paths: paths.clone(),
+                indexing: false,
+            });
             let _ = index::save(&paths, &cache_path);
         });
 
@@ -145,7 +166,10 @@ impl Engine {
             job_tx,
             paths: Arc::new(Vec::new()),
             results: Vec::new(),
-            status: EngineStatus { indexing: true, ..Default::default() },
+            status: EngineStatus {
+                indexing: true,
+                ..Default::default()
+            },
             mode: Mode::Fuzzy,
             generation: 0,
             query: String::new(),
@@ -190,14 +214,22 @@ impl Engine {
                         self.dispatch_filename();
                     }
                 }
-                Msg::FilenameResults { generation, indices, error } => {
+                Msg::FilenameResults {
+                    generation,
+                    indices,
+                    error,
+                } => {
                     if generation != self.generation {
                         continue;
                     }
                     self.results = indices
                         .into_iter()
                         .filter_map(|i| self.paths.get(i))
-                        .map(|p| ResultRow { path: p.clone(), line_number: None, line: None })
+                        .map(|p| ResultRow {
+                            path: p.clone(),
+                            line_number: None,
+                            line: None,
+                        })
                         .collect();
                     self.status.matches = self.results.len();
                     self.status.error = error;
@@ -299,7 +331,10 @@ mod tests {
 
     #[test]
     fn parse_plain_is_fuzzy() {
-        assert_eq!(parse_query("notes", false), (Mode::Fuzzy, "notes".to_string()));
+        assert_eq!(
+            parse_query("notes", false),
+            (Mode::Fuzzy, "notes".to_string())
+        );
     }
 
     #[test]

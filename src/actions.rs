@@ -42,7 +42,10 @@ mod tests {
 
     #[test]
     fn open_uses_macos_open() {
-        assert_eq!(open_args("/a b.txt"), ("open", vec!["/a b.txt".to_string()]));
+        assert_eq!(
+            open_args("/a b.txt"),
+            ("open", vec!["/a b.txt".to_string()])
+        );
     }
 
     #[test]

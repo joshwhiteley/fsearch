@@ -134,7 +134,14 @@ mod tests {
 
     #[test]
     fn help_text_covers_the_essentials() {
-        for needle in ["usage", "--config", "--reindex", "--version", "> pattern", "ctrl-r"] {
+        for needle in [
+            "usage",
+            "--config",
+            "--reindex",
+            "--version",
+            "> pattern",
+            "ctrl-r",
+        ] {
             assert!(HELP.contains(needle), "help is missing {needle:?}");
         }
     }

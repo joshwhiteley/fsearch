@@ -14,7 +14,10 @@ fn version_prints_the_crate_version() {
     let out = fsearch(&["--version"], &[]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text.trim(), format!("fsearch {}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        text.trim(),
+        format!("fsearch {}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

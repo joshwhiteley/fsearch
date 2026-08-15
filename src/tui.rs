@@ -160,8 +160,11 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         (_, true) => "regex",
         _ => "fuzzy",
     };
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(format!("fsearch [{mode}]")));
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("fsearch [{mode}]")),
+    );
     frame.render_widget(input, area);
     frame.set_cursor_position((area.x + 1 + app.input.len() as u16, area.y + 1));
 }
@@ -196,7 +199,11 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     app.load_preview();
-    let text: Vec<Line> = app.preview_lines.iter().map(|l| Line::from(l.as_str())).collect();
+    let text: Vec<Line> = app
+        .preview_lines
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
     let preview =
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("preview"));
     frame.render_widget(preview, area);
