@@ -279,3 +279,45 @@ fn filters_scope_filename_and_content_search() {
             .all(|r| r.path.ends_with("guide.md"))
     );
 }
+
+#[test]
+fn changed_and_size_filters_narrow_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let now = std::time::SystemTime::now();
+    // fresh + big, fresh + small, old + big
+    std::fs::write(p.join("fresh-big.bin"), vec![0u8; 4000]).unwrap();
+    std::fs::write(p.join("fresh-small.txt"), "x").unwrap();
+    std::fs::write(p.join("old-big.bin"), vec![0u8; 4000]).unwrap();
+    let f = std::fs::File::options()
+        .write(true)
+        .open(p.join("old-big.bin"))
+        .unwrap();
+    f.set_modified(now - std::time::Duration::from_secs(10 * 24 * 3600))
+        .unwrap();
+
+    let aux = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(
+        config_for(p),
+        aux.path().join("index.bin"),
+        aux.path().join("history"),
+    );
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().indexed == 3
+    });
+
+    engine.set_query("changed:1d", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 2 && e.results().iter().all(|r| r.path.contains("fresh"))
+    });
+
+    engine.set_query("larger:1kb", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 2 && e.results().iter().all(|r| r.path.contains("big"))
+    });
+
+    engine.set_query("changed:1d larger:1kb", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 1 && e.results()[0].path.ends_with("fresh-big.bin")
+    });
+}

@@ -168,3 +168,32 @@ fn print_mode_honors_filters() {
     assert!(text.contains("guide.md"));
     assert!(!text.contains("guide.txt"));
 }
+
+#[test]
+fn big_lists_largest_files_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("small.txt"), "x").unwrap();
+    std::fs::write(tree.join("huge.bin"), vec![0u8; 5000]).unwrap();
+    std::fs::write(tree.join("mid.txt"), vec![0u8; 500]).unwrap();
+    let xdg = dir.path().join("xdg");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
+    std::fs::write(
+        xdg.join("fsearch").join("config.toml"),
+        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+    )
+    .unwrap();
+    let env: &[(&str, &str)] = &[
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+    ];
+    let out = fsearch(&["--big", "2"], env);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("huge.bin") && lines[0].contains("5.0 KB"));
+    assert!(lines[1].contains("mid.txt"));
+}

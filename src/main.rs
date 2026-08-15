@@ -12,6 +12,7 @@ fn main() {
         Command::Doctor => doctor(),
         Command::Print(query) => print_search(&query),
         Command::Pick(initial) => run_ui(tui::UiMode::Pick, &initial),
+        Command::Big(n) => biggest(n),
         Command::Unknown(arg) => {
             eprintln!("fsearch: unexpected argument {arg:?}\n");
             eprint!("{}", cli::HELP);
@@ -72,6 +73,35 @@ fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// "412 B", "1.3 KB", "2.0 MB", "1.1 GB" — mirrors the status line.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// The N largest files in the index — a quick "what is eating my disk".
+fn biggest(n: usize) {
+    let config = load_config();
+    let (paths, metas) = load_index(&config);
+    let mut order: Vec<usize> = (0..paths.len())
+        .filter(|&i| !paths[i].ends_with('/'))
+        .collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(metas[i].size));
+    for &i in order.iter().take(n) {
+        println!("{:>10}  {}", human_size(metas[i].size), paths[i]);
+    }
 }
 
 fn print_search(query: &str) {

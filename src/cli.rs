@@ -8,6 +8,7 @@ pub enum Command {
     Doctor,
     Print(String),
     Pick(String),
+    Big(usize),
     Unknown(String),
 }
 
@@ -19,6 +20,7 @@ usage:
   fsearch --config     open the config file in $VISUAL/$EDITOR,
                        or reveal it in Finder when neither is set
   fsearch --reindex    rebuild the file index now
+  fsearch --big [N]    largest N files in the index (default 20)
   fsearch -p QUERY     print matches to stdout (no ui); \"> pattern\"
                        searches file contents
   fsearch --pick [Q]   interactive ui, but enter prints the selection to
@@ -32,6 +34,10 @@ query syntax:
   ctrl-r               toggle regex match on the full path
   > pattern            regex search inside file contents
   ext:pdf path:term    narrow any search by extension or path
+  kind:image           extension shorthands: image, video, audio,
+                       doc, code, archive
+  changed:7d           only files modified in the window (m/h/d/w)
+  larger:100mb         size bounds (also smaller:)
   dir:                 search folders instead of files
 
 keys:
@@ -79,6 +85,17 @@ pub fn parse(args: &[String]) -> Command {
         && first == "--pick"
     {
         return Command::Pick(args[1..].join(" "));
+    }
+    if let Some(first) = args.first()
+        && first == "--big"
+    {
+        return match args.get(1) {
+            None => Command::Big(20),
+            Some(n) => match n.parse() {
+                Ok(n) if args.len() == 2 => Command::Big(n),
+                _ => Command::Unknown(args[1].clone()),
+            },
+        };
     }
     let mut cmd = Command::Run;
     for arg in args {
@@ -142,6 +159,16 @@ mod tests {
         );
         // no query is an error
         assert_eq!(parse_strs(&["-p"]), Command::Unknown("-p".to_string()));
+    }
+
+    #[test]
+    fn big_takes_an_optional_count() {
+        assert_eq!(parse_strs(&["--big"]), Command::Big(20));
+        assert_eq!(parse_strs(&["--big", "5"]), Command::Big(5));
+        assert_eq!(
+            parse_strs(&["--big", "nope"]),
+            Command::Unknown("nope".to_string())
+        );
     }
 
     #[test]

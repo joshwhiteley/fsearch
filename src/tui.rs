@@ -272,7 +272,7 @@ impl App {
     }
 }
 
-const HINTS: &str = "type to search \u{b7} > grep in files \u{b7} ext:pdf \u{b7} path:term \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview \u{b7} enter open";
+const HINTS: &str = "> grep in files \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // show syntax reminders under the search bar until typing starts
