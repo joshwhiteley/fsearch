@@ -36,7 +36,7 @@ Run `fsearch` and start typing.
   so `> ext:md TODO` greps only markdown)
 - `dir:` — search folders instead of files (preview lists their contents)
 - `enter` opens · `ctrl-f` reveals in Finder · `ctrl-y` copies the path ·
-  `tab` toggles preview · `esc` quits
+  `tab` cycles the preview (side → full-window → hidden) · `esc` quits
 
 Scripting: `fsearch -p QUERY` prints matches to stdout (exit 1 when none),
 and `fsearch --pick` runs the full UI but prints your selection instead of

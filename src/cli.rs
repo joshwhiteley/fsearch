@@ -40,7 +40,7 @@ keys:
   ctrl-f               reveal in Finder
   ctrl-y               copy path to clipboard
   ctrl-u               clear query
-  tab                  toggle preview pane
+  tab                  cycle preview: side, full-window, hidden
   esc, ctrl-c          quit
 
 files:

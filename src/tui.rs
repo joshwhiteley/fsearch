@@ -18,6 +18,26 @@ use std::time::Duration;
 
 const PREVIEW_BYTES: usize = 64 * 1024;
 
+/// Where the preview lives; Tab cycles. Full trades the results list for
+/// a much larger canvas — images render at ~3x the cell resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PreviewLayout {
+    #[default]
+    Side,
+    Full,
+    Hidden,
+}
+
+impl PreviewLayout {
+    fn next(self) -> PreviewLayout {
+        match self {
+            PreviewLayout::Side => PreviewLayout::Full,
+            PreviewLayout::Full => PreviewLayout::Hidden,
+            PreviewLayout::Hidden => PreviewLayout::Side,
+        }
+    }
+}
+
 /// What Enter does: open the file, or print its path and exit (`--pick`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum UiMode {
@@ -31,7 +51,7 @@ pub struct App {
     pub input: String,
     pub selected: usize,
     pub regex_mode: bool,
-    pub show_preview: bool,
+    pub preview_layout: PreviewLayout,
     pub message: Option<String>,
     pub appearance: Appearance,
     pub picker: Option<Picker>,
@@ -53,7 +73,7 @@ impl App {
             input: String::new(),
             selected: 0,
             regex_mode: false,
-            show_preview: true,
+            preview_layout: PreviewLayout::Side,
             message: None,
             appearance: Appearance::Dark,
             picker: None,
@@ -82,7 +102,7 @@ impl App {
             (KeyCode::Char('k'), true) | (KeyCode::Up, _) => self.move_selection(-1),
             (KeyCode::Char('y'), true) => self.act(actions::copy, "copied"),
             (KeyCode::Char('f'), true) => self.act(actions::reveal, "revealed"),
-            (KeyCode::Tab, _) => self.show_preview = !self.show_preview,
+            (KeyCode::Tab, _) => self.preview_layout = self.preview_layout.next(),
             (KeyCode::Enter, _) => match self.ui_mode {
                 UiMode::Open => self.open_selected(),
                 UiMode::Pick => {
@@ -233,7 +253,7 @@ impl App {
     }
 }
 
-const HINTS: &str = "type to search \u{b7} > grep in files \u{b7} ext:pdf \u{b7} path:term \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab preview \u{b7} enter open";
+const HINTS: &str = "type to search \u{b7} > grep in files \u{b7} ext:pdf \u{b7} path:term \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview \u{b7} enter open";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // show syntax reminders under the search bar until typing starts
@@ -256,15 +276,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let body = outer[2];
     let status_area = outer[3];
 
-    if app.show_preview {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(body);
-        draw_results(frame, app, cols[0]);
-        draw_preview(frame, app, cols[1]);
-    } else {
-        draw_results(frame, app, body);
+    match app.preview_layout {
+        PreviewLayout::Side => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(body);
+            draw_results(frame, app, cols[0]);
+            draw_preview(frame, app, cols[1]);
+        }
+        PreviewLayout::Full => draw_preview(frame, app, body),
+        PreviewLayout::Hidden => draw_results(frame, app, body),
     }
 
     draw_status(frame, app, status_area);
@@ -689,6 +711,29 @@ mod tests {
         assert_eq!(spans[0].style, Style::default());
         // no positions → single raw span
         assert_eq!(spans_with_positions("abcd", &[], hl).len(), 1);
+    }
+
+    #[test]
+    fn tab_cycles_preview_layouts() {
+        let mut app = test_app();
+        assert_eq!(app.preview_layout, PreviewLayout::Side);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.preview_layout, PreviewLayout::Full);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.preview_layout, PreviewLayout::Hidden);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.preview_layout, PreviewLayout::Side);
+    }
+
+    #[test]
+    fn full_layout_renders_preview_without_results() {
+        let mut app = test_app();
+        app.preview_layout = PreviewLayout::Full;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("preview"));
+        assert!(!text.contains("results"));
     }
 
     #[test]
