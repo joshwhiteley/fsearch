@@ -83,3 +83,23 @@ is the diagnosis: if your loader's time is O(records) in *allocator calls*,
 no amount of faster parsing fixes it; you have to change the memory shape
 so the record count stops mattering. One allocation instead of a million is
 not 30% faster. It's a different complexity class for the part that hurt.
+
+## Appendix: the optimization that measured worse
+
+The obvious next idea was incremental narrowing: when a query is extended
+("docs9" → "docs99"), rescore only the previous query's match set instead
+of the whole index. I built it, with the correctness guard the subset
+property needs (nucleo's `!`/`^`/`$` atoms invert it), and measured.
+
+Best of 15 runs, 1M paths, 110k-path candidate set: **full scan 2.7 ms,
+narrowed 3.6 ms.** The first version was 4x worse still — the candidate
+list came out of the parallel fold unordered, and 110k random arena reads
+cost a cache miss each, which alone exceeded the full scan's budget.
+Sorting the candidates fixed the access pattern and it *still* lost:
+nucleo's memchr prefilter rejects non-matching paths at memory bandwidth,
+so a sequential scan of 1M paths is nearly as cheap as touching the 110k
+survivors through an index indirection.
+
+The branch is deleted. The general lesson: an optimization that skips work
+only wins if the skipped work costs more than the indirection that skips
+it — and prefilters have already made the skipped work almost free.
