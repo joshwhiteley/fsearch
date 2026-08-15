@@ -614,8 +614,10 @@ impl Engine {
         });
     }
 
-    /// One worker for the whole session: the embedding model and the vector
-    /// store both load once, on the first `?` query, and stay warm.
+    /// One worker for the whole session: the embedding model loads once, on
+    /// the first `?` query, and stays warm. The store load is retried until
+    /// it succeeds, so an index built while the UI is open is picked up on
+    /// the next query — no restart needed.
     fn ensure_semantic_worker(&mut self) -> Sender<SemJob> {
         if let Some(tx) = &self.sem_tx {
             return tx.clone();
@@ -623,31 +625,37 @@ impl Engine {
         let (tx, rx) = mpsc::channel::<SemJob>();
         let msg_tx = self.msg_tx.clone();
         std::thread::spawn(move || {
+            let mut embedder: Option<Result<Box<dyn sem::Embedder + Send>, String>> = None;
             let mut ready: Option<(Box<dyn sem::Embedder + Send>, sem::SemStore)> = None;
-            let mut broken: Option<String> = None;
             while let Ok(mut job) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
                     job = newer;
                 }
-                if ready.is_none() && broken.is_none() {
-                    match sem::make_embedder() {
+                let mut broken: Option<String> = None;
+                if ready.is_none() {
+                    match embedder.take().unwrap_or_else(sem::make_embedder) {
                         Ok(e) => match sem::SemStore::load(&sem::default_store_path()) {
                             Some(s) if s.dim as usize == e.dim() => ready = Some((e, s)),
                             Some(_) => {
+                                embedder = Some(Ok(e));
                                 broken = Some(
                                     "semantic index is from another model — \
                                      rerun fsearch --index-semantic"
                                         .to_string(),
-                                )
+                                );
                             }
                             None => {
+                                embedder = Some(Ok(e));
                                 broken = Some(
                                     "no semantic index yet — run fsearch --index-semantic"
                                         .to_string(),
-                                )
+                                );
                             }
                         },
-                        Err(e) => broken = Some(e),
+                        Err(e) => {
+                            broken = Some(e.clone());
+                            embedder = Some(Err(e));
+                        }
                     }
                 }
                 let msg = match (&mut ready, &broken) {
