@@ -201,3 +201,37 @@ fn opened_files_rank_first() {
         e.results().len() == 2 && e.results()[0].path.ends_with("stale-open.txt")
     });
 }
+
+#[test]
+fn live_index_picks_up_created_and_deleted_files() {
+    let tree = tempfile::tempdir().unwrap();
+    // canonicalize: fs events report resolved paths (/private/var vs /var)
+    let root = tree.path().canonicalize().unwrap();
+    std::fs::write(root.join("first.txt"), "x\n").unwrap();
+    let aux = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(
+        config_for(&root),
+        aux.path().join("index.bin"),
+        aux.path().join("history"),
+    );
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().indexed == 1
+    });
+    engine.set_query("", false);
+
+    // a newly created file shows up without any reindex…
+    std::fs::write(root.join("brand-new.txt"), "y\n").unwrap();
+    wait_until(&mut engine, Duration::from_secs(10), |e| {
+        e.results()
+            .iter()
+            .any(|r| r.path.ends_with("brand-new.txt"))
+    });
+    // …at the front (it is the newest file)
+    assert!(engine.results()[0].path.ends_with("brand-new.txt"));
+
+    // and a deleted file disappears
+    std::fs::remove_file(root.join("first.txt")).unwrap();
+    wait_until(&mut engine, Duration::from_secs(10), |e| {
+        !e.results().iter().any(|r| r.path.ends_with("first.txt"))
+    });
+}

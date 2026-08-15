@@ -2,7 +2,7 @@ use crate::content::{self, ContentMatch};
 use crate::frecency::Frecency;
 use crate::matcher::{self, FilenameMode};
 use crate::{config::Config, index, walker};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -86,6 +86,118 @@ pub struct Engine {
     boosts: Arc<HashMap<String, u32>>,
 }
 
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
+const WATCH_SAVE_EVERY: Duration = Duration::from_secs(60);
+
+/// Folds filesystem events into fresh index snapshots, forever. Changed and
+/// created files go to the front of the list (they are the newest); deleted
+/// paths — including whole directories — are filtered out.
+/// Starts watching `roots` and returns the live watcher (keep it alive!)
+/// plus the event stream. Armed *before* the initial walk so that no change
+/// can slip between walk completion and stream start.
+fn start_watcher(
+    roots: &[std::path::PathBuf],
+) -> Option<(
+    notify::RecommendedWatcher,
+    Receiver<notify::Result<notify::Event>>,
+)> {
+    use notify::Watcher;
+    let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = event_tx.send(res);
+    })
+    .ok()?;
+    for root in roots {
+        let _ = watcher.watch(root, notify::RecursiveMode::Recursive);
+    }
+    Some((watcher, event_rx))
+}
+
+fn watch_loop(
+    event_rx: &Receiver<notify::Result<notify::Event>>,
+    excludes: &globset::GlobSet,
+    cache_path: &std::path::Path,
+    indexer_tx: &Sender<Msg>,
+    mut current: Arc<Vec<String>>,
+) {
+    let mut last_save = Instant::now();
+    loop {
+        // block until something happens, then debounce-collect the burst
+        let Ok(first) = event_rx.recv() else { return };
+        let mut touched: std::collections::HashSet<std::path::PathBuf> = HashSet::new();
+        let mut absorb = |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                touched.extend(event.paths);
+            }
+        };
+        absorb(first);
+        let deadline = Instant::now() + WATCH_DEBOUNCE;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match event_rx.recv_timeout(left) {
+                Ok(res) => absorb(res),
+                Err(_) => break,
+            }
+        }
+
+        let mut fronts: Vec<String> = Vec::new();
+        let mut gone: std::collections::HashSet<String> = HashSet::new();
+        let mut gone_dir_prefixes: Vec<String> = Vec::new();
+        let push_front = |fronts: &mut Vec<String>, gone: &mut HashSet<String>, s: String| {
+            if gone.insert(s.clone()) {
+                fronts.push(s);
+            }
+        };
+        for path in touched {
+            if excludes.is_match(&path) {
+                continue;
+            }
+            let s = path.to_string_lossy().into_owned();
+            if path.is_file() {
+                // front-inserted (it is the newest); the stale base copy is
+                // filtered via `gone`
+                push_front(&mut fronts, &mut gone, s);
+            } else if path.is_dir() {
+                // a directory appeared or changed: index its files
+                let (files, _) = walker::collect_sorted(&[path], excludes);
+                for f in files {
+                    push_front(&mut fronts, &mut gone, f);
+                }
+            } else {
+                // deleted: could have been a file or a whole directory
+                gone_dir_prefixes.push(format!("{s}/"));
+                gone.insert(s);
+            }
+        }
+        if fronts.is_empty() && gone.is_empty() {
+            continue;
+        }
+        let mut next: Vec<String> = Vec::with_capacity(current.len() + fronts.len());
+        next.extend(fronts);
+        next.extend(
+            current
+                .iter()
+                .filter(|p| {
+                    !gone.contains(*p) && !gone_dir_prefixes.iter().any(|d| p.starts_with(d))
+                })
+                .cloned(),
+        );
+        current = Arc::new(next);
+        if indexer_tx
+            .send(Msg::IndexSnapshot {
+                paths: current.clone(),
+                indexing: false,
+            })
+            .is_err()
+        {
+            return; // engine dropped
+        }
+        if last_save.elapsed() >= WATCH_SAVE_EVERY {
+            last_save = Instant::now();
+            let _ = index::save(&current, cache_path);
+        }
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -144,9 +256,15 @@ impl Engine {
                 });
                 return;
             };
+            // arm the watcher before walking: events raised mid-walk sit in
+            // the channel and are folded in afterwards (re-stat makes them
+            // idempotent), so nothing slips through the startup window
+            let watcher = start_watcher(&config.roots);
             let (path_tx, path_rx) = mpsc::channel::<(String, i64)>();
             let roots = config.roots.clone();
-            let walk_thread = std::thread::spawn(move || walker::walk(&roots, &excludes, &path_tx));
+            let walk_excludes = excludes.clone();
+            let walk_thread =
+                std::thread::spawn(move || walker::walk(&roots, &walk_excludes, &path_tx));
             // the index is ordered newest-first, so head-of-list results,
             // regex hits (index order) and fuzzy score ties all favor recency
             let mut fresh: Vec<(String, i64)> = Vec::new();
@@ -174,6 +292,10 @@ impl Engine {
                 indexing: false,
             });
             let _ = index::save(&paths, &cache_path);
+            if let Some((_watcher, event_rx)) = watcher {
+                // _watcher must stay alive for events to keep flowing
+                watch_loop(&event_rx, &excludes, &cache_path, &indexer_tx, paths);
+            }
         });
 
         let frecency = Frecency::load(history_path);
