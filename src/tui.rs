@@ -352,46 +352,6 @@ fn forced_picker(protocol: ratatui_image::picker::ProtocolType) -> Picker {
     picker
 }
 
-/// Asks the terminal directly whether it speaks the Kitty graphics protocol.
-/// Some terminals (e.g. the Herdr multiplexer) ACK Kitty graphics but ignore
-/// font-size queries, which makes ratatui-image's own detection give up and
-/// fall back to halfblocks. Only call on a terminal that answers queries.
-fn kitty_ack_probe() -> bool {
-    use ratatui::crossterm::terminal;
-    use std::io::{Read, Write};
-    if terminal::enable_raw_mode().is_err() {
-        return false;
-    }
-    let mut stdout = std::io::stdout();
-    // kitty graphics query, then DA1 (which every real terminal answers)
-    let _ = stdout.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c");
-    let _ = stdout.flush();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut chunk = [0u8; 256];
-        let mut reply: Vec<u8> = Vec::new();
-        loop {
-            match stdin.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    reply.extend_from_slice(&chunk[..n]);
-                    // DA1 terminates the exchange: ESC [ ? ... c
-                    if reply.windows(2).any(|w| w == b"[?") && reply.ends_with(b"c") {
-                        let _ = tx.send(reply);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    let reply = rx
-        .recv_timeout(Duration::from_millis(800))
-        .unwrap_or_default();
-    let _ = terminal::disable_raw_mode();
-    reply.windows(2).any(|w| w == b"_G")
-}
-
 /// Runs the full pre-init terminal probe: appearance, responsiveness, and
 /// graphics picker selection (honoring `FSEARCH_IMAGES=off|halfblocks|
 /// kitty|iterm2`). Performs stdio queries — call before raw mode / the
@@ -404,13 +364,12 @@ pub fn probe_terminal() -> (highlight::TerminalTraits, Option<Picker>) {
         Ok("halfblocks") => Some(Picker::halfblocks()),
         Ok("kitty") => Some(forced_picker(ProtocolType::Kitty)),
         Ok("iterm2") => Some(forced_picker(ProtocolType::Iterm2)),
+        // NOTE: no auto-upgrade on a bare capability ACK. Some multiplexers
+        // (Herdr, and WezTerm/Konsole per ratatui-image's blacklist) answer
+        // the Kitty query but never render the images — a blank pane is
+        // worse than halfblocks. Users who know better can force a protocol.
         _ if traits.responsive => {
-            let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-            if picker.protocol_type() == ProtocolType::Halfblocks && kitty_ack_probe() {
-                Some(forced_picker(ProtocolType::Kitty))
-            } else {
-                Some(picker)
-            }
+            Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
         }
         _ => Some(Picker::halfblocks()),
     };

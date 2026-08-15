@@ -28,6 +28,13 @@ terminal-colorsaurus = "1"
 toml = "1"
 two-face = "0.5"
 
+[features]
+# Sharper cell-art image previews for terminals without a graphics protocol.
+# Needs libchafa >= 1.8 and pkg-config at build time, libchafa at run time
+# (`brew install chafa pkgconf`):
+#   cargo install --path . --features chafa
+chafa = ["ratatui-image/chafa-dyn"]
+
 [dev-dependencies]
 tempfile = "3"
 

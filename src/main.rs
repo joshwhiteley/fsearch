@@ -40,6 +40,12 @@ fn doctor() {
             let f = p.font_size();
             println!("image protocol: {:?}", p.protocol_type());
             println!("cell size: {}x{} px", f.width, f.height);
+            #[cfg(feature = "chafa")]
+            println!("halfblock renderer: chafa");
+            #[cfg(not(feature = "chafa"))]
+            println!(
+                "halfblock renderer: builtin (rebuild with --features chafa for sharper cells)"
+            );
         }
         None => println!("image previews: off (FSEARCH_IMAGES=off)"),
     }

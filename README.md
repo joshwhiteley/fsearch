@@ -76,10 +76,17 @@ excluded folders, content-search size limit. Cloud drives (iCloud, Dropbox,
 Box…) are skipped by default; remove them from `excludes` to index them.
 `fsearch --reindex` rebuilds the index after changes.
 
-Image previews auto-negotiate the best protocol, including inside
-multiplexers that support Kitty graphics but ignore font-size queries.
-`fsearch --doctor` shows what was detected; `FSEARCH_IMAGES` overrides it
-(`kitty`, `iterm2`, `halfblocks`, or `off`).
+Image previews auto-negotiate the best graphics protocol and fall back to
+colored cells elsewhere (multiplexers included — a terminal merely claiming
+Kitty support isn't trusted, since some ACK the query but never render).
+`fsearch --doctor` prints what was detected; `FSEARCH_IMAGES` overrides it
+(`kitty`, `iterm2`, `halfblocks`, or `off`). For much sharper cell-art
+fallback, build with the chafa renderer:
+
+```sh
+brew install chafa pkgconf
+cargo install --path . --features chafa
+```
 
 ## How it works
 
