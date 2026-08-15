@@ -1,4 +1,4 @@
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSEARCH\0";
@@ -35,27 +35,26 @@ pub fn save(paths: &[String], path: &Path) -> std::io::Result<()> {
 }
 
 pub fn load(path: &Path) -> Option<Vec<String>> {
-    let mut r = BufReader::new(std::fs::File::open(path).ok()?);
-    let mut magic = [0u8; 8];
-    r.read_exact(&mut magic).ok()?;
-    if &magic != MAGIC {
+    // one bulk read, then parse from the slice — measurably faster than
+    // per-record buffered reads on multi-million-path caches
+    let data = std::fs::read(path).ok()?;
+    let header = data.get(..20)?;
+    if &header[..8] != MAGIC {
         return None;
     }
-    let mut u32buf = [0u8; 4];
-    r.read_exact(&mut u32buf).ok()?;
-    if u32::from_le_bytes(u32buf) != VERSION {
+    if u32::from_le_bytes(header[8..12].try_into().ok()?) != VERSION {
         return None;
     }
-    let mut u64buf = [0u8; 8];
-    r.read_exact(&mut u64buf).ok()?;
-    let count = u64::from_le_bytes(u64buf) as usize;
+    let count = u64::from_le_bytes(header[12..20].try_into().ok()?) as usize;
     let mut paths = Vec::with_capacity(count.min(4_000_000));
+    let mut pos = 20;
     for _ in 0..count {
-        r.read_exact(&mut u32buf).ok()?;
-        let len = u32::from_le_bytes(u32buf) as usize;
-        let mut bytes = vec![0u8; len];
-        r.read_exact(&mut bytes).ok()?;
-        paths.push(String::from_utf8(bytes).ok()?);
+        let len_bytes = data.get(pos..pos + 4)?;
+        let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+        pos += 4;
+        let bytes = data.get(pos..pos + len)?;
+        pos += len;
+        paths.push(std::str::from_utf8(bytes).ok()?.to_string());
     }
     Some(paths)
 }
