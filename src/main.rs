@@ -278,7 +278,13 @@ fn index_semantic() {
                 && fsearch::sem::is_semantic_path(p)
                 && store.meta(i).size <= fsearch::sem::MAX_SEMANTIC_BYTES
         })
-        .map(|i| (store.get(i).to_string(), store.meta(i).mtime, store.meta(i).size))
+        .map(|i| {
+            (
+                store.get(i).to_string(),
+                store.meta(i).mtime,
+                store.meta(i).size,
+            )
+        })
         .collect();
     let out_path = fsearch::sem::default_store_path();
     let prior = fsearch::sem::SemStore::load(&out_path);

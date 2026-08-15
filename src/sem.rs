@@ -320,7 +320,9 @@ impl SemStore {
         for _ in 0..ndocs {
             let plen = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
             pos += 4;
-            let path = std::str::from_utf8(data.get(pos..pos + plen)?).ok()?.to_string();
+            let path = std::str::from_utf8(data.get(pos..pos + plen)?)
+                .ok()?
+                .to_string();
             pos += plen;
             let mtime = i64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
             pos += 8;
@@ -395,7 +397,10 @@ pub fn build(
             let chunks: Vec<(u32, Vec<f32>)> = (0..entry.chunk_count)
                 .map(|c| {
                     let ci = (entry.chunk_start + c) as usize;
-                    (p.chunk_lines[ci], p.vectors[ci * dim..(ci + 1) * dim].to_vec())
+                    (
+                        p.chunk_lines[ci],
+                        p.vectors[ci * dim..(ci + 1) * dim].to_vec(),
+                    )
                 })
                 .collect();
             store.push_doc(path, *mtime, *size, &chunks);
@@ -506,13 +511,9 @@ mod tests {
             "/a/garden.md" => Some("tomatoes need sun and water".to_string()),
             _ => None,
         };
-        let (first, stats) = build(
-            &files,
-            None,
-            &mut embedder,
-            &mut read,
-            &mut |_, _| embed_calls += 1,
-        )
+        let (first, stats) = build(&files, None, &mut embedder, &mut read, &mut |_, _| {
+            embed_calls += 1
+        })
         .unwrap();
         assert_eq!(
             stats,
@@ -534,10 +535,14 @@ mod tests {
             "/a/garden.md" => Some("tomatoes need sun water and mulch".to_string()),
             _ => None,
         };
-        let (second, stats2) =
-            build(&files2, Some(&first), &mut embedder, &mut read2, &mut |_,
-             _| {})
-            .unwrap();
+        let (second, stats2) = build(
+            &files2,
+            Some(&first),
+            &mut embedder,
+            &mut read2,
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(
             stats2,
             BuildStats {

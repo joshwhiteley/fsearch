@@ -208,7 +208,11 @@ fn semantic_index_and_query_with_fake_embedder() {
         "compound interest rewards patience and time\n",
     )
     .unwrap();
-    std::fs::write(tree.join("garden.md"), "tomatoes need sun water and mulch\n").unwrap();
+    std::fs::write(
+        tree.join("garden.md"),
+        "tomatoes need sun water and mulch\n",
+    )
+    .unwrap();
     std::fs::write(tree.join("code.rs"), "fn main() {}\n").unwrap();
     let xdg = dir.path().join("xdg");
     let cache = dir.path().join("cache");
