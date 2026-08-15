@@ -67,8 +67,23 @@ fn print_search(query: &str) {
         paths
     });
 
+    let (query_filters, stripped) = fsearch::filters::parse(query);
+    let query = if query_filters.is_empty() {
+        query.to_string()
+    } else {
+        stripped
+    };
     let matched = if let Some(pattern) = query.strip_prefix('>') {
         let pattern = pattern.trim_start().to_string();
+        let paths: Vec<String> = if query_filters.is_empty() {
+            paths.clone()
+        } else {
+            paths
+                .iter()
+                .filter(|p| query_filters.matches(p))
+                .cloned()
+                .collect()
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let max = config.max_content_filesize;
@@ -94,7 +109,14 @@ fn print_search(query: &str) {
             }
         }
     } else {
-        match fsearch::matcher::search(&paths, query, fsearch::matcher::FilenameMode::Fuzzy, 500) {
+        match fsearch::matcher::search_boosted(
+            &paths,
+            &query,
+            fsearch::matcher::FilenameMode::Fuzzy,
+            500,
+            &std::collections::HashMap::new(),
+            &query_filters,
+        ) {
             Ok(indices) => {
                 for i in &indices {
                     println!("{}", paths[*i]);

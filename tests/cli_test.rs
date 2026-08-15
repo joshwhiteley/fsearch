@@ -142,3 +142,29 @@ fn print_mode_lists_matches_and_content_hits() {
     let out = fsearch(&["-p", "zzzznope"], env);
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn print_mode_honors_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("guide.md"), "x\n").unwrap();
+    std::fs::write(tree.join("guide.txt"), "x\n").unwrap();
+    let xdg = dir.path().join("xdg");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
+    std::fs::write(
+        xdg.join("fsearch").join("config.toml"),
+        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+    )
+    .unwrap();
+    let env: &[(&str, &str)] = &[
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+    ];
+    let out = fsearch(&["-p", "ext:md", "guide"], env);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("guide.md"));
+    assert!(!text.contains("guide.txt"));
+}
