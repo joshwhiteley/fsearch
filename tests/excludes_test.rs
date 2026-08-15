@@ -1,5 +1,5 @@
 #[test]
-fn ds_store_files_are_excluded() {
+fn ds_store_files_are_excluded_by_the_walker() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(".DS_Store"), "x").unwrap();
     std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
