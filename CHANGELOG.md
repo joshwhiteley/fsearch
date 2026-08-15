@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 — 2026-08-15
+
+- Metadata filters: `kind:image`, `changed:7d`, `larger:100mb`,
+  `smaller:` — composable with every search mode
+- `fsearch --big [N]`: largest files in the index
+- Actions menu on `→`: open, reveal, copy path, Quick Look, move to trash
+- Quick Look on `ctrl-space` (macOS)
+- Query history: `ctrl-p` / `ctrl-n`
+- Themes: catppuccin, gruvbox, nord, tokyonight presets + accent override
+- Arena index cache: one allocation instead of a million; one-shot
+  searches 1.7x faster (see docs/blog/arena-cache.md, including a
+  measured negative result on incremental narrowing)
+- Index format v3 (rebuilds automatically; stores mtime + size)
+
 ## 0.3.0 — 2026-08-15
 
 - Query filters: `ext:pdf`, `path:term` narrow any search — including

@@ -34,11 +34,17 @@ Run `fsearch` and start typing.
   instant)
 - `ext:pdf`, `path:term` — narrow any search (content search included,
   so `> ext:md TODO` greps only markdown)
+- `kind:image` (also video, audio, doc, code, archive), `changed:7d`,
+  `larger:100mb` / `smaller:` — metadata filters that compose with any query
 - `dir:` — search folders instead of files (preview lists their contents)
-- `enter` opens · `ctrl-f` reveals in Finder · `ctrl-y` copies the path ·
+- `enter` opens · `→` opens an actions menu (reveal, copy, quick look,
+  move to trash) · `ctrl-space` Quick Look · `ctrl-y` copies the path ·
+  `ctrl-p`/`ctrl-n` recall query history ·
   `tab` cycles the preview (side → full-window → hidden) · `esc` quits
 
-Scripting: `fsearch -p QUERY` prints matches to stdout (exit 1 when none),
+Scripting: `fsearch --big` lists the largest files in the index (a quick
+"what's eating my disk"), and `fsearch -p QUERY` prints matches to stdout
+(exit 1 when none),
 and `fsearch --pick` runs the full UI but prints your selection instead of
 opening it — so `vim "$(fsearch --pick)"` works. `fsearch --help` lists
 everything else.

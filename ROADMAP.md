@@ -1,5 +1,10 @@
 # Roadmap
 
+Shipped in v0.4.0:
+
+- Metadata filters (kind:/changed:/larger:), `--big`, actions menu,
+  Quick Look, query history, themes, arena index cache
+
 Shipped in v0.3.0:
 
 - Query filters (`ext:`, `path:`, `dir:`) across all search modes

@@ -1,8 +1,8 @@
 use crate::content::{self, ContentMatch};
 use crate::filters::{self, Filters};
 use crate::frecency::Frecency;
-use crate::matcher::{self, FilenameMode};
 use crate::index::PathStore;
+use crate::matcher::{self, FilenameMode};
 use crate::walker::FileMeta;
 use crate::{config::Config, index, walker};
 use std::collections::{HashMap, HashSet};
