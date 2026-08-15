@@ -1,5 +1,13 @@
 # Roadmap
 
+Shipped in v0.3.0:
+
+- Query filters (`ext:`, `path:`, `dir:`) across all search modes
+- Search inside PDFs (cached text extraction)
+- `--pick` mode + shell integration (Ctrl-T, `fcd`)
+- Syntax hints under the search bar; size/age in the status line
+- Optional chafa renderer for sharper cell-art previews
+
 Shipped in v0.2.0:
 
 - Syntax-highlighted previews (syntect + two-face, dark/light auto-detected)
@@ -16,9 +24,8 @@ Planned:
 
 - Homebrew tap publishing (`brew install joshwhiteley/tap/fsearch`)
 - crates.io release
-- PDF and Office text extraction for content search
+- Office document text extraction (docx, xlsx)
 - Configurable keybindings
-- Per-file-type filters (`ext:pdf`, `kind:image`)
 - Optional persistent full-text index for instant content search
 
 Ideas welcome — open an issue.
