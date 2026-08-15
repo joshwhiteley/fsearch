@@ -197,3 +197,60 @@ fn big_lists_largest_files_first() {
     assert!(lines[0].contains("huge.bin") && lines[0].contains("5.0 KB"));
     assert!(lines[1].contains("mid.txt"));
 }
+
+#[test]
+fn semantic_index_and_query_with_fake_embedder() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("money.md"),
+        "compound interest rewards patience and time\n",
+    )
+    .unwrap();
+    std::fs::write(tree.join("garden.md"), "tomatoes need sun water and mulch\n").unwrap();
+    std::fs::write(tree.join("code.rs"), "fn main() {}\n").unwrap();
+    let xdg = dir.path().join("xdg");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
+    std::fs::write(
+        xdg.join("fsearch").join("config.toml"),
+        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+    )
+    .unwrap();
+    let env: &[(&str, &str)] = &[
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+        ("FSEARCH_SEM_FAKE", "1"),
+    ];
+
+    // querying before indexing points at --index-semantic
+    let out = fsearch(&["-p", "? compound interest"], env);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("--index-semantic"), "got: {err}");
+
+    let out = fsearch(&["--index-semantic"], env);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("2 documents"), "got: {text}");
+    assert!(cache.join("fsearch").join("semantic.bin").exists());
+
+    // the doc sharing the query's vocabulary ranks first (path:line:score)
+    let out = fsearch(&["-p", "? compound interest and patience"], env);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let first = text.lines().next().unwrap();
+    assert!(first.contains("money.md:1:"), "got: {text}");
+    assert!(text.contains("garden.md"));
+
+    // rebuilding reuses every unchanged document
+    let out = fsearch(&["--index-semantic"], env);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("0 embedded, 2 unchanged"), "got: {text}");
+}

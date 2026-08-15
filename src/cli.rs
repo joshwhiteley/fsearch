@@ -5,6 +5,7 @@ pub enum Command {
     Version,
     Config,
     Reindex,
+    IndexSemantic,
     Doctor,
     Print(String),
     Pick(String),
@@ -20,6 +21,9 @@ usage:
   fsearch --config     open the config file in $VISUAL/$EDITOR,
                        or reveal it in Finder when neither is set
   fsearch --reindex    rebuild the file index now
+  fsearch --index-semantic
+                       build/refresh the semantic index for ? queries
+                       (notes, docs, pdfs; embeds changed files only)
   fsearch --big [N]    largest N files in the index (default 20)
   fsearch -p QUERY     print matches to stdout (no ui); \"> pattern\"
                        searches file contents
@@ -33,6 +37,8 @@ query syntax:
   plain text           fuzzy match on file names and paths
   ctrl-r               toggle regex match on the full path
   > pattern            regex search inside file contents
+  ? words              search documents by meaning (semantic; run
+                       fsearch --index-semantic first)
   ext:pdf path:term    narrow any search by extension or path
   kind:image           extension shorthands: image, video, audio,
                        doc, code, archive
@@ -104,6 +110,7 @@ pub fn parse(args: &[String]) -> Command {
             "--version" | "-V" => Command::Version,
             "--config" => Command::Config,
             "--reindex" => Command::Reindex,
+            "--index-semantic" => Command::IndexSemantic,
             "--doctor" => Command::Doctor,
             other => return Command::Unknown(other.to_string()),
         };
@@ -145,6 +152,7 @@ mod tests {
     fn config_and_reindex_flags() {
         assert_eq!(parse_strs(&["--config"]), Command::Config);
         assert_eq!(parse_strs(&["--reindex"]), Command::Reindex);
+        assert_eq!(parse_strs(&["--index-semantic"]), Command::IndexSemantic);
     }
 
     #[test]
@@ -216,6 +224,8 @@ mod tests {
             "--reindex",
             "--version",
             "> pattern",
+            "? words",
+            "--index-semantic",
             "ctrl-r",
         ] {
             assert!(HELP.contains(needle), "help is missing {needle:?}");

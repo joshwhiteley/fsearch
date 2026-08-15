@@ -9,6 +9,7 @@ fn main() {
         Command::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Command::Config => edit_config(),
         Command::Reindex => reindex(),
+        Command::IndexSemantic => index_semantic(),
         Command::Doctor => doctor(),
         Command::Print(query) => print_search(&query),
         Command::Pick(initial) => run_ui(tui::UiMode::Pick, &initial),
@@ -114,7 +115,40 @@ fn print_search(query: &str) {
     } else {
         stripped
     };
-    let matched = if let Some(pattern) = query.strip_prefix('>') {
+    let matched = if let Some(q) = query.strip_prefix('?') {
+        let q = q.trim_start().to_string();
+        let mut embedder = fsearch::sem::make_embedder().unwrap_or_else(|e| {
+            eprintln!("fsearch: {e}");
+            std::process::exit(2);
+        });
+        let store_path = fsearch::sem::default_store_path();
+        let sem_store = match fsearch::sem::SemStore::load(&store_path) {
+            Some(s) if s.dim as usize == embedder.dim() => s,
+            Some(_) => {
+                eprintln!(
+                    "fsearch: semantic index is from another model — rerun fsearch --index-semantic"
+                );
+                std::process::exit(2);
+            }
+            None => {
+                eprintln!("fsearch: no semantic index yet — run fsearch --index-semantic");
+                std::process::exit(2);
+            }
+        };
+        let qv = embedder.embed(&[q]).unwrap_or_else(|e| {
+            eprintln!("fsearch: {e}");
+            std::process::exit(2);
+        });
+        let mut any = false;
+        for hit in sem_store.query(&qv[0], fsearch::engine::SEMANTIC_LIMIT) {
+            let path = &sem_store.docs[hit.doc].path;
+            if query_filters.is_empty() || query_filters.matches(path) {
+                any = true;
+                println!("{path}:{}:{:.2}", hit.line_start, hit.score);
+            }
+        }
+        any
+    } else if let Some(pattern) = query.strip_prefix('>') {
         let pattern = pattern.trim_start().to_string();
         let paths: Vec<String> = (0..store.len())
             .filter(|&i| {
@@ -222,6 +256,78 @@ fn edit_config() {
             }
         }
     }
+}
+
+/// Builds the vector index behind `?` queries: every text-bearing document
+/// in the file index is chunked and embedded, reusing vectors for files
+/// that haven't changed since the last run.
+fn index_semantic() {
+    let config = load_config();
+    let store = load_index(&config);
+    let mut embedder = match fsearch::sem::make_embedder() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fsearch: {e}");
+            std::process::exit(1);
+        }
+    };
+    let files: Vec<(String, i64, u64)> = (0..store.len())
+        .filter(|&i| {
+            let p = store.get(i);
+            !p.ends_with('/')
+                && fsearch::sem::is_semantic_path(p)
+                && store.meta(i).size <= fsearch::sem::MAX_SEMANTIC_BYTES
+        })
+        .map(|i| (store.get(i).to_string(), store.meta(i).mtime, store.meta(i).size))
+        .collect();
+    let out_path = fsearch::sem::default_store_path();
+    let prior = fsearch::sem::SemStore::load(&out_path);
+    let pdf_cache = fsearch::pdf::default_cache_dir();
+    let start = Instant::now();
+    let mut read = |path: &str| -> Option<String> {
+        if path.to_ascii_lowercase().ends_with(".pdf") {
+            fsearch::pdf::extract_cached(path, &pdf_cache).ok()
+        } else {
+            std::fs::read_to_string(path).ok()
+        }
+    };
+    let mut last_tick = Instant::now();
+    let mut progress = |done: usize, total: usize| {
+        if last_tick.elapsed().as_millis() >= 500 {
+            last_tick = Instant::now();
+            eprint!("\r{done}/{total} documents");
+        }
+    };
+    let result = fsearch::sem::build(
+        &files,
+        prior.as_ref(),
+        embedder.as_mut(),
+        &mut read,
+        &mut progress,
+    );
+    let (sem_store, stats) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\rfsearch: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = sem_store.save(&out_path) {
+        eprintln!("\rfsearch: writing {}: {e}", out_path.display());
+        std::process::exit(1);
+    }
+    let secs = start.elapsed().as_secs_f32();
+    print!(
+        "\rsemantic index: {} documents, {} chunks ({} embedded, {} unchanged",
+        sem_store.docs.len(),
+        sem_store.chunk_count(),
+        stats.embedded,
+        stats.reused,
+    );
+    if stats.skipped > 0 {
+        print!(", {} unreadable", stats.skipped);
+    }
+    println!(") in {secs:.1}s");
 }
 
 fn reindex() {

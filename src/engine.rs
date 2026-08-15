@@ -2,6 +2,7 @@ use crate::content::{self, ContentMatch};
 use crate::filters::{self, Filters};
 use crate::frecency::Frecency;
 use crate::index::PathStore;
+use crate::sem;
 use crate::matcher::{self, FilenameMode};
 use crate::walker::FileMeta;
 use crate::{config::Config, index, walker};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 pub const FILENAME_LIMIT: usize = 500;
 pub const CONTENT_LIMIT: usize = 1000;
+pub const SEMANTIC_LIMIT: usize = 100;
 pub const CONTENT_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,11 +23,14 @@ pub enum Mode {
     Fuzzy,
     Regex,
     Content,
+    Semantic,
 }
 
 pub fn parse_query(input: &str, regex_mode: bool) -> (Mode, String) {
     if let Some(rest) = input.strip_prefix('>') {
         (Mode::Content, rest.trim_start().to_string())
+    } else if let Some(rest) = input.strip_prefix('?') {
+        (Mode::Semantic, rest.trim_start().to_string())
     } else if regex_mode {
         (Mode::Regex, input.to_string())
     } else {
@@ -65,6 +70,16 @@ enum Msg {
         generation: u64,
         hit: ContentMatch,
     },
+    SemanticResults {
+        generation: u64,
+        rows: Vec<ResultRow>,
+        error: Option<String>,
+    },
+}
+
+struct SemJob {
+    generation: u64,
+    query: String,
 }
 
 struct FilenameJob {
@@ -91,6 +106,8 @@ pub struct Engine {
     filters: Filters,
     pending_content: Option<(String, Instant)>,
     content_cancel: Option<Arc<AtomicBool>>,
+    pending_semantic: Option<(String, Instant)>,
+    sem_tx: Option<Sender<SemJob>>,
     frecency: Frecency,
     boosts: Arc<HashMap<String, u32>>,
 }
@@ -353,6 +370,8 @@ impl Engine {
             filters: Filters::default(),
             pending_content: None,
             content_cancel: None,
+            pending_semantic: None,
+            sem_tx: None,
             frecency,
             boosts,
         }
@@ -383,12 +402,22 @@ impl Engine {
             Mode::Content => {
                 self.results.clear();
                 self.status.matches = 0;
+                self.pending_semantic = None;
                 if !query.is_empty() {
                     self.pending_content = Some((query, Instant::now()));
                 }
             }
+            Mode::Semantic => {
+                self.results.clear();
+                self.status.matches = 0;
+                self.pending_content = None;
+                if !query.is_empty() {
+                    self.pending_semantic = Some((query, Instant::now()));
+                }
+            }
             Mode::Fuzzy | Mode::Regex => {
                 self.pending_content = None;
+                self.pending_semantic = None;
                 self.dispatch_filename();
             }
         }
@@ -396,6 +425,7 @@ impl Engine {
 
     pub fn tick(&mut self) {
         self.fire_due_content_search();
+        self.fire_due_semantic_search();
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
                 Msg::IndexSnapshot { store, indexing } => {
@@ -446,6 +476,22 @@ impl Engine {
                     if self.results.len() >= CONTENT_LIMIT {
                         self.cancel_content();
                     }
+                }
+                Msg::SemanticResults {
+                    generation,
+                    rows,
+                    error,
+                } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    let f = &self.filters;
+                    self.results = rows
+                        .into_iter()
+                        .filter(|r| f.is_empty() || f.matches(&r.path))
+                        .collect();
+                    self.status.matches = self.results.len();
+                    self.status.error = error;
                 }
             }
         }
@@ -551,6 +597,103 @@ impl Engine {
             flag.store(true, Ordering::Relaxed);
         }
     }
+
+    fn fire_due_semantic_search(&mut self) {
+        let due = self
+            .pending_semantic
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= CONTENT_DEBOUNCE);
+        if !due {
+            return;
+        }
+        let (query, _) = self.pending_semantic.take().unwrap();
+        let tx = self.ensure_semantic_worker();
+        let _ = tx.send(SemJob {
+            generation: self.generation,
+            query,
+        });
+    }
+
+    /// One worker for the whole session: the embedding model and the vector
+    /// store both load once, on the first `?` query, and stay warm.
+    fn ensure_semantic_worker(&mut self) -> Sender<SemJob> {
+        if let Some(tx) = &self.sem_tx {
+            return tx.clone();
+        }
+        let (tx, rx) = mpsc::channel::<SemJob>();
+        let msg_tx = self.msg_tx.clone();
+        std::thread::spawn(move || {
+            let mut ready: Option<(Box<dyn sem::Embedder + Send>, sem::SemStore)> = None;
+            let mut broken: Option<String> = None;
+            while let Ok(mut job) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    job = newer;
+                }
+                if ready.is_none() && broken.is_none() {
+                    match sem::make_embedder() {
+                        Ok(e) => match sem::SemStore::load(&sem::default_store_path()) {
+                            Some(s) if s.dim as usize == e.dim() => ready = Some((e, s)),
+                            Some(_) => {
+                                broken = Some(
+                                    "semantic index is from another model — \
+                                     rerun fsearch --index-semantic"
+                                        .to_string(),
+                                )
+                            }
+                            None => {
+                                broken = Some(
+                                    "no semantic index yet — run fsearch --index-semantic"
+                                        .to_string(),
+                                )
+                            }
+                        },
+                        Err(e) => broken = Some(e),
+                    }
+                }
+                let msg = match (&mut ready, &broken) {
+                    (Some((embedder, store)), _) => {
+                        match embedder.embed(std::slice::from_ref(&job.query)) {
+                            Ok(qv) => {
+                                let rows = store
+                                    .query(&qv[0], SEMANTIC_LIMIT)
+                                    .into_iter()
+                                    .map(|h| ResultRow {
+                                        path: store.docs[h.doc].path.clone(),
+                                        line_number: Some(h.line_start as u64),
+                                        line: Some(format!(
+                                            "{:.0}% match",
+                                            h.score.clamp(0.0, 1.0) * 100.0
+                                        )),
+                                        recent_open: false,
+                                    })
+                                    .collect();
+                                Msg::SemanticResults {
+                                    generation: job.generation,
+                                    rows,
+                                    error: None,
+                                }
+                            }
+                            Err(e) => Msg::SemanticResults {
+                                generation: job.generation,
+                                rows: Vec::new(),
+                                error: Some(e),
+                            },
+                        }
+                    }
+                    _ => Msg::SemanticResults {
+                        generation: job.generation,
+                        rows: Vec::new(),
+                        error: broken.clone(),
+                    },
+                };
+                if msg_tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        });
+        self.sem_tx = Some(tx.clone());
+        tx
+    }
 }
 
 #[cfg(test)]
@@ -586,5 +729,16 @@ mod tests {
     #[test]
     fn parse_bare_gt_is_empty_content() {
         assert_eq!(parse_query(">", false), (Mode::Content, String::new()));
+    }
+
+    #[test]
+    fn parse_question_prefix_is_semantic() {
+        assert_eq!(
+            parse_query("? essays about patience", false),
+            (Mode::Semantic, "essays about patience".to_string())
+        );
+        // regex toggle does not override semantic mode
+        assert_eq!(parse_query("?x", true), (Mode::Semantic, "x".to_string()));
+        assert_eq!(parse_query("?", false), (Mode::Semantic, String::new()));
     }
 }

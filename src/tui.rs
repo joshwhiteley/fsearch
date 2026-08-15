@@ -374,7 +374,7 @@ impl App {
     }
 }
 
-const HINTS: &str = "> grep in files \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
+const HINTS: &str = "> grep in files \u{b7} ? semantic \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
 
 fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
     Block::default()
@@ -484,6 +484,7 @@ fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>> {
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match (app.engine.mode(), app.regex_mode) {
         (Mode::Content, _) => "content",
+        (Mode::Semantic, _) => "semantic",
         (_, true) => "regex",
         _ => "fuzzy",
     };
