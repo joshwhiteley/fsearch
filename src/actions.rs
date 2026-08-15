@@ -43,6 +43,45 @@ pub fn reveal(path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn quick_look_args(path: &str) -> (&'static str, Vec<String>) {
+    ("qlmanage", vec!["-p".to_string(), path.to_string()])
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn quick_look_args(path: &str) -> (&'static str, Vec<String>) {
+    // no Quick Look on Linux; opening is the closest equivalent
+    open_args(path)
+}
+
+/// Opens the system Quick Look panel (macOS) for the file.
+pub fn quick_look(path: &str) -> std::io::Result<()> {
+    run(quick_look_args(path))
+}
+
+#[cfg(target_os = "macos")]
+pub fn trash_args(path: &str) -> (&'static str, Vec<String>) {
+    // Finder's trash: recoverable, no special entitlements needed
+    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    (
+        "osascript",
+        vec![
+            "-e".to_string(),
+            format!("tell application \"Finder\" to delete POSIX file \"{escaped}\""),
+        ],
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn trash_args(path: &str) -> (&'static str, Vec<String>) {
+    ("gio", vec!["trash".to_string(), path.to_string()])
+}
+
+/// Moves the file to the system trash (recoverable).
+pub fn trash(path: &str) -> std::io::Result<()> {
+    run(trash_args(path))
+}
+
+#[cfg(target_os = "macos")]
 const CLIPBOARD_COMMANDS: &[&[&str]] = &[&["pbcopy"]];
 
 #[cfg(not(target_os = "macos"))]
@@ -85,6 +124,23 @@ mod tests {
             open_args("/a b.txt"),
             ("open", vec!["/a b.txt".to_string()])
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quick_look_uses_qlmanage() {
+        assert_eq!(
+            quick_look_args("/a.png"),
+            ("qlmanage", vec!["-p".to_string(), "/a.png".to_string()])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trash_goes_through_finder_with_escaping() {
+        let (cmd, args) = trash_args("/a/b \"c\".txt");
+        assert_eq!(cmd, "osascript");
+        assert!(args[1].contains("POSIX file \"/a/b \\\"c\\\".txt\""));
     }
 
     #[cfg(target_os = "macos")]

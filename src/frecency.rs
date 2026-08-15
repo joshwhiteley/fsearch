@@ -30,6 +30,45 @@ pub fn default_history_path() -> PathBuf {
     base.join("fsearch").join("history")
 }
 
+pub fn default_queries_path() -> PathBuf {
+    default_history_path().with_file_name("queries")
+}
+
+/// Recent unique queries, oldest first, capped.
+pub fn load_queries(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let q = line.trim();
+        if q.is_empty() {
+            continue;
+        }
+        out.retain(|prev| prev != q); // keep most recent occurrence only
+        out.push(q.to_string());
+    }
+    let excess = out.len().saturating_sub(100);
+    out.drain(..excess);
+    out
+}
+
+pub fn append_query(path: &std::path::Path, query: &str) {
+    if query.trim().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{}", query.trim());
+    }
+}
+
 impl Frecency {
     pub fn load(file: PathBuf) -> Frecency {
         let mut map: HashMap<String, Entry> = HashMap::new();
@@ -124,6 +163,23 @@ mod tests {
     use super::*;
 
     const HOUR: i64 = 3600;
+
+    #[test]
+    fn queries_roundtrip_dedupe_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queries");
+        append_query(&path, "alpha");
+        append_query(&path, "beta");
+        append_query(&path, "alpha"); // re-run: moves to most-recent
+        append_query(&path, "  ");
+        assert_eq!(load_queries(&path), vec!["beta", "alpha"]);
+        for i in 0..150 {
+            append_query(&path, &format!("q{i}"));
+        }
+        let qs = load_queries(&path);
+        assert_eq!(qs.len(), 100);
+        assert_eq!(qs.last().unwrap(), "q149");
+    }
 
     #[test]
     fn missing_file_is_empty() {

@@ -57,6 +57,11 @@ pub struct App {
     pub picker: Option<Picker>,
     pub ui_mode: UiMode,
     pub picked: Option<String>,
+    /// Open actions popup: Some(selected entry index).
+    pub menu: Option<usize>,
+    pub history: Vec<String>,
+    history_pos: Option<usize>,
+    history_file: Option<std::path::PathBuf>,
     preview_for: Option<(String, Option<u64>)>,
     preview: PreviewContent,
 }
@@ -88,8 +93,69 @@ impl App {
             picker: None,
             ui_mode: UiMode::Open,
             picked: None,
+            menu: None,
+            history: Vec::new(),
+            history_pos: None,
+            history_file: None,
             preview_for: None,
             preview: PreviewContent::Lines(Vec::new()),
+        }
+    }
+
+    const MENU: [&'static str; 5] = [
+        "open",
+        "reveal in finder",
+        "copy path",
+        "quick look",
+        "move to trash",
+    ];
+
+    fn run_menu_action(&mut self, entry: usize) {
+        self.menu = None;
+        match entry {
+            0 => self.open_selected(),
+            1 => self.act(actions::reveal, "revealed"),
+            2 => self.act(actions::copy, "copied"),
+            3 => self.act(actions::quick_look, "quick look"),
+            4 => self.act(actions::trash, "trashed"),
+            _ => {}
+        }
+    }
+
+    fn history_step(&mut self, back: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match (self.history_pos, back) {
+            (None, true) => Some(self.history.len() - 1),
+            (None, false) => return,
+            (Some(0), true) => Some(0),
+            (Some(i), true) => Some(i - 1),
+            (Some(i), false) if i + 1 < self.history.len() => Some(i + 1),
+            (Some(_), false) => {
+                // stepped past the newest entry: back to a blank query
+                self.history_pos = None;
+                self.input.clear();
+                self.refresh_query();
+                return;
+            }
+        };
+        self.history_pos = next;
+        if let Some(i) = next {
+            self.input = self.history[i].clone();
+            self.refresh_query_keep_history();
+        }
+    }
+
+    fn push_history(&mut self) {
+        let q = self.input.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.history.retain(|prev| prev != &q);
+        self.history.push(q.clone());
+        if let Some(file) = &self.history_file {
+            crate::frecency::append_query(file, &q);
         }
     }
 
@@ -97,8 +163,27 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.message = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // the actions popup swallows navigation while open
+        if let Some(selected) = self.menu {
+            match key.code {
+                KeyCode::Esc | KeyCode::Left => self.menu = None,
+                KeyCode::Down => self.menu = Some((selected + 1) % Self::MENU.len()),
+                KeyCode::Up => {
+                    self.menu = Some((selected + Self::MENU.len() - 1) % Self::MENU.len());
+                }
+                KeyCode::Enter => self.run_menu_action(selected),
+                _ => {}
+            }
+            return true;
+        }
         match (key.code, ctrl) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => return false,
+            (KeyCode::Right, _) if !self.engine.results().is_empty() => {
+                self.menu = Some(0);
+            }
+            (KeyCode::Char('p'), true) => self.history_step(true),
+            (KeyCode::Char('n'), true) => self.history_step(false),
+            (KeyCode::Char(' '), true) => self.act(actions::quick_look, "quick look"),
             (KeyCode::Char('r'), true) => {
                 self.regex_mode = !self.regex_mode;
                 self.refresh_query();
@@ -113,10 +198,19 @@ impl App {
             (KeyCode::Char('f'), true) => self.act(actions::reveal, "revealed"),
             (KeyCode::Tab, _) => self.preview_layout = self.preview_layout.next(),
             (KeyCode::Enter, _) => match self.ui_mode {
-                UiMode::Open => self.open_selected(),
+                UiMode::Open => {
+                    self.push_history();
+                    self.open_selected();
+                }
                 UiMode::Pick => {
-                    if let Some(row) = self.engine.results().get(self.selected) {
-                        self.picked = Some(row.path.clone());
+                    let picked = self
+                        .engine
+                        .results()
+                        .get(self.selected)
+                        .map(|row| row.path.clone());
+                    if let Some(path) = picked {
+                        self.push_history();
+                        self.picked = Some(path);
                         return false;
                     }
                 }
@@ -135,6 +229,11 @@ impl App {
     }
 
     fn refresh_query(&mut self) {
+        self.history_pos = None;
+        self.refresh_query_keep_history();
+    }
+
+    fn refresh_query_keep_history(&mut self) {
         self.selected = 0;
         self.engine.set_query(&self.input, self.regex_mode);
     }
@@ -309,6 +408,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     draw_status(frame, app, status_area);
+    if let Some(selected) = app.menu {
+        draw_menu(frame, selected, body);
+    }
+}
+
+/// Small actions popup anchored inside the body area.
+fn draw_menu(frame: &mut Frame, selected: usize, body: Rect) {
+    let width = 24u16.min(body.width);
+    let height = (App::MENU.len() as u16 + 2).min(body.height);
+    let area = Rect {
+        x: body.x + (body.width.saturating_sub(width)) / 2,
+        y: body.y + (body.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let items: Vec<ListItem> = App::MENU
+        .iter()
+        .map(|label| ListItem::new(format!(" {label}")))
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("actions"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// Preview for a directory entry: its children, folders first.
@@ -615,6 +740,9 @@ pub fn run(engine: Engine, ui_mode: UiMode, initial_query: &str) -> anyhow::Resu
     app.appearance = traits.appearance;
     app.picker = picker;
     app.ui_mode = ui_mode;
+    let queries_path = crate::frecency::default_queries_path();
+    app.history = crate::frecency::load_queries(&queries_path);
+    app.history_file = Some(queries_path);
     if !initial_query.is_empty() {
         app.input = initial_query.to_string();
         app.engine.set_query(&app.input, app.regex_mode);
@@ -769,6 +897,50 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("preview"));
         assert!(!text.contains("results"));
+    }
+
+    #[test]
+    fn history_cycles_with_ctrl_p_and_n() {
+        let mut app = test_app();
+        app.history = vec!["alpha".to_string(), "beta".to_string()];
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "beta");
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "alpha");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "beta");
+        // stepping past the newest clears back to a blank query
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "");
+        // typing resets the cursor position in history
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "beta");
+    }
+
+    #[test]
+    fn menu_opens_only_with_results_and_esc_closes_it() {
+        let mut app = test_app();
+        // no results: Right is a no-op
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.menu, None);
+        // force it open: Esc closes the menu without quitting the app
+        app.menu = Some(0);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(app.menu, None);
+        // and a second Esc quits
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn menu_renders_actions() {
+        let mut app = test_app();
+        app.menu = Some(4);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("move to trash"));
+        assert!(text.contains("quick look"));
     }
 
     #[test]
