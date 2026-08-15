@@ -64,6 +64,15 @@ pub struct App {
 enum PreviewContent {
     Lines(Vec<Line<'static>>),
     Image(Box<StatefulProtocol>),
+    /// Image rendered by fsearch's own chafa pipeline (geometric symbols,
+    /// max quality); re-encoded only when the target area changes.
+    #[cfg(feature = "chafa")]
+    CellArt {
+        img: image::DynamicImage,
+        cols: u16,
+        rows: u16,
+        lines: Vec<Line<'static>>,
+    },
 }
 
 impl App {
@@ -214,6 +223,16 @@ impl App {
                 images::load(&row.path, images::MAX_IMAGE_BYTES),
             ) {
                 (Some(picker), Ok(img)) => {
+                    #[cfg(feature = "chafa")]
+                    if picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks {
+                        self.preview = PreviewContent::CellArt {
+                            img,
+                            cols: 0,
+                            rows: 0,
+                            lines: Vec::new(),
+                        };
+                        return;
+                    }
                     PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
                 }
                 (None, _) => PreviewContent::Lines(vec![Line::from("(image)")]),
@@ -433,6 +452,22 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = block.inner(area);
             frame.render_widget(block, area);
             frame.render_stateful_widget(StatefulImage::default(), inner, protocol.as_mut());
+        }
+        #[cfg(feature = "chafa")]
+        PreviewContent::CellArt {
+            img,
+            cols,
+            rows,
+            lines,
+        } => {
+            let inner = block.inner(area);
+            let (want_cols, want_rows) =
+                crate::cellart::fit_cells(img.width(), img.height(), inner.width, inner.height);
+            if (*cols, *rows) != (want_cols, want_rows) {
+                *lines = crate::cellart::render(img, want_cols, want_rows);
+                (*cols, *rows) = (want_cols, want_rows);
+            }
+            frame.render_widget(Paragraph::new(lines.clone()).block(block), area);
         }
     }
 }
