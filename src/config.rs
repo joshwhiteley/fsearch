@@ -30,11 +30,18 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "Library/CloudStorage",
 ];
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ThemeConfig {
+    pub preset: String,
+    pub accent: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub roots: Vec<PathBuf>,
     pub excludes: Vec<String>,
     pub max_content_filesize: u64,
+    pub theme: ThemeConfig,
 }
 
 impl Default for Config {
@@ -43,6 +50,7 @@ impl Default for Config {
             roots: vec![dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))],
             excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             max_content_filesize: 2 * 1024 * 1024,
+            theme: ThemeConfig::default(),
         }
     }
 }
@@ -52,6 +60,13 @@ struct RawConfig {
     roots: Option<Vec<String>>,
     excludes: Option<Vec<String>>,
     max_content_filesize: Option<u64>,
+    theme: Option<RawTheme>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawTheme {
+    preset: Option<String>,
+    accent: Option<String>,
 }
 
 pub fn expand_tilde(s: &str) -> PathBuf {
@@ -83,6 +98,8 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #   cloud drives are excluded by default; delete \"Library/Mobile Documents\"
 #   (iCloud) or \"Library/CloudStorage\" (Box, Dropbox, ...) to index them
 # max_content_filesize: content search skips files larger than this (bytes)
+# [theme] preset: default, catppuccin, gruvbox, nord, tokyonight
+#         accent: optional hex override, e.g. \"#7aa2f7\"
 ";
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
@@ -108,6 +125,13 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
             .unwrap_or(d.roots),
         excludes: raw.excludes.unwrap_or(d.excludes),
         max_content_filesize: raw.max_content_filesize.unwrap_or(d.max_content_filesize),
+        theme: raw
+            .theme
+            .map(|t| ThemeConfig {
+                preset: t.preset.unwrap_or_default(),
+                accent: t.accent,
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -170,6 +194,19 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "roots = not toml").unwrap();
         assert!(load_or_create(&path).is_err());
+    }
+
+    #[test]
+    fn theme_section_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[theme]\npreset = \"nord\"\naccent = \"#ff0080\"\n").unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert_eq!(c.theme.preset, "nord");
+        assert_eq!(c.theme.accent.as_deref(), Some("#ff0080"));
+        // absent section: defaults
+        let d = Config::default();
+        assert_eq!(d.theme.preset, "");
     }
 
     #[test]

@@ -22,6 +22,7 @@ fn config_for(root: &std::path::Path) -> Config {
         roots: vec![root.to_path_buf()],
         excludes: vec!["node_modules".to_string()],
         max_content_filesize: 1024 * 1024,
+        theme: Default::default(),
     }
 }
 

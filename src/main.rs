@@ -178,12 +178,14 @@ fn print_search(query: &str) {
 }
 
 fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
+    let config = load_config();
+    let theme = fsearch::theme::resolve(&config.theme.preset, config.theme.accent.as_deref());
     let engine = Engine::new(
-        load_config(),
+        config,
         index::default_cache_path(),
         fsearch::frecency::default_history_path(),
     );
-    match tui::run(engine, ui_mode, initial_query) {
+    match tui::run(engine, ui_mode, initial_query, theme) {
         Ok(Some(picked)) => println!("{picked}"),
         Ok(None) => {
             if ui_mode == tui::UiMode::Pick {

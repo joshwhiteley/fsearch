@@ -3,6 +3,7 @@ use crate::engine::{Engine, Mode};
 use crate::highlight::{self, Appearance};
 use crate::images;
 use crate::matcher::Highlighter;
+use crate::theme::Theme;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -55,6 +56,7 @@ pub struct App {
     pub message: Option<String>,
     pub appearance: Appearance,
     pub picker: Option<Picker>,
+    pub theme: Theme,
     pub ui_mode: UiMode,
     pub picked: Option<String>,
     /// Open actions popup: Some(selected entry index).
@@ -91,6 +93,7 @@ impl App {
             message: None,
             appearance: Appearance::Dark,
             picker: None,
+            theme: crate::theme::resolve("default", None),
             ui_mode: UiMode::Open,
             picked: None,
             menu: None,
@@ -283,7 +286,7 @@ impl App {
         }
         self.preview_for = Some(key);
         if row.path.ends_with('/') {
-            self.preview = PreviewContent::Lines(directory_listing(&row.path));
+            self.preview = PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
             return;
         }
         if crate::pdf::is_pdf_path(&row.path) {
@@ -292,7 +295,7 @@ impl App {
                     Ok(text) => match row.line_number {
                         Some(n) => {
                             let start = (n as usize).saturating_sub(6);
-                            let gutter = Style::default().fg(Color::DarkGray);
+                            let gutter = Style::default().fg(self.theme.dim);
                             text.lines()
                                 .enumerate()
                                 .skip(start)
@@ -354,7 +357,7 @@ impl App {
                             .enumerate()
                             .skip(start)
                             .map(|(i, line)| {
-                                let gutter = Style::default().fg(Color::DarkGray);
+                                let gutter = Style::default().fg(self.theme.dim);
                                 let mut spans =
                                     vec![Span::styled(format!("{:>5} ", i + 1), gutter)];
                                 spans.extend(line.spans);
@@ -373,6 +376,16 @@ impl App {
 
 const HINTS: &str = "> grep in files \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
 
+fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(theme.title),
+        ))
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // show syntax reminders under the search bar until typing starts
     let hint_rows = if app.input.is_empty() { 1 } else { 0 };
@@ -388,7 +401,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_input(frame, app, outer[0]);
     if hint_rows > 0 {
-        let hints = Paragraph::new(format!(" {HINTS}")).style(Style::default().fg(Color::DarkGray));
+        let hints = Paragraph::new(format!(" {HINTS}")).style(Style::default().fg(app.theme.dim));
         frame.render_widget(hints, outer[1]);
     }
     let body = outer[2];
@@ -409,12 +422,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_status(frame, app, status_area);
     if let Some(selected) = app.menu {
-        draw_menu(frame, selected, body);
+        draw_menu(frame, selected, body, &app.theme);
     }
 }
 
 /// Small actions popup anchored inside the body area.
-fn draw_menu(frame: &mut Frame, selected: usize, body: Rect) {
+fn draw_menu(frame: &mut Frame, selected: usize, body: Rect, theme: &Theme) {
     let width = 24u16.min(body.width);
     let height = (App::MENU.len() as u16 + 2).min(body.height);
     let area = Rect {
@@ -429,7 +442,7 @@ fn draw_menu(frame: &mut Frame, selected: usize, body: Rect) {
         .map(|label| ListItem::new(format!(" {label}")))
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("actions"))
+        .block(themed_block("actions", theme))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(Some(selected));
@@ -437,7 +450,7 @@ fn draw_menu(frame: &mut Frame, selected: usize, body: Rect) {
 }
 
 /// Preview for a directory entry: its children, folders first.
-fn directory_listing(path: &str) -> Vec<Line<'static>> {
+fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>> {
     let Ok(entries) = std::fs::read_dir(path) else {
         return vec![Line::from("(unreadable directory)")];
     };
@@ -459,7 +472,7 @@ fn directory_listing(path: &str) -> Vec<Line<'static>> {
             if is_dir {
                 Line::from(Span::styled(
                     format!("{name}/"),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(accent),
                 ))
             } else {
                 Line::from(name)
@@ -474,11 +487,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         (_, true) => "regex",
         _ => "fuzzy",
     };
-    let input = Paragraph::new(app.input.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("fsearch [{mode}]")),
-    );
+    let input = Paragraph::new(app.input.as_str())
+        .block(themed_block(&format!("fsearch [{mode}]"), &app.theme));
     frame.render_widget(input, area);
     frame.set_cursor_position((area.x + 1 + app.input.len() as u16, area.y + 1));
 }
@@ -516,7 +526,7 @@ fn spans_with_positions(shown: &str, positions: &[u32], highlight: Style) -> Vec
 fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
     let accent = Style::default()
-        .fg(Color::Cyan)
+        .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
     let mut highlighter = (matches!(app.engine.mode(), Mode::Fuzzy) && !app.input.is_empty())
         .then(|| Highlighter::new(&app.input));
@@ -533,7 +543,10 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
             };
             match (r.line_number, &r.line) {
                 (Some(n), Some(line)) => ListItem::new(Line::from(vec![
-                    Span::styled(format!("{shown}:{n} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{shown}:{n} "),
+                        Style::default().fg(app.theme.accent),
+                    ),
                     Span::raw(line.clone()),
                 ])),
                 _ => match highlighter.as_mut() {
@@ -559,7 +572,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("results"))
+        .block(themed_block("results", &app.theme))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(Some(app.selected));
@@ -568,7 +581,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     app.load_preview();
-    let block = Block::default().borders(Borders::ALL).title("preview");
+    let block = themed_block("preview", &app.theme);
     match &mut app.preview {
         PreviewContent::Lines(lines) => {
             frame.render_widget(Paragraph::new(lines.clone()).block(block), area);
@@ -652,7 +665,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(m) = &app.message {
         parts.push(m.clone());
     }
-    let status = Paragraph::new(parts.join(" · ")).style(Style::default().fg(Color::DarkGray));
+    let status = Paragraph::new(parts.join(" · ")).style(Style::default().fg(app.theme.dim));
     frame.render_widget(status, area);
 }
 
@@ -724,7 +737,12 @@ fn restore_terminal() {
 
 /// Runs the UI. Draws on /dev/tty (not stdout), so `--pick` works inside
 /// command substitution. In [`UiMode::Pick`], Enter returns the selection.
-pub fn run(engine: Engine, ui_mode: UiMode, initial_query: &str) -> anyhow::Result<Option<String>> {
+pub fn run(
+    engine: Engine,
+    ui_mode: UiMode,
+    initial_query: &str,
+    theme: Theme,
+) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
     let mut tty = open_tty()?;
@@ -740,6 +758,7 @@ pub fn run(engine: Engine, ui_mode: UiMode, initial_query: &str) -> anyhow::Resu
     app.appearance = traits.appearance;
     app.picker = picker;
     app.ui_mode = ui_mode;
+    app.theme = theme;
     let queries_path = crate::frecency::default_queries_path();
     app.history = crate::frecency::load_queries(&queries_path);
     app.history_file = Some(queries_path);
@@ -789,6 +808,7 @@ mod tests {
             roots: vec![dir.path().to_path_buf()],
             excludes: vec![],
             max_content_filesize: 1024,
+            theme: Default::default(),
         };
         let engine = Engine::new(
             config,

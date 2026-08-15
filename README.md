@@ -90,6 +90,10 @@ excluded folders, content-search size limit. Cloud drives (iCloud, Dropbox,
 Box…) are skipped by default; remove them from `excludes` to index them.
 `fsearch --reindex` rebuilds the index after changes.
 
+Themes: add a `[theme]` section with `preset = "catppuccin"` (also
+`gruvbox`, `nord`, `tokyonight`) and an optional `accent = "#7aa2f7"`
+override.
+
 Image previews auto-negotiate the best graphics protocol and fall back to
 colored cells elsewhere (multiplexers included — a terminal merely claiming
 Kitty support isn't trusted, since some ACK the query but never render).
