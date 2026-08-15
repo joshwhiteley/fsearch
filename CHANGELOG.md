@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 — 2026-08-15
+
+- Semantic search: `? growing tomatoes` ranks notes, docs and PDFs by
+  meaning. `fsearch --index-semantic` builds the vector index (re-runs
+  embed only changed files); needs the optional `semantic` build
+  feature. Everything runs locally — all-MiniLM-L6-v2 over ONNX
+  Runtime, nothing leaves the machine
+- Launch screen sections: with an empty query, results group under
+  "recent opens" and "recently modified"
+
 ## 0.4.0 — 2026-08-15
 
 - Metadata filters: `kind:image`, `changed:7d`, `larger:100mb`,

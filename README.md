@@ -32,6 +32,8 @@ Run `fsearch` and start typing.
 - `> pattern` — regex search inside files, streamed as `path:line`;
   PDFs are searched through their extracted text (cached, so repeats are
   instant)
+- `? growing tomatoes` — semantic search: notes, docs and PDFs ranked by
+  meaning, not exact words (an optional build feature — see below)
 - `ext:pdf`, `path:term` — narrow any search (content search included,
   so `> ext:md TODO` greps only markdown)
 - `kind:image` (also video, audio, doc, code, archive), `changed:7d`,
@@ -111,6 +113,23 @@ fallback, build with the chafa renderer:
 brew install chafa pkgconf
 cargo install --path . --features chafa
 ```
+
+## Semantic search
+
+`? query` finds documents by meaning — `? that essay about patience`
+turns up `compounding.md` even when no word matches. Embeddings run
+fully locally (all-MiniLM-L6-v2 on ONNX Runtime); nothing leaves your
+machine. It's an optional build feature:
+
+```sh
+brew install onnxruntime
+cargo install --path . --features semantic
+fsearch --index-semantic   # one-time; re-runs embed only changed files
+```
+
+The ~90 MB model downloads on the first index. Markdown, text, HTML,
+LaTeX and PDFs are indexed; the vector store lives next to the file
+index and queries answer in milliseconds.
 
 ## How it works
 
