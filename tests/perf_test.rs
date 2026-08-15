@@ -6,9 +6,15 @@ use std::time::Instant;
 #[ignore]
 fn million_path_search_under_100ms() {
     let dirs = ["src", "docs", "Library", "projects", "Downloads", "notes"];
-    let paths: Vec<String> = (0..1_000_000)
-        .map(|i| format!("/Users/josh/{}/sub{}/file-{i}.txt", dirs[i % 6], i % 997))
+    let entries: Vec<(String, fsearch::walker::FileMeta)> = (0..1_000_000)
+        .map(|i| {
+            (
+                format!("/Users/josh/{}/sub{}/file-{i}.txt", dirs[i % 6], i % 997),
+                Default::default(),
+            )
+        })
         .collect();
+    let paths = fsearch::index::PathStore::from_entries(&entries);
 
     for (query, mode) in [
         ("filetxt", FilenameMode::Fuzzy),

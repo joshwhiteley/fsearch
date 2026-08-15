@@ -3,7 +3,65 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"FSEARCH\0";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
+
+/// Every indexed path in one contiguous byte arena, plus per-entry spans
+/// and metadata. Loading is a single file read and two table scans — no
+/// per-path allocations, which is what makes million-path startup instant.
+pub struct PathStore {
+    arena: Box<[u8]>,
+    spans: Vec<(u32, u32)>,
+    metas: Vec<FileMeta>,
+}
+
+impl PathStore {
+    pub fn empty() -> PathStore {
+        PathStore {
+            arena: Box::from([]),
+            spans: Vec::new(),
+            metas: Vec::new(),
+        }
+    }
+
+    pub fn from_entries(entries: &[(String, FileMeta)]) -> PathStore {
+        let total: usize = entries.iter().map(|(p, _)| p.len()).sum();
+        let mut arena = Vec::with_capacity(total);
+        let mut spans = Vec::with_capacity(entries.len());
+        let mut metas = Vec::with_capacity(entries.len());
+        for (p, m) in entries {
+            spans.push((arena.len() as u32, p.len() as u32));
+            arena.extend_from_slice(p.as_bytes());
+            metas.push(*m);
+        }
+        PathStore {
+            arena: arena.into_boxed_slice(),
+            spans,
+            metas,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn get(&self, i: usize) -> &str {
+        let (off, len) = self.spans[i];
+        // the arena is validated as UTF-8 when constructed/loaded
+        unsafe { std::str::from_utf8_unchecked(&self.arena[off as usize..(off + len) as usize]) }
+    }
+
+    pub fn meta(&self, i: usize) -> FileMeta {
+        self.metas[i]
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        (0..self.len()).map(|i| self.get(i))
+    }
+}
 
 pub fn default_cache_path() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
@@ -16,6 +74,8 @@ pub fn default_cache_path() -> PathBuf {
     base.join("fsearch").join("index.bin")
 }
 
+/// v3 layout: magic, version, count, then three contiguous tables —
+/// lengths (u32), metadata (i64 mtime + u64 size), and the path arena.
 pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -26,20 +86,22 @@ pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> 
         w.write_all(MAGIC)?;
         w.write_all(&VERSION.to_le_bytes())?;
         w.write_all(&(entries.len() as u64).to_le_bytes())?;
-        for (p, meta) in entries {
+        for (p, _) in entries {
             w.write_all(&(p.len() as u32).to_le_bytes())?;
-            w.write_all(p.as_bytes())?;
+        }
+        for (_, meta) in entries {
             w.write_all(&meta.mtime.to_le_bytes())?;
             w.write_all(&meta.size.to_le_bytes())?;
+        }
+        for (p, _) in entries {
+            w.write_all(p.as_bytes())?;
         }
         w.flush()?;
     }
     std::fs::rename(&tmp, path)
 }
 
-pub fn load(path: &Path) -> Option<(Vec<String>, Vec<FileMeta>)> {
-    // one bulk read, then parse from the slice — measurably faster than
-    // per-record buffered reads on multi-million-path caches
+pub fn load(path: &Path) -> Option<PathStore> {
     let data = std::fs::read(path).ok()?;
     let header = data.get(..20)?;
     if &header[..8] != MAGIC {
@@ -49,23 +111,37 @@ pub fn load(path: &Path) -> Option<(Vec<String>, Vec<FileMeta>)> {
         return None;
     }
     let count = u64::from_le_bytes(header[12..20].try_into().ok()?) as usize;
-    let mut paths = Vec::with_capacity(count.min(4_000_000));
-    let mut metas = Vec::with_capacity(count.min(4_000_000));
-    let mut pos = 20;
-    for _ in 0..count {
-        let len_bytes = data.get(pos..pos + 4)?;
-        let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-        pos += 4;
-        let bytes = data.get(pos..pos + len)?;
-        pos += len;
-        paths.push(std::str::from_utf8(bytes).ok()?.to_string());
-        let mtime = i64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        let size = u64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        metas.push(FileMeta { mtime, size });
+    let lens_at = 20usize;
+    let metas_at = lens_at.checked_add(count.checked_mul(4)?)?;
+    let arena_at = metas_at.checked_add(count.checked_mul(16)?)?;
+
+    let mut spans = Vec::with_capacity(count.min(8_000_000));
+    let mut offset: u32 = 0;
+    let lens = data.get(lens_at..metas_at)?;
+    for chunk in lens.chunks_exact(4) {
+        let len = u32::from_le_bytes(chunk.try_into().ok()?);
+        spans.push((offset, len));
+        offset = offset.checked_add(len)?;
     }
-    Some((paths, metas))
+    let mut metas = Vec::with_capacity(count.min(8_000_000));
+    let meta_bytes = data.get(metas_at..arena_at)?;
+    for chunk in meta_bytes.chunks_exact(16) {
+        metas.push(FileMeta {
+            mtime: i64::from_le_bytes(chunk[..8].try_into().ok()?),
+            size: u64::from_le_bytes(chunk[8..].try_into().ok()?),
+        });
+    }
+    let arena = data.get(arena_at..)?;
+    if arena.len() != offset as usize {
+        return None; // truncated or padded
+    }
+    // one linear validation pass; from then on gets are zero-cost
+    std::str::from_utf8(arena).ok()?;
+    Some(PathStore {
+        arena: arena.to_vec().into_boxed_slice(),
+        spans,
+        metas,
+    })
 }
 
 #[cfg(test)]
@@ -86,9 +162,14 @@ mod tests {
             (String::new(), meta(0, 0)),
         ];
         save(&entries, &file).unwrap();
-        let (paths, metas) = load(&file).unwrap();
-        assert_eq!(paths, vec!["/a/b.txt", "/c/déjà vu.md", ""]);
-        assert_eq!(metas, vec![meta(1000, 42), meta(2000, 7), meta(0, 0)]);
+        let store = load(&file).unwrap();
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get(0), "/a/b.txt");
+        assert_eq!(store.get(1), "/c/déjà vu.md");
+        assert_eq!(store.get(2), "");
+        assert_eq!(store.meta(0), meta(1000, 42));
+        assert_eq!(store.meta(1), meta(2000, 7));
+        assert_eq!(store.iter().count(), 3);
     }
 
     #[test]
@@ -115,6 +196,18 @@ mod tests {
         .unwrap();
         let bytes = std::fs::read(&file).unwrap();
         std::fs::write(&file, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(load(&file).is_none());
+    }
+
+    #[test]
+    fn invalid_utf8_arena_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        save(&[("/ab".to_string(), meta(1, 1))], &file).unwrap();
+        let mut bytes = std::fs::read(&file).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] = 0xff; // stomp an arena byte
+        std::fs::write(&file, &bytes).unwrap();
         assert!(load(&file).is_none());
     }
 

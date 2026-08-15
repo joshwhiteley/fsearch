@@ -1,5 +1,5 @@
 use crate::filters::Filters;
-use crate::walker::FileMeta;
+use crate::index::PathStore;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
@@ -12,14 +12,13 @@ pub enum FilenameMode {
 }
 
 pub fn search(
-    paths: &[String],
+    store: &PathStore,
     query: &str,
     mode: FilenameMode,
     limit: usize,
 ) -> Result<Vec<usize>, String> {
     search_boosted(
-        paths,
-        &[],
+        store,
         query,
         mode,
         limit,
@@ -28,15 +27,9 @@ pub fn search(
     )
 }
 
-/// Missing metadata (e.g. an empty slice) never filters anything out.
-fn meta_at(metas: &[FileMeta], i: usize, filters: &Filters) -> bool {
-    metas.get(i).is_none_or(|m| filters.matches_meta(m))
-}
-
 /// Like [`search`], with per-path ranking boosts (from open history).
 pub fn search_boosted(
-    paths: &[String],
-    metas: &[FileMeta],
+    store: &PathStore,
     query: &str,
     mode: FilenameMode,
     limit: usize,
@@ -44,53 +37,52 @@ pub fn search_boosted(
     filters: &Filters,
 ) -> Result<Vec<usize>, String> {
     if query.is_empty() {
-        return Ok(head_with_boosts(paths, metas, limit, boosts, filters));
+        return Ok(head_with_boosts(store, limit, boosts, filters));
     }
     match mode {
-        FilenameMode::Fuzzy => Ok(fuzzy(paths, metas, query, limit, boosts, filters)),
-        FilenameMode::Regex => regex_filter(paths, metas, query, limit, boosts, filters),
+        FilenameMode::Fuzzy => Ok(fuzzy(store, query, limit, boosts, filters)),
+        FilenameMode::Regex => regex_filter(store, query, limit, boosts, filters),
     }
 }
 
-/// First `limit` paths (already newest-first), with boosted paths — wherever
-/// they sit in the full list — floated to the front.
+fn passes(store: &PathStore, i: usize, filters: &Filters) -> bool {
+    filters.matches(store.get(i)) && filters.matches_meta(&store.meta(i))
+}
+
+/// First `limit` entries (already newest-first), with boosted paths —
+/// wherever they sit in the full list — floated to the front.
 fn head_with_boosts(
-    paths: &[String],
-    metas: &[FileMeta],
+    store: &PathStore,
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
 ) -> Vec<usize> {
     if boosts.is_empty() {
-        return (0..paths.len())
-            .filter(|&i| filters.matches(&paths[i]) && meta_at(metas, i, filters))
+        return (0..store.len())
+            .filter(|&i| passes(store, i, filters))
             .take(limit)
             .collect();
     }
-    let mut boosted: Vec<(u32, usize)> = paths
-        .iter()
-        .enumerate()
-        .filter(|(i, p)| filters.matches(p) && meta_at(metas, *i, filters))
-        .filter_map(|(i, p)| boosts.get(p).map(|&b| (b, i)))
+    let mut boosted: Vec<(u32, usize)> = (0..store.len())
+        .filter(|&i| passes(store, i, filters))
+        .filter_map(|i| boosts.get(store.get(i)).map(|&b| (b, i)))
         .collect();
     boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
     let mut out: Vec<usize> = boosted.iter().map(|&(_, i)| i).collect();
     let in_boosted: std::collections::HashSet<usize> = out.iter().copied().collect();
     out.extend(
-        (0..paths.len())
-            .filter(|&i| {
-                !in_boosted.contains(&i) && filters.matches(&paths[i]) && meta_at(metas, i, filters)
-            })
+        (0..store.len())
+            .filter(|&i| !in_boosted.contains(&i) && passes(store, i, filters))
             .take(limit),
     );
     out.truncate(limit);
     out
 }
 
-fn apply_boost_order(hits: &mut [usize], paths: &[String], boosts: &HashMap<String, u32>) {
+fn apply_boost_order(hits: &mut [usize], store: &PathStore, boosts: &HashMap<String, u32>) {
     if !boosts.is_empty() {
         // stable: unboosted hits keep their recency order
-        hits.sort_by_key(|&i| std::cmp::Reverse(boosts.get(&paths[i]).copied().unwrap_or(0)));
+        hits.sort_by_key(|&i| std::cmp::Reverse(boosts.get(store.get(i)).copied().unwrap_or(0)));
     }
 }
 
@@ -129,47 +121,46 @@ impl Highlighter {
 const CHUNK: usize = 16_384;
 
 fn fuzzy(
-    paths: &[String],
-    metas: &[FileMeta],
+    store: &PathStore,
     query: &str,
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
 ) -> Vec<usize> {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-    let mut scored: Vec<(u32, usize)> = paths
-        .par_chunks(CHUNK)
-        .enumerate()
-        .map(|(chunk_no, chunk)| {
-            let mut cfg = Config::DEFAULT;
-            cfg.set_match_paths();
-            let mut matcher = Matcher::new(cfg);
-            let mut buf = Vec::new();
-            let base = chunk_no * CHUNK;
-            chunk
-                .iter()
-                .enumerate()
-                .filter(|(i, path)| filters.matches(path) && meta_at(metas, base + i, filters))
-                .filter_map(|(i, path)| {
-                    pattern
-                        .score(Utf32Str::new(path, &mut buf), &mut matcher)
-                        .map(|score| {
-                            let boost = boosts.get(path).copied().unwrap_or(0);
-                            (score + boost, base + i)
-                        })
-                })
-                .collect::<Vec<_>>()
-        })
-        .flatten()
-        .collect();
+    let mut scored: Vec<(u32, usize)> = (0..store.len())
+        .into_par_iter()
+        .with_min_len(CHUNK)
+        .fold(
+            || {
+                let mut cfg = Config::DEFAULT;
+                cfg.set_match_paths();
+                (Matcher::new(cfg), Vec::new(), Vec::new())
+            },
+            |(mut matcher, mut buf, mut acc), i| {
+                if passes(store, i, filters) {
+                    let path = store.get(i);
+                    if let Some(score) = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)
+                    {
+                        let boost = boosts.get(path).copied().unwrap_or(0);
+                        acc.push((score + boost, i));
+                    }
+                }
+                (matcher, buf, acc)
+            },
+        )
+        .map(|(_, _, acc)| acc)
+        .reduce(Vec::new, |mut a, mut b| {
+            a.append(&mut b);
+            a
+        });
     scored.par_sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.truncate(limit);
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
 fn regex_filter(
-    paths: &[String],
-    metas: &[FileMeta],
+    store: &PathStore,
     query: &str,
     limit: usize,
     boosts: &HashMap<String, u32>,
@@ -180,14 +171,13 @@ fn regex_filter(
         .case_insensitive(smart_case_insensitive)
         .build()
         .map_err(|e| e.to_string())?;
-    let mut hits: Vec<usize> = paths
-        .par_iter()
-        .enumerate()
-        .filter(|(i, p)| filters.matches(p) && meta_at(metas, *i, filters) && re.is_match(p))
-        .map(|(i, _)| i)
+    let mut hits: Vec<usize> = (0..store.len())
+        .into_par_iter()
+        .with_min_len(CHUNK)
+        .filter(|&i| passes(store, i, filters) && re.is_match(store.get(i)))
         .collect();
     hits.sort_unstable();
-    apply_boost_order(&mut hits, paths, boosts);
+    apply_boost_order(&mut hits, store, boosts);
     hits.truncate(limit);
     Ok(hits)
 }
@@ -196,8 +186,12 @@ fn regex_filter(
 mod tests {
     use super::*;
 
-    fn paths(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn paths(v: &[&str]) -> PathStore {
+        let entries: Vec<(String, crate::walker::FileMeta)> = v
+            .iter()
+            .map(|s| (s.to_string(), Default::default()))
+            .collect();
+        PathStore::from_entries(&entries)
     }
 
     #[test]
@@ -263,7 +257,6 @@ mod tests {
         // identical fuzzy quality: boost wins
         let r = search_boosted(
             &p,
-            &[],
             "readme",
             FilenameMode::Fuzzy,
             10,
@@ -275,7 +268,6 @@ mod tests {
         // empty query: boosted file floats to the top
         let r = search_boosted(
             &p,
-            &[],
             "",
             FilenameMode::Fuzzy,
             10,
@@ -287,7 +279,6 @@ mod tests {
         // regex: boosted file first, others keep index order
         let r = search_boosted(
             &p,
-            &[],
             "readme",
             FilenameMode::Regex,
             10,
@@ -304,14 +295,14 @@ mod tests {
         let (f, _) = crate::filters::parse("ext:pdf path:docs x", 0);
         let none = HashMap::new();
         // empty query honors filters
-        let r = search_boosted(&p, &[], "", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
+        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
         assert_eq!(r, vec![0]);
         // fuzzy honors filters
-        let r = search_boosted(&p, &[], "a", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
+        let r = search_boosted(&p, "a", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
         assert_eq!(r, vec![0]);
         // dirs only with dir:
         let (fd, _) = crate::filters::parse("dir: x", 0);
-        let r = search_boosted(&p, &[], "", FilenameMode::Fuzzy, 10, &none, &fd).unwrap();
+        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &fd).unwrap();
         assert_eq!(r, vec![2]);
         // default (no filters) excludes dirs
         let r = search(&p, "", FilenameMode::Fuzzy, 10).unwrap();
@@ -330,7 +321,9 @@ mod tests {
 
     #[test]
     fn limit_is_respected() {
-        let p: Vec<String> = (0..100).map(|i| format!("/f/file{i}.txt")).collect();
+        let owned: Vec<String> = (0..100).map(|i| format!("/f/file{i}.txt")).collect();
+        let strs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let p = paths(&strs);
         assert_eq!(search(&p, "file", FilenameMode::Fuzzy, 5).unwrap().len(), 5);
     }
 }

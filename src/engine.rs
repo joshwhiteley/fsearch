@@ -2,6 +2,7 @@ use crate::content::{self, ContentMatch};
 use crate::filters::{self, Filters};
 use crate::frecency::Frecency;
 use crate::matcher::{self, FilenameMode};
+use crate::index::PathStore;
 use crate::walker::FileMeta;
 use crate::{config::Config, index, walker};
 use std::collections::{HashMap, HashSet};
@@ -49,8 +50,7 @@ pub struct EngineStatus {
 
 enum Msg {
     IndexSnapshot {
-        paths: Arc<Vec<String>>,
-        metas: Arc<Vec<FileMeta>>,
+        store: Arc<PathStore>,
         indexing: bool,
     },
     FilenameResults {
@@ -68,8 +68,7 @@ struct FilenameJob {
     generation: u64,
     query: String,
     mode: FilenameMode,
-    paths: Arc<Vec<String>>,
-    metas: Arc<Vec<FileMeta>>,
+    store: Arc<PathStore>,
     boosts: Arc<HashMap<String, u32>>,
     filters: Filters,
 }
@@ -78,8 +77,7 @@ pub struct Engine {
     msg_rx: Receiver<Msg>,
     msg_tx: Sender<Msg>,
     job_tx: Sender<FilenameJob>,
-    paths: Arc<Vec<String>>,
-    metas: Arc<Vec<FileMeta>>,
+    store: Arc<PathStore>,
     results: Vec<ResultRow>,
     status: EngineStatus,
     mode: Mode,
@@ -209,11 +207,9 @@ fn watch_loop(
                 .cloned(),
         );
         current = next;
-        let (p, m): (Vec<_>, Vec<_>) = current.iter().cloned().unzip();
         if indexer_tx
             .send(Msg::IndexSnapshot {
-                paths: Arc::new(p),
-                metas: Arc::new(m),
+                store: Arc::new(PathStore::from_entries(&current)),
                 indexing: false,
             })
             .is_err()
@@ -253,8 +249,7 @@ impl Engine {
                     job = newer;
                 }
                 let (indices, error) = match matcher::search_boosted(
-                    &job.paths,
-                    &job.metas,
+                    &job.store,
                     &job.query,
                     job.mode,
                     FILENAME_LIMIT,
@@ -281,17 +276,15 @@ impl Engine {
         let indexer_tx = msg_tx.clone();
         let max_content_filesize = config.max_content_filesize;
         std::thread::spawn(move || {
-            if let Some((cached_paths, cached_metas)) = index::load(&cache_path) {
+            if let Some(cached) = index::load(&cache_path) {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
-                    paths: Arc::new(cached_paths),
-                    metas: Arc::new(cached_metas),
+                    store: Arc::new(cached),
                     indexing: true,
                 });
             }
             let Ok(excludes) = walker::build_exclude_set(&config.excludes) else {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
-                    paths: Arc::new(Vec::new()),
-                    metas: Arc::new(Vec::new()),
+                    store: Arc::new(PathStore::empty()),
                     indexing: false,
                 });
                 return;
@@ -318,20 +311,16 @@ impl Engine {
                     last_publish = Instant::now();
                     let mut snapshot = fresh.clone();
                     snapshot.sort_unstable_by(walker::mtime_cmp);
-                    let (p, m): (Vec<_>, Vec<_>) = snapshot.into_iter().unzip();
                     let _ = indexer_tx.send(Msg::IndexSnapshot {
-                        paths: Arc::new(p),
-                        metas: Arc::new(m),
+                        store: Arc::new(PathStore::from_entries(&snapshot)),
                         indexing: true,
                     });
                 }
             }
             let _ = walk_thread.join();
             fresh.sort_unstable_by(walker::mtime_cmp);
-            let (p, m): (Vec<_>, Vec<_>) = fresh.iter().cloned().unzip();
             let _ = indexer_tx.send(Msg::IndexSnapshot {
-                paths: Arc::new(p),
-                metas: Arc::new(m),
+                store: Arc::new(PathStore::from_entries(&fresh)),
                 indexing: false,
             });
             let _ = index::save(&fresh, &cache_path);
@@ -347,8 +336,7 @@ impl Engine {
             msg_rx,
             msg_tx,
             job_tx,
-            paths: Arc::new(Vec::new()),
-            metas: Arc::new(Vec::new()),
+            store: Arc::new(PathStore::empty()),
             results: Vec::new(),
             status: EngineStatus {
                 indexing: true,
@@ -407,14 +395,9 @@ impl Engine {
         self.fire_due_content_search();
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
-                Msg::IndexSnapshot {
-                    paths,
-                    metas,
-                    indexing,
-                } => {
-                    self.paths = paths;
-                    self.metas = metas;
-                    self.status.indexed = self.paths.len();
+                Msg::IndexSnapshot { store, indexing } => {
+                    self.store = store;
+                    self.status.indexed = self.store.len();
                     self.status.indexing = indexing;
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
                         self.generation += 1;
@@ -431,9 +414,9 @@ impl Engine {
                     }
                     self.results = indices
                         .into_iter()
-                        .filter_map(|i| self.paths.get(i))
-                        .map(|p| ResultRow {
-                            path: p.clone(),
+                        .filter(|&i| i < self.store.len())
+                        .map(|i| ResultRow {
+                            path: self.store.get(i).to_string(),
                             line_number: None,
                             line: None,
                         })
@@ -480,8 +463,7 @@ impl Engine {
             generation: self.generation,
             query: self.query.clone(),
             mode,
-            paths: self.paths.clone(),
-            metas: self.metas.clone(),
+            store: self.store.clone(),
             boosts: self.boosts.clone(),
             filters: self.filters.clone(),
         });
@@ -499,19 +481,18 @@ impl Engine {
         let cancel = Arc::new(AtomicBool::new(false));
         self.content_cancel = Some(cancel.clone());
         // scope the grep with any ext:/path: filters from the query
-        let paths = if self.filters.is_empty() {
-            self.paths.clone()
-        } else {
-            let f = &self.filters;
-            Arc::new(
-                self.paths
-                    .iter()
-                    .zip(self.metas.iter())
-                    .filter(|(p, m)| f.matches(p) && f.matches_meta(m))
-                    .map(|(p, _)| p.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
+        // content search still wants owned strings (it runs for seconds on a
+        // background thread while snapshots keep swapping underneath)
+        let f = &self.filters;
+        let paths: Arc<Vec<String>> = Arc::new(
+            (0..self.store.len())
+                .filter(|&i| {
+                    f.is_empty()
+                        || (f.matches(self.store.get(i)) && f.matches_meta(&self.store.meta(i)))
+                })
+                .map(|i| self.store.get(i).to_string())
+                .collect(),
+        );
         let tx = self.msg_tx.clone();
         let generation = self.generation;
         let max = self.max_content_filesize;

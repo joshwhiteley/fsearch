@@ -56,7 +56,7 @@ fn doctor() {
 /// Non-interactive search: prints matches to stdout, exits 1 when none.
 /// Uses the cached index when present; builds (and saves) one otherwise.
 /// Loads the cached index, building (and saving) it when absent.
-fn load_index(config: &config::Config) -> (Vec<String>, Vec<fsearch::walker::FileMeta>) {
+fn load_index(config: &config::Config) -> fsearch::index::PathStore {
     let cache = index::default_cache_path();
     index::load(&cache).unwrap_or_else(|| {
         let excludes = walker::build_exclude_set(&config.excludes).unwrap_or_else(|e| {
@@ -65,7 +65,7 @@ fn load_index(config: &config::Config) -> (Vec<String>, Vec<fsearch::walker::Fil
         });
         let (entries, _) = walker::collect_sorted(&config.roots, &excludes);
         let _ = index::save(&entries, &cache);
-        entries.into_iter().unzip()
+        fsearch::index::PathStore::from_entries(&entries)
     })
 }
 
@@ -94,19 +94,19 @@ fn human_size(bytes: u64) -> String {
 /// The N largest files in the index — a quick "what is eating my disk".
 fn biggest(n: usize) {
     let config = load_config();
-    let (paths, metas) = load_index(&config);
-    let mut order: Vec<usize> = (0..paths.len())
-        .filter(|&i| !paths[i].ends_with('/'))
+    let store = load_index(&config);
+    let mut order: Vec<usize> = (0..store.len())
+        .filter(|&i| !store.get(i).ends_with('/'))
         .collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(metas[i].size));
+    order.sort_by_key(|&i| std::cmp::Reverse(store.meta(i).size));
     for &i in order.iter().take(n) {
-        println!("{:>10}  {}", human_size(metas[i].size), paths[i]);
+        println!("{:>10}  {}", human_size(store.meta(i).size), store.get(i));
     }
 }
 
 fn print_search(query: &str) {
     let config = load_config();
-    let (paths, metas) = load_index(&config);
+    let store = load_index(&config);
 
     let (query_filters, stripped) = fsearch::filters::parse(query, unix_now());
     let query = if query_filters.is_empty() {
@@ -116,16 +116,14 @@ fn print_search(query: &str) {
     };
     let matched = if let Some(pattern) = query.strip_prefix('>') {
         let pattern = pattern.trim_start().to_string();
-        let paths: Vec<String> = if query_filters.is_empty() {
-            paths.clone()
-        } else {
-            paths
-                .iter()
-                .zip(metas.iter())
-                .filter(|(p, m)| query_filters.matches(p) && query_filters.matches_meta(m))
-                .map(|(p, _)| p.clone())
-                .collect()
-        };
+        let paths: Vec<String> = (0..store.len())
+            .filter(|&i| {
+                query_filters.is_empty()
+                    || (query_filters.matches(store.get(i))
+                        && query_filters.matches_meta(&store.meta(i)))
+            })
+            .map(|i| store.get(i).to_string())
+            .collect();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let max = config.max_content_filesize;
@@ -152,8 +150,7 @@ fn print_search(query: &str) {
         }
     } else {
         match fsearch::matcher::search_boosted(
-            &paths,
-            &metas,
+            &store,
             &query,
             fsearch::matcher::FilenameMode::Fuzzy,
             500,
@@ -162,7 +159,7 @@ fn print_search(query: &str) {
         ) {
             Ok(indices) => {
                 for i in &indices {
-                    println!("{}", paths[*i]);
+                    println!("{}", store.get(*i));
                 }
                 !indices.is_empty()
             }
