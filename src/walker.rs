@@ -60,18 +60,27 @@ pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, i64)>) -
         let skipped = &skipped;
         Box::new(move |entry| {
             match entry {
-                Ok(e) if e.file_type().is_some_and(|t| t.is_file()) => {
-                    files.fetch_add(1, Ordering::Relaxed);
+                Ok(e) if e.file_type().is_some() && e.depth() > 0 => {
+                    let is_file = e.file_type().is_some_and(|t| t.is_file());
+                    let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+                    if !is_file && !is_dir {
+                        return WalkState::Continue;
+                    }
+                    if is_file {
+                        files.fetch_add(1, Ordering::Relaxed);
+                    }
                     let mtime = e
                         .metadata()
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map_or(0, |d| d.as_secs() as i64);
-                    if tx
-                        .send((e.path().to_string_lossy().into_owned(), mtime))
-                        .is_err()
-                    {
+                    let mut path = e.path().to_string_lossy().into_owned();
+                    if is_dir {
+                        // directories are marked with a trailing slash
+                        path.push('/');
+                    }
+                    if tx.send((path, mtime)).is_err() {
                         return WalkState::Quit;
                     }
                 }
@@ -117,8 +126,22 @@ mod tests {
         let stats = walk(&[PathBuf::from(root)], &set, &tx);
         drop(tx);
         let paths: Vec<String> = rx.into_iter().map(|(p, _)| p).collect();
-        assert_eq!(stats.files as usize, paths.len());
+        let files = paths.iter().filter(|p| !p.ends_with('/')).count();
+        assert_eq!(stats.files as usize, files);
         paths
+    }
+
+    #[test]
+    fn directories_are_indexed_with_trailing_slash() {
+        let dir = tree();
+        let paths = walk_all(dir.path(), &[]);
+        assert!(paths.iter().any(|p| p.ends_with("/docs/")));
+        // the root itself is not an entry
+        let root = format!("{}/", dir.path().to_string_lossy());
+        assert!(!paths.contains(&root));
+        // excluded dirs stay excluded
+        let paths = walk_all(dir.path(), &["node_modules"]);
+        assert!(!paths.iter().any(|p| p.contains("node_modules")));
     }
 
     #[test]

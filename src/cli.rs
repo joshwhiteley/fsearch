@@ -28,6 +28,8 @@ query syntax:
   plain text           fuzzy match on file names and paths
   ctrl-r               toggle regex match on the full path
   > pattern            regex search inside file contents
+  ext:pdf path:term    narrow any search by extension or path
+  dir:                 search folders instead of files
 
 keys:
   up/down, ctrl-k/j    move selection

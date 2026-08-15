@@ -48,9 +48,10 @@ fn end_to_end_filename_and_content_search() {
         cache_dir.path().join("history"),
     );
 
-    // index builds in the background (no cache on first run)
+    // index builds in the background (no cache on first run);
+    // 2 files + the docs/ directory entry
     wait_until(&mut engine, Duration::from_secs(5), |e| {
-        !e.status().indexing && e.status().indexed == 2
+        !e.status().indexing && e.status().indexed == 3
     });
 
     // fuzzy filename search
@@ -93,7 +94,7 @@ fn end_to_end_filename_and_content_search() {
     wait_until(&mut engine, Duration::from_secs(5), |_| cache.exists());
     let mut engine2 = Engine::new(config_for(tree.path()), cache, cache_dir.path().join("h2"));
     wait_until(&mut engine2, Duration::from_secs(2), |e| {
-        e.status().indexed == 2
+        e.status().indexed == 3
     });
 }
 
@@ -234,4 +235,47 @@ fn live_index_picks_up_created_and_deleted_files() {
     wait_until(&mut engine, Duration::from_secs(10), |e| {
         !e.results().iter().any(|r| r.path.ends_with("first.txt"))
     });
+}
+
+#[test]
+fn filters_scope_filename_and_content_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    std::fs::create_dir_all(p.join("docs")).unwrap();
+    std::fs::create_dir_all(p.join("pics")).unwrap();
+    std::fs::write(p.join("docs/guide.md"), "the needle\n").unwrap();
+    std::fs::write(p.join("docs/guide.txt"), "the needle\n").unwrap();
+    let aux = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(
+        config_for(p),
+        aux.path().join("index.bin"),
+        aux.path().join("history"),
+    );
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().indexed == 4
+    });
+
+    // ext: narrows fuzzy results
+    engine.set_query("ext:md guide", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 1 && e.results()[0].path.ends_with("guide.md")
+    });
+
+    // dir: lists directories only
+    engine.set_query("dir:", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 2 && e.results().iter().all(|r| r.path.ends_with('/'))
+    });
+
+    // filters scope content search too
+    engine.set_query("> ext:md needle", false);
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.results().is_empty()
+    });
+    assert!(
+        engine
+            .results()
+            .iter()
+            .all(|r| r.path.ends_with("guide.md"))
+    );
 }

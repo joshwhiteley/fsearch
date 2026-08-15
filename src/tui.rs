@@ -131,6 +131,10 @@ impl App {
             return;
         }
         self.preview_for = Some(key);
+        if row.path.ends_with('/') {
+            self.preview = PreviewContent::Lines(directory_listing(&row.path));
+            return;
+        }
         if images::is_image_path(&row.path) {
             self.preview = match (
                 &self.picker,
@@ -176,30 +180,73 @@ impl App {
     }
 }
 
+const HINTS: &str = "type to search \u{b7} > grep in files \u{b7} ext:pdf \u{b7} path:term \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab preview \u{b7} enter open";
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    // show syntax reminders under the search bar until typing starts
+    let hint_rows = if app.input.is_empty() { 1 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(hint_rows),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
     draw_input(frame, app, outer[0]);
+    if hint_rows > 0 {
+        let hints = Paragraph::new(format!(" {HINTS}")).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(hints, outer[1]);
+    }
+    let body = outer[2];
+    let status_area = outer[3];
 
     if app.show_preview {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(outer[1]);
+            .split(body);
         draw_results(frame, app, cols[0]);
         draw_preview(frame, app, cols[1]);
     } else {
-        draw_results(frame, app, outer[1]);
+        draw_results(frame, app, body);
     }
 
-    draw_status(frame, app, outer[2]);
+    draw_status(frame, app, status_area);
+}
+
+/// Preview for a directory entry: its children, folders first.
+fn directory_listing(path: &str) -> Vec<Line<'static>> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return vec![Line::from("(unreadable directory)")];
+    };
+    let mut names: Vec<(bool, String)> = entries
+        .flatten()
+        .map(|e| {
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            (is_dir, e.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort_by(|a, b| (!a.0, &a.1).cmp(&(!b.0, &b.1)));
+    names.truncate(200);
+    if names.is_empty() {
+        return vec![Line::from("(empty directory)")];
+    }
+    names
+        .into_iter()
+        .map(|(is_dir, name)| {
+            if is_dir {
+                Line::from(Span::styled(
+                    format!("{name}/"),
+                    Style::default().fg(Color::Cyan),
+                ))
+            } else {
+                Line::from(name)
+            }
+        })
+        .collect()
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -318,7 +365,7 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let s = app.engine.status();
     let mut parts = vec![
-        format!("{} files", s.indexed),
+        format!("{} indexed", s.indexed),
         format!("{} matches", s.matches),
     ];
     if s.indexing {
@@ -454,6 +501,17 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("notes"));
         assert!(text.contains("fuzzy"));
+    }
+
+    #[test]
+    fn hints_show_only_while_input_is_empty() {
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("grep in files"));
+        app.input = "x".to_string();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains("grep in files"));
     }
 
     #[test]

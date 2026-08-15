@@ -1,4 +1,5 @@
 use crate::content::{self, ContentMatch};
+use crate::filters::{self, Filters};
 use crate::frecency::Frecency;
 use crate::matcher::{self, FilenameMode};
 use crate::{config::Config, index, walker};
@@ -67,6 +68,7 @@ struct FilenameJob {
     mode: FilenameMode,
     paths: Arc<Vec<String>>,
     boosts: Arc<HashMap<String, u32>>,
+    filters: Filters,
 }
 
 pub struct Engine {
@@ -80,6 +82,7 @@ pub struct Engine {
     generation: u64,
     query: String,
     max_content_filesize: u64,
+    filters: Filters,
     pending_content: Option<(String, Instant)>,
     content_cancel: Option<Arc<AtomicBool>>,
     frecency: Frecency,
@@ -89,9 +92,6 @@ pub struct Engine {
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
 const WATCH_SAVE_EVERY: Duration = Duration::from_secs(60);
 
-/// Folds filesystem events into fresh index snapshots, forever. Changed and
-/// created files go to the front of the list (they are the newest); deleted
-/// paths — including whole directories — are filtered out.
 /// Starts watching `roots` and returns the live watcher (keep it alive!)
 /// plus the event stream. Armed *before* the initial walk so that no change
 /// can slip between walk completion and stream start.
@@ -113,6 +113,9 @@ fn start_watcher(
     Some((watcher, event_rx))
 }
 
+/// Folds filesystem events into fresh index snapshots, forever. Changed and
+/// created files go to the front of the list (they are the newest); deleted
+/// paths — including whole directories — are filtered out.
 fn watch_loop(
     event_rx: &Receiver<notify::Result<notify::Event>>,
     excludes: &globset::GlobSet,
@@ -222,6 +225,7 @@ impl Engine {
                     job.mode,
                     FILENAME_LIMIT,
                     &job.boosts,
+                    &job.filters,
                 ) {
                     Ok(ix) => (ix, None),
                     Err(e) => (Vec::new(), Some(format!("invalid pattern: {e}"))),
@@ -314,6 +318,7 @@ impl Engine {
             generation: 0,
             query: String::new(),
             max_content_filesize,
+            filters: Filters::default(),
             pending_content: None,
             content_cancel: None,
             frecency,
@@ -329,6 +334,14 @@ impl Engine {
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
         let (mode, query) = parse_query(input, regex_mode);
+        let (query_filters, pattern) = filters::parse(&query);
+        // rejoin preserves regex/content patterns without filter tokens
+        let query = if query_filters.is_empty() {
+            query
+        } else {
+            pattern
+        };
+        self.filters = query_filters;
         self.generation += 1;
         self.mode = mode;
         self.query = query.clone();
@@ -423,6 +436,7 @@ impl Engine {
             mode,
             paths: self.paths.clone(),
             boosts: self.boosts.clone(),
+            filters: self.filters.clone(),
         });
     }
 
@@ -437,7 +451,19 @@ impl Engine {
         let (pattern, _) = self.pending_content.take().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         self.content_cancel = Some(cancel.clone());
-        let paths = self.paths.clone();
+        // scope the grep with any ext:/path: filters from the query
+        let paths = if self.filters.is_empty() {
+            self.paths.clone()
+        } else {
+            let f = &self.filters;
+            Arc::new(
+                self.paths
+                    .iter()
+                    .filter(|p| f.matches(p))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
         let tx = self.msg_tx.clone();
         let generation = self.generation;
         let max = self.max_content_filesize;

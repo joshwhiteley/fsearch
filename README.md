@@ -30,6 +30,9 @@ Run `fsearch` and start typing.
 - plain text — fuzzy search on file names, matches highlighted
 - `ctrl-r` — regex on the full path
 - `> pattern` — regex search inside files, streamed as `path:line`
+- `ext:pdf`, `path:term` — narrow any search (content search included,
+  so `> ext:md TODO` greps only markdown)
+- `dir:` — search folders instead of files (preview lists their contents)
 - `enter` opens · `ctrl-f` reveals in Finder · `ctrl-y` copies the path ·
   `tab` toggles preview · `esc` quits
 
