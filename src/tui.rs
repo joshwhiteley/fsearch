@@ -571,11 +571,37 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
-    let list = List::new(items)
+    // On the launch screen (empty query), split the list into "recent
+    // opens" (frecency) and "recently modified" with dim section headers.
+    // Headers are extra list rows, so the selection index shifts past them.
+    let rows = app.engine.results();
+    let opened = rows.iter().take_while(|r| r.recent_open).count();
+    let sectioned = app.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
+    let mut display_items = items;
+    let mut display_selected = app.selected;
+    if sectioned {
+        let header = |label: &str| {
+            ListItem::new(Span::styled(
+                format!("─ {label} ────────"),
+                Style::default().fg(app.theme.dim),
+            ))
+        };
+        let mut with_headers = Vec::with_capacity(display_items.len() + 2);
+        with_headers.push(header("RECENT OPENS"));
+        for (i, item) in display_items.into_iter().enumerate() {
+            if i == opened {
+                with_headers.push(header("RECENTLY MODIFIED"));
+            }
+            with_headers.push(item);
+        }
+        display_items = with_headers;
+        display_selected += if app.selected < opened { 1 } else { 2 };
+    }
+    let list = List::new(display_items)
         .block(themed_block("results", &app.theme))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    state.select(Some(display_selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -917,6 +943,36 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("preview"));
         assert!(!text.contains("results"));
+    }
+
+    #[test]
+    fn sections_render_on_empty_query_with_recent_opens() {
+        use crate::engine::ResultRow;
+        let mut app = test_app();
+        // simulate an engine state with one frecency row and one plain row
+        app.engine.inject_results_for_test(vec![
+            ResultRow {
+                path: "/a/opened.txt".into(),
+                line_number: None,
+                line: None,
+                recent_open: true,
+            },
+            ResultRow {
+                path: "/a/fresh.txt".into(),
+                line_number: None,
+                line: None,
+                recent_open: false,
+            },
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("RECENT OPENS"));
+        assert!(text.contains("RECENTLY MODIFIED"));
+        // typing hides the sections
+        app.input = "x".to_string();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains("RECENT OPENS"));
     }
 
     #[test]

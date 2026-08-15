@@ -38,6 +38,9 @@ pub struct ResultRow {
     pub path: String,
     pub line_number: Option<u64>,
     pub line: Option<String>,
+    /// True when this row ranks high because the user opened it before
+    /// (frecency) — the UI groups these under "recent opens".
+    pub recent_open: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -415,10 +418,15 @@ impl Engine {
                     self.results = indices
                         .into_iter()
                         .filter(|&i| i < self.store.len())
-                        .map(|i| ResultRow {
-                            path: self.store.get(i).to_string(),
-                            line_number: None,
-                            line: None,
+                        .map(|i| {
+                            let path = self.store.get(i).to_string();
+                            let recent_open = self.boosts.contains_key(&path);
+                            ResultRow {
+                                path,
+                                line_number: None,
+                                line: None,
+                                recent_open,
+                            }
                         })
                         .collect();
                     self.status.matches = self.results.len();
@@ -432,6 +440,7 @@ impl Engine {
                         path: hit.path,
                         line_number: Some(hit.line_number),
                         line: Some(hit.line),
+                        recent_open: false,
                     });
                     self.status.matches = self.results.len();
                     if self.results.len() >= CONTENT_LIMIT {
@@ -444,6 +453,13 @@ impl Engine {
 
     pub fn results(&self) -> &[ResultRow] {
         &self.results
+    }
+
+    /// Test-only: place rows directly so UI states can be rendered without
+    /// waiting on worker threads.
+    #[doc(hidden)]
+    pub fn inject_results_for_test(&mut self, rows: Vec<ResultRow>) {
+        self.results = rows;
     }
 
     pub fn status(&self) -> EngineStatus {
