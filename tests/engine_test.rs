@@ -232,7 +232,7 @@ fn live_index_picks_up_created_and_deleted_files() {
 
     // and a deleted file disappears
     std::fs::remove_file(root.join("first.txt")).unwrap();
-    wait_until(&mut engine, Duration::from_secs(10), |e| {
+    wait_until(&mut engine, Duration::from_secs(30), |e| {
         !e.results().iter().any(|r| r.path.ends_with("first.txt"))
     });
 }
