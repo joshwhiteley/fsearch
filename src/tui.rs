@@ -324,16 +324,20 @@ pub fn run(engine: Engine) -> anyhow::Result<()> {
     // query the terminal background, graphics protocol, and warm syntax
     // dumps — all before raw mode / the event loop consumes stdin
     let traits = highlight::detect_terminal();
-    let picker = if traits.responsive {
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
-    } else {
-        Picker::halfblocks()
+    // FSEARCH_IMAGES=halfblocks|off overrides graphics-protocol detection
+    let picker = match std::env::var("FSEARCH_IMAGES").as_deref() {
+        Ok("off") => None,
+        Ok("halfblocks") => Some(Picker::halfblocks()),
+        _ if traits.responsive => {
+            Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
+        }
+        _ => Some(Picker::halfblocks()),
     };
     highlight::preload();
     let mut terminal = ratatui::init(); // installs a terminal-restoring panic hook
     let mut app = App::new(engine);
     app.appearance = traits.appearance;
-    app.picker = Some(picker);
+    app.picker = picker;
     let result = loop {
         app.engine.tick();
         let len = app.engine.results().len();
