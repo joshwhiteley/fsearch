@@ -10,6 +10,7 @@ homepage = "https://github.com/joshwhiteley/fsearch"
 [dependencies]
 anyhow = "1"
 dirs = "6"
+fastembed = { version = "5.17.4", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
 globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
@@ -35,6 +36,10 @@ two-face = "0.5"
 # (`brew install chafa pkgconf`):
 #   cargo install --path . --features chafa
 chafa = ["ratatui-image/chafa-dyn"]
+# Semantic search (`? query`): local ONNX embeddings via fastembed.
+# Heavy build (onnxruntime); the model (~90 MB) downloads on first index.
+#   cargo install --path . --features semantic
+semantic = ["dep:fastembed"]
 
 [dev-dependencies]
 tempfile = "3"
