@@ -2,14 +2,15 @@ use crate::actions;
 use crate::engine::{Engine, Mode};
 use crate::highlight::{self, Appearance};
 use crate::images;
-use ratatui_image::picker::Picker;
-use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+use crate::matcher::Highlighter;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui_image::picker::Picker;
+use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 use std::time::Duration;
 
 const PREVIEW_BYTES: usize = 64 * 1024;
@@ -117,7 +118,10 @@ impl App {
         }
         self.preview_for = Some(key);
         if images::is_image_path(&row.path) {
-            self.preview = match (&self.picker, images::load(&row.path, images::MAX_IMAGE_BYTES)) {
+            self.preview = match (
+                &self.picker,
+                images::load(&row.path, images::MAX_IMAGE_BYTES),
+            ) {
                 (Some(picker), Ok(img)) => {
                     PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
                 }
@@ -199,23 +203,78 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.set_cursor_position((area.x + 1 + app.input.len() as u16, area.y + 1));
 }
 
+/// Splits `shown` into spans, styling the chars at `positions` (char indices).
+fn spans_with_positions(shown: &str, positions: &[u32], highlight: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_highlighted = false;
+    let mut next = positions.iter().peekable();
+    for (i, ch) in shown.chars().enumerate() {
+        while next.next_if(|&&p| (p as usize) < i).is_some() {}
+        let highlighted = next.peek().is_some_and(|&&p| p as usize == i);
+        if highlighted != run_highlighted && !run.is_empty() {
+            let text = std::mem::take(&mut run);
+            spans.push(if run_highlighted {
+                Span::styled(text, highlight)
+            } else {
+                Span::raw(text)
+            });
+        }
+        run_highlighted = highlighted;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(if run_highlighted {
+            Span::styled(run, highlight)
+        } else {
+            Span::raw(run)
+        });
+    }
+    spans
+}
+
 fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    let accent = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut highlighter = (matches!(app.engine.mode(), Mode::Fuzzy) && !app.input.is_empty())
+        .then(|| Highlighter::new(&app.input));
     let items: Vec<ListItem> = app
         .engine
         .results()
         .iter()
         .map(|r| {
-            let shown = match &home {
-                Some(h) if r.path.starts_with(h) => format!("~{}", &r.path[h.len()..]),
-                _ => r.path.clone(),
+            let (shown, trimmed_chars) = match &home {
+                Some(h) if r.path.starts_with(h.as_str()) => {
+                    (format!("~{}", &r.path[h.len()..]), h.chars().count())
+                }
+                _ => (r.path.clone(), 0),
             };
             match (r.line_number, &r.line) {
                 (Some(n), Some(line)) => ListItem::new(Line::from(vec![
                     Span::styled(format!("{shown}:{n} "), Style::default().fg(Color::Cyan)),
                     Span::raw(line.clone()),
                 ])),
-                _ => ListItem::new(shown),
+                _ => match highlighter.as_mut() {
+                    Some(hl) => {
+                        // positions refer to the full path; shift them onto the
+                        // `~`-shortened string and drop hits inside the prefix
+                        let shift = if trimmed_chars > 0 {
+                            trimmed_chars - 1
+                        } else {
+                            0
+                        };
+                        let positions: Vec<u32> = hl
+                            .positions(&r.path)
+                            .into_iter()
+                            .filter(|&p| p as usize >= trimmed_chars)
+                            .map(|p| (p as usize - shift) as u32)
+                            .collect();
+                        ListItem::new(Line::from(spans_with_positions(&shown, &positions, accent)))
+                    }
+                    None => ListItem::new(shown),
+                },
             }
         })
         .collect();
@@ -352,6 +411,18 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
         assert_eq!(app.input, "");
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn spans_split_on_highlight_boundaries() {
+        let hl = Style::default().fg(Color::Cyan);
+        let spans = spans_with_positions("abcd", &[1, 2], hl);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["a", "bc", "d"]);
+        assert_eq!(spans[1].style, hl);
+        assert_eq!(spans[0].style, Style::default());
+        // no positions → single raw span
+        assert_eq!(spans_with_positions("abcd", &[], hl).len(), 1);
     }
 
     #[test]

@@ -133,7 +133,10 @@ fn print_mode_lists_matches_and_content_hits() {
     let out = fsearch(&["-p", "> needle"], env);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("meeting-notes.md:1:find the needle"), "got: {text}");
+    assert!(
+        text.contains("meeting-notes.md:1:find the needle"),
+        "got: {text}"
+    );
 
     // no match exits 1
     let out = fsearch(&["-p", "zzzznope"], env);

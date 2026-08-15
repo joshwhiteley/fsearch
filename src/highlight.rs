@@ -193,14 +193,32 @@ mod tests {
         use syntect::highlighting::Color as SC;
         // a == 0: 16-color palette index carried in r
         assert_eq!(
-            convert_color(SC { r: 3, g: 0, b: 0, a: 0 }),
+            convert_color(SC {
+                r: 3,
+                g: 0,
+                b: 0,
+                a: 0
+            }),
             Some(Color::Indexed(3))
         );
         // a == 1: terminal default — emit nothing
-        assert_eq!(convert_color(SC { r: 9, g: 9, b: 9, a: 1 }), None);
+        assert_eq!(
+            convert_color(SC {
+                r: 9,
+                g: 9,
+                b: 9,
+                a: 1
+            }),
+            None
+        );
         // real rgb
         assert_eq!(
-            convert_color(SC { r: 10, g: 20, b: 30, a: 255 }),
+            convert_color(SC {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255
+            }),
             Some(Color::Rgb(10, 20, 30))
         );
     }

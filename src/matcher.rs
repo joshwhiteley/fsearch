@@ -23,6 +23,38 @@ pub fn search(
     }
 }
 
+/// Re-runs a fuzzy pattern against single strings to recover the matched
+/// character positions (for highlighting the visible result rows).
+pub struct Highlighter {
+    pattern: Pattern,
+    matcher: Matcher,
+}
+
+impl Highlighter {
+    pub fn new(query: &str) -> Highlighter {
+        let mut cfg = Config::DEFAULT;
+        cfg.set_match_paths();
+        Highlighter {
+            pattern: Pattern::parse(query, CaseMatching::Smart, Normalization::Smart),
+            matcher: Matcher::new(cfg),
+        }
+    }
+
+    /// Matched char positions in `text`, sorted and deduplicated.
+    pub fn positions(&mut self, text: &str) -> Vec<u32> {
+        let mut buf = Vec::new();
+        let mut indices = Vec::new();
+        self.pattern.indices(
+            Utf32Str::new(text, &mut buf),
+            &mut self.matcher,
+            &mut indices,
+        );
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+}
+
 const CHUNK: usize = 16_384;
 
 fn fuzzy(paths: &[String], query: &str, limit: usize) -> Vec<usize> {
@@ -131,6 +163,16 @@ mod tests {
     fn invalid_regex_is_err() {
         let p = paths(&["/a"]);
         assert!(search(&p, "[unclosed", FilenameMode::Regex, 10).is_err());
+    }
+
+    #[test]
+    fn highlighter_finds_match_positions() {
+        let mut h = Highlighter::new("rest");
+        let pos = h.positions("/docs/rest-api.md");
+        // "rest" sits at chars 6..10
+        assert_eq!(pos, vec![6, 7, 8, 9]);
+        // non-matching text yields no positions
+        assert!(h.positions("/zzz").is_empty());
     }
 
     #[test]

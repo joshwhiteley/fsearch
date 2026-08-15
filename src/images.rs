@@ -18,7 +18,10 @@ pub fn is_image_path(path: &str) -> bool {
 pub fn load(path: &str, max_bytes: u64) -> Result<DynamicImage, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.len() > max_bytes {
-        return Err(format!("image larger than {} MiB", max_bytes / (1024 * 1024)));
+        return Err(format!(
+            "image larger than {} MiB",
+            max_bytes / (1024 * 1024)
+        ));
     }
     let is_svg = std::path::Path::new(path)
         .extension()
@@ -36,9 +39,8 @@ pub fn load(path: &str, max_bytes: u64) -> Result<DynamicImage, String> {
 const MAX_SVG_EDGE: f32 = 1600.0;
 
 fn rasterize_svg(data: &[u8]) -> Result<DynamicImage, String> {
-    let tree =
-        resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default())
-            .map_err(|e| e.to_string())?;
+    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default())
+        .map_err(|e| e.to_string())?;
     let size = tree.size();
     let scale = (MAX_SVG_EDGE / size.width().max(size.height())).min(1.0);
     let (w, h) = (
