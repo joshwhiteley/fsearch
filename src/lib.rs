@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod content;
 pub mod engine;
+pub mod highlight;
 pub mod index;
 pub mod matcher;
 pub mod tui;

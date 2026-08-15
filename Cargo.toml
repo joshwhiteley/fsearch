@@ -17,7 +17,10 @@ ratatui = "0.30"
 rayon = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+syntect = "5"
+terminal-colorsaurus = "1"
 toml = "1"
+two-face = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

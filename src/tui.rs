@@ -1,5 +1,6 @@
 use crate::actions;
 use crate::engine::{Engine, Mode};
+use crate::highlight::{self, Appearance};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -17,8 +18,9 @@ pub struct App {
     pub regex_mode: bool,
     pub show_preview: bool,
     pub message: Option<String>,
+    pub appearance: Appearance,
     preview_for: Option<(String, Option<u64>)>,
-    preview_lines: Vec<String>,
+    preview_lines: Vec<Line<'static>>,
 }
 
 impl App {
@@ -30,6 +32,7 @@ impl App {
             regex_mode: false,
             show_preview: true,
             message: None,
+            appearance: Appearance::Dark,
             preview_for: None,
             preview_lines: Vec::new(),
         }
@@ -95,7 +98,7 @@ impl App {
     fn load_preview(&mut self) {
         let Some(row) = self.engine.results().get(self.selected) else {
             self.preview_for = None;
-            self.preview_lines = vec!["no selection".to_string()];
+            self.preview_lines = vec![Line::from("no selection")];
             return;
         };
         let key = (row.path.clone(), row.line_number);
@@ -104,26 +107,32 @@ impl App {
         }
         self.preview_for = Some(key);
         self.preview_lines = match std::fs::read(&row.path) {
-            Ok(bytes) if bytes.contains(&0) => vec!["(binary file)".to_string()],
+            Ok(bytes) if bytes.contains(&0) => vec![Line::from("(binary file)")],
             Ok(mut bytes) => {
                 bytes.truncate(PREVIEW_BYTES);
                 let text = String::from_utf8_lossy(&bytes);
-                let all: Vec<String> = text.lines().map(|l| l.to_string()).collect();
                 match row.line_number {
-                    // center the preview on the matching line
+                    // center the preview on the matching line, with a gutter
                     Some(n) => {
                         let start = (n as usize).saturating_sub(6);
-                        all.into_iter()
+                        let end = start + 40;
+                        highlight::highlight(&row.path, &text, self.appearance, end)
+                            .into_iter()
                             .enumerate()
                             .skip(start)
-                            .take(40)
-                            .map(|(i, l)| format!("{:>5} {l}", i + 1))
+                            .map(|(i, line)| {
+                                let gutter = Style::default().fg(Color::DarkGray);
+                                let mut spans =
+                                    vec![Span::styled(format!("{:>5} ", i + 1), gutter)];
+                                spans.extend(line.spans);
+                                Line::from(spans)
+                            })
                             .collect()
                     }
-                    None => all.into_iter().take(100).collect(),
+                    None => highlight::highlight(&row.path, &text, self.appearance, 100),
                 }
             }
-            Err(e) => vec![format!("(unreadable: {e})")],
+            Err(e) => vec![Line::from(format!("(unreadable: {e})"))],
         };
     }
 }
@@ -199,13 +208,8 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     app.load_preview();
-    let text: Vec<Line> = app
-        .preview_lines
-        .iter()
-        .map(|l| Line::from(l.as_str()))
-        .collect();
-    let preview =
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("preview"));
+    let preview = Paragraph::new(app.preview_lines.clone())
+        .block(Block::default().borders(Borders::ALL).title("preview"));
     frame.render_widget(preview, area);
 }
 
@@ -229,8 +233,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn run(engine: Engine) -> anyhow::Result<()> {
+    // query the terminal background and warm syntax dumps before raw mode
+    let appearance = highlight::detect_appearance();
+    highlight::preload();
     let mut terminal = ratatui::init(); // installs a terminal-restoring panic hook
     let mut app = App::new(engine);
+    app.appearance = appearance;
     let result = loop {
         app.engine.tick();
         let len = app.engine.results().len();
