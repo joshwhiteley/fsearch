@@ -39,7 +39,16 @@ Run `fsearch` and start typing.
   `tab` toggles preview · `esc` quits
 
 Scripting: `fsearch -p QUERY` prints matches to stdout (exit 1 when none),
-so it composes with pipes. `fsearch --help` lists everything else.
+and `fsearch --pick` runs the full UI but prints your selection instead of
+opening it — so `vim "$(fsearch --pick)"` works. `fsearch --help` lists
+everything else.
+
+## Shell integration
+
+Source `shell/fsearch.zsh` (or `.bash`) from your rc file to get:
+
+- **Ctrl-T** — pick a file and insert its path at the cursor
+- **`fcd`** — fuzzy-pick a directory and `cd` into it
 
 The first run indexes your home folder; later launches load the cached
 index in milliseconds and refresh it in the background.

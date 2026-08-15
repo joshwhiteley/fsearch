@@ -7,6 +7,7 @@ pub enum Command {
     Reindex,
     Doctor,
     Print(String),
+    Pick(String),
     Unknown(String),
 }
 
@@ -20,6 +21,8 @@ usage:
   fsearch --reindex    rebuild the file index now
   fsearch -p QUERY     print matches to stdout (no ui); \"> pattern\"
                        searches file contents
+  fsearch --pick [Q]   interactive ui, but enter prints the selection to
+                       stdout instead of opening it (for scripts/pipes)
   fsearch --doctor     print what the terminal probe detected
   fsearch --help       show this help
   fsearch --version    print the version
@@ -71,6 +74,11 @@ pub fn parse(args: &[String]) -> Command {
         } else {
             Command::Print(query)
         };
+    }
+    if let Some(first) = args.first()
+        && first == "--pick"
+    {
+        return Command::Pick(args[1..].join(" "));
     }
     let mut cmd = Command::Run;
     for arg in args {
@@ -134,6 +142,15 @@ mod tests {
         );
         // no query is an error
         assert_eq!(parse_strs(&["-p"]), Command::Unknown("-p".to_string()));
+    }
+
+    #[test]
+    fn pick_takes_an_optional_initial_query() {
+        assert_eq!(parse_strs(&["--pick"]), Command::Pick(String::new()));
+        assert_eq!(
+            parse_strs(&["--pick", "dir:"]),
+            Command::Pick("dir:".to_string())
+        );
     }
 
     #[test]

@@ -3,17 +3,28 @@ use crate::engine::{Engine, Mode};
 use crate::highlight::{self, Appearance};
 use crate::images;
 use crate::matcher::Highlighter;
-use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::{Frame, Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 use std::time::Duration;
 
 const PREVIEW_BYTES: usize = 64 * 1024;
+
+/// What Enter does: open the file, or print its path and exit (`--pick`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum UiMode {
+    #[default]
+    Open,
+    Pick,
+}
 
 pub struct App {
     pub engine: Engine,
@@ -24,6 +35,8 @@ pub struct App {
     pub message: Option<String>,
     pub appearance: Appearance,
     pub picker: Option<Picker>,
+    pub ui_mode: UiMode,
+    pub picked: Option<String>,
     preview_for: Option<(String, Option<u64>)>,
     preview: PreviewContent,
 }
@@ -44,6 +57,8 @@ impl App {
             message: None,
             appearance: Appearance::Dark,
             picker: None,
+            ui_mode: UiMode::Open,
+            picked: None,
             preview_for: None,
             preview: PreviewContent::Lines(Vec::new()),
         }
@@ -68,7 +83,15 @@ impl App {
             (KeyCode::Char('y'), true) => self.act(actions::copy, "copied"),
             (KeyCode::Char('f'), true) => self.act(actions::reveal, "revealed"),
             (KeyCode::Tab, _) => self.show_preview = !self.show_preview,
-            (KeyCode::Enter, _) => self.open_selected(),
+            (KeyCode::Enter, _) => match self.ui_mode {
+                UiMode::Open => self.open_selected(),
+                UiMode::Pick => {
+                    if let Some(row) = self.engine.results().get(self.selected) {
+                        self.picked = Some(row.path.clone());
+                        return false;
+                    }
+                }
+            },
             (KeyCode::Backspace, _) => {
                 self.input.pop();
                 self.refresh_query();
@@ -435,6 +458,19 @@ fn forced_picker(protocol: ratatui_image::picker::ProtocolType) -> Picker {
 /// event loop consumes stdin.
 pub fn probe_terminal() -> (highlight::TerminalTraits, Option<Picker>) {
     use ratatui_image::picker::ProtocolType;
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        // stdout is a pipe (`--pick` in command substitution): the stdio
+        // capability queries would write escape bytes into the pipe and
+        // never get answers, so skip them entirely
+        return (
+            highlight::TerminalTraits {
+                appearance: crate::highlight::Appearance::Dark,
+                responsive: false,
+            },
+            Some(Picker::halfblocks()),
+        );
+    }
     let traits = highlight::detect_terminal();
     let picker = match std::env::var("FSEARCH_IMAGES").as_deref() {
         Ok("off") => None,
@@ -453,13 +489,39 @@ pub fn probe_terminal() -> (highlight::TerminalTraits, Option<Picker>) {
     (traits, picker)
 }
 
-pub fn run(engine: Engine) -> anyhow::Result<()> {
+fn open_tty() -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).open("/dev/tty")
+}
+
+fn restore_terminal() {
+    if let Ok(mut tty) = open_tty() {
+        let _ = execute!(tty, LeaveAlternateScreen);
+    }
+    let _ = disable_raw_mode();
+}
+
+/// Runs the UI. Draws on /dev/tty (not stdout), so `--pick` works inside
+/// command substitution. In [`UiMode::Pick`], Enter returns the selection.
+pub fn run(engine: Engine, ui_mode: UiMode, initial_query: &str) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
-    let mut terminal = ratatui::init(); // installs a terminal-restoring panic hook
+    let mut tty = open_tty()?;
+    enable_raw_mode()?;
+    execute!(tty, EnterAlternateScreen)?;
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+    let mut terminal = Terminal::new(CrosstermBackend::new(tty))?;
     let mut app = App::new(engine);
     app.appearance = traits.appearance;
     app.picker = picker;
+    app.ui_mode = ui_mode;
+    if !initial_query.is_empty() {
+        app.input = initial_query.to_string();
+        app.engine.set_query(&app.input, app.regex_mode);
+    }
     let result = loop {
         app.engine.tick();
         let len = app.engine.results().len();
@@ -482,8 +544,9 @@ pub fn run(engine: Engine) -> anyhow::Result<()> {
             Err(e) => break Err(e.into()),
         }
     };
-    ratatui::restore();
-    result
+    restore_terminal();
+    let _ = std::panic::take_hook(); // drop the restoring hook
+    result.map(|_| app.picked)
 }
 
 #[cfg(test)]
@@ -564,6 +627,15 @@ mod tests {
         assert_eq!(spans[0].style, Style::default());
         // no positions → single raw span
         assert_eq!(spans_with_positions("abcd", &[], hl).len(), 1);
+    }
+
+    #[test]
+    fn pick_mode_enter_returns_selection_and_quits() {
+        let mut app = test_app();
+        app.ui_mode = UiMode::Pick;
+        // no results yet: Enter does nothing
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(app.picked.is_none());
     }
 
     #[test]

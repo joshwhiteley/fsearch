@@ -4,13 +4,14 @@ use std::time::Instant;
 
 fn main() {
     match cli::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        Command::Run => run_ui(),
+        Command::Run => run_ui(tui::UiMode::Open, ""),
         Command::Help => print!("{}", cli::HELP),
         Command::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Command::Config => edit_config(),
         Command::Reindex => reindex(),
         Command::Doctor => doctor(),
         Command::Print(query) => print_search(&query),
+        Command::Pick(initial) => run_ui(tui::UiMode::Pick, &initial),
         Command::Unknown(arg) => {
             eprintln!("fsearch: unexpected argument {arg:?}\n");
             eprint!("{}", cli::HELP);
@@ -111,15 +112,24 @@ fn print_search(query: &str) {
     }
 }
 
-fn run_ui() {
+fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     let engine = Engine::new(
         load_config(),
         index::default_cache_path(),
         fsearch::frecency::default_history_path(),
     );
-    if let Err(e) = tui::run(engine) {
-        eprintln!("fsearch: {e:#}");
-        std::process::exit(1);
+    match tui::run(engine, ui_mode, initial_query) {
+        Ok(Some(picked)) => println!("{picked}"),
+        Ok(None) => {
+            if ui_mode == tui::UiMode::Pick {
+                // nothing chosen: signal it like grep does
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("fsearch: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
