@@ -9,6 +9,7 @@ fn main() {
         Command::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Command::Config => edit_config(),
         Command::Reindex => reindex(),
+        Command::Print(query) => print_search(&query),
         Command::Unknown(arg) => {
             eprintln!("fsearch: unexpected argument {arg:?}\n");
             eprint!("{}", cli::HELP);
@@ -24,6 +25,65 @@ fn load_config() -> config::Config {
             eprintln!("fsearch: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Non-interactive search: prints matches to stdout, exits 1 when none.
+/// Uses the cached index when present; builds (and saves) one otherwise.
+fn print_search(query: &str) {
+    let config = load_config();
+    let cache = index::default_cache_path();
+    let paths = index::load(&cache).unwrap_or_else(|| {
+        let excludes = walker::build_exclude_set(&config.excludes).unwrap_or_else(|e| {
+            eprintln!("fsearch: invalid exclude pattern: {e:#}");
+            std::process::exit(1);
+        });
+        let (paths, _) = walker::collect_sorted(&config.roots, &excludes);
+        let _ = index::save(&paths, &cache);
+        paths
+    });
+
+    let matched = if let Some(pattern) = query.strip_prefix('>') {
+        let pattern = pattern.trim_start().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let max = config.max_content_filesize;
+        let result = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let r = fsearch::content::search(&paths, &pattern, max, &cancel, &tx);
+                drop(tx);
+                r
+            });
+            let mut any = false;
+            for hit in rx {
+                any = true;
+                println!("{}:{}:{}", hit.path, hit.line_number, hit.line);
+            }
+            handle.join().expect("content search panicked").map(|_| any)
+        });
+        match result {
+            Ok(any) => any,
+            Err(e) => {
+                eprintln!("fsearch: invalid pattern: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        match fsearch::matcher::search(&paths, query, fsearch::matcher::FilenameMode::Fuzzy, 500) {
+            Ok(indices) => {
+                for i in &indices {
+                    println!("{}", paths[*i]);
+                }
+                !indices.is_empty()
+            }
+            Err(e) => {
+                eprintln!("fsearch: {e}");
+                std::process::exit(2);
+            }
+        }
+    };
+    if !matched {
+        std::process::exit(1);
     }
 }
 

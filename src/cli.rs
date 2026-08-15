@@ -5,6 +5,7 @@ pub enum Command {
     Version,
     Config,
     Reindex,
+    Print(String),
     Unknown(String),
 }
 
@@ -16,6 +17,8 @@ usage:
   fsearch --config     open the config file in $VISUAL/$EDITOR,
                        or reveal it in Finder when neither is set
   fsearch --reindex    rebuild the file index now
+  fsearch -p QUERY     print matches to stdout (no ui); \"> pattern\"
+                       searches file contents
   fsearch --help       show this help
   fsearch --version    print the version
 
@@ -55,6 +58,16 @@ pub fn choose_config_open(visual: Option<&str>, editor: Option<&str>) -> ConfigO
 
 /// Parses argv (without the program name) into a command.
 pub fn parse(args: &[String]) -> Command {
+    if let Some(first) = args.first()
+        && (first == "-p" || first == "--print")
+    {
+        let query = args[1..].join(" ");
+        return if query.is_empty() {
+            Command::Unknown(first.clone())
+        } else {
+            Command::Print(query)
+        };
+    }
     let mut cmd = Command::Run;
     for arg in args {
         let next = match arg.as_str() {
@@ -102,6 +115,20 @@ mod tests {
     fn config_and_reindex_flags() {
         assert_eq!(parse_strs(&["--config"]), Command::Config);
         assert_eq!(parse_strs(&["--reindex"]), Command::Reindex);
+    }
+
+    #[test]
+    fn print_takes_the_rest_as_query() {
+        assert_eq!(
+            parse_strs(&["-p", "tax", "2025"]),
+            Command::Print("tax 2025".to_string())
+        );
+        assert_eq!(
+            parse_strs(&["--print", "> needle"]),
+            Command::Print("> needle".to_string())
+        );
+        // no query is an error
+        assert_eq!(parse_strs(&["-p"]), Command::Unknown("-p".to_string()));
     }
 
     #[test]
