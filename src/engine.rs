@@ -1,6 +1,8 @@
 use crate::content::{self, ContentMatch};
+use crate::frecency::Frecency;
 use crate::matcher::{self, FilenameMode};
 use crate::{config::Config, index, walker};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -64,6 +66,7 @@ struct FilenameJob {
     query: String,
     mode: FilenameMode,
     paths: Arc<Vec<String>>,
+    boosts: Arc<HashMap<String, u32>>,
 }
 
 pub struct Engine {
@@ -79,10 +82,18 @@ pub struct Engine {
     max_content_filesize: u64,
     pending_content: Option<(String, Instant)>,
     content_cancel: Option<Arc<AtomicBool>>,
+    frecency: Frecency,
+    boosts: Arc<HashMap<String, u32>>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 impl Engine {
-    pub fn new(config: Config, cache_path: PathBuf) -> Engine {
+    pub fn new(config: Config, cache_path: PathBuf, history_path: PathBuf) -> Engine {
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
 
@@ -93,11 +104,16 @@ impl Engine {
                 while let Ok(newer) = job_rx.try_recv() {
                     job = newer;
                 }
-                let (indices, error) =
-                    match matcher::search(&job.paths, &job.query, job.mode, FILENAME_LIMIT) {
-                        Ok(ix) => (ix, None),
-                        Err(e) => (Vec::new(), Some(format!("invalid pattern: {e}"))),
-                    };
+                let (indices, error) = match matcher::search_boosted(
+                    &job.paths,
+                    &job.query,
+                    job.mode,
+                    FILENAME_LIMIT,
+                    &job.boosts,
+                ) {
+                    Ok(ix) => (ix, None),
+                    Err(e) => (Vec::new(), Some(format!("invalid pattern: {e}"))),
+                };
                 if worker_tx
                     .send(Msg::FilenameResults {
                         generation: job.generation,
@@ -160,6 +176,8 @@ impl Engine {
             let _ = index::save(&paths, &cache_path);
         });
 
+        let frecency = Frecency::load(history_path);
+        let boosts = Arc::new(frecency.boosts(unix_now()));
         Engine {
             msg_rx,
             msg_tx,
@@ -176,7 +194,15 @@ impl Engine {
             max_content_filesize,
             pending_content: None,
             content_cancel: None,
+            frecency,
+            boosts,
         }
+    }
+
+    /// Records that `path` was opened, boosting it in future rankings.
+    pub fn record_open(&mut self, path: &str) {
+        self.frecency.record(path);
+        self.boosts = Arc::new(self.frecency.boosts(unix_now()));
     }
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
@@ -274,6 +300,7 @@ impl Engine {
             query: self.query.clone(),
             mode,
             paths: self.paths.clone(),
+            boosts: self.boosts.clone(),
         });
     }
 

@@ -68,7 +68,7 @@ impl App {
             (KeyCode::Char('y'), true) => self.act(actions::copy, "copied"),
             (KeyCode::Char('f'), true) => self.act(actions::reveal, "revealed"),
             (KeyCode::Tab, _) => self.show_preview = !self.show_preview,
-            (KeyCode::Enter, _) => self.act(actions::open, "opened"),
+            (KeyCode::Enter, _) => self.open_selected(),
             (KeyCode::Backspace, _) => {
                 self.input.pop();
                 self.refresh_query();
@@ -94,6 +94,20 @@ impl App {
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    fn open_selected(&mut self) {
+        let Some(row) = self.engine.results().get(self.selected) else {
+            return;
+        };
+        let path = row.path.clone();
+        self.message = Some(match actions::open(&path) {
+            Ok(()) => {
+                self.engine.record_open(&path);
+                format!("opened: {path}")
+            }
+            Err(e) => format!("error: {e}"),
+        });
     }
 
     fn act(&mut self, f: impl Fn(&str) -> std::io::Result<()>, verb: &str) {
@@ -380,7 +394,11 @@ mod tests {
             excludes: vec![],
             max_content_filesize: 1024,
         };
-        let engine = Engine::new(config, dir.path().join("index.bin"));
+        let engine = Engine::new(
+            config,
+            dir.path().join("index.bin"),
+            dir.path().join("history"),
+        );
         // keep the tempdir alive for the test's duration by leaking it (test-only)
         std::mem::forget(dir);
         App::new(engine)

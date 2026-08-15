@@ -99,12 +99,18 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn open_uses_xdg_open() {
-        assert_eq!(open_args("/a b.txt"), ("xdg-open", vec!["/a b.txt".to_string()]));
+        assert_eq!(
+            open_args("/a b.txt"),
+            ("xdg-open", vec!["/a b.txt".to_string()])
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn reveal_opens_parent_dir() {
-        assert_eq!(reveal_args("/a/b.txt"), ("xdg-open", vec!["/a".to_string()]));
+        assert_eq!(
+            reveal_args("/a/b.txt"),
+            ("xdg-open", vec!["/a".to_string()])
+        );
     }
 }

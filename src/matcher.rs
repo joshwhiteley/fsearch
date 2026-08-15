@@ -1,6 +1,7 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilenameMode {
@@ -14,12 +15,53 @@ pub fn search(
     mode: FilenameMode,
     limit: usize,
 ) -> Result<Vec<usize>, String> {
+    search_boosted(paths, query, mode, limit, &HashMap::new())
+}
+
+/// Like [`search`], with per-path ranking boosts (from open history).
+pub fn search_boosted(
+    paths: &[String],
+    query: &str,
+    mode: FilenameMode,
+    limit: usize,
+    boosts: &HashMap<String, u32>,
+) -> Result<Vec<usize>, String> {
     if query.is_empty() {
-        return Ok((0..paths.len().min(limit)).collect());
+        return Ok(head_with_boosts(paths, limit, boosts));
     }
     match mode {
-        FilenameMode::Fuzzy => Ok(fuzzy(paths, query, limit)),
-        FilenameMode::Regex => regex_filter(paths, query, limit),
+        FilenameMode::Fuzzy => Ok(fuzzy(paths, query, limit, boosts)),
+        FilenameMode::Regex => regex_filter(paths, query, limit, boosts),
+    }
+}
+
+/// First `limit` paths (already newest-first), with boosted paths — wherever
+/// they sit in the full list — floated to the front.
+fn head_with_boosts(paths: &[String], limit: usize, boosts: &HashMap<String, u32>) -> Vec<usize> {
+    if boosts.is_empty() {
+        return (0..paths.len().min(limit)).collect();
+    }
+    let mut boosted: Vec<(u32, usize)> = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| boosts.get(p).map(|&b| (b, i)))
+        .collect();
+    boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
+    let mut out: Vec<usize> = boosted.iter().map(|&(_, i)| i).collect();
+    let in_boosted: std::collections::HashSet<usize> = out.iter().copied().collect();
+    out.extend(
+        (0..paths.len())
+            .filter(|i| !in_boosted.contains(i))
+            .take(limit),
+    );
+    out.truncate(limit);
+    out
+}
+
+fn apply_boost_order(hits: &mut [usize], paths: &[String], boosts: &HashMap<String, u32>) {
+    if !boosts.is_empty() {
+        // stable: unboosted hits keep their recency order
+        hits.sort_by_key(|&i| std::cmp::Reverse(boosts.get(&paths[i]).copied().unwrap_or(0)));
     }
 }
 
@@ -57,7 +99,7 @@ impl Highlighter {
 
 const CHUNK: usize = 16_384;
 
-fn fuzzy(paths: &[String], query: &str, limit: usize) -> Vec<usize> {
+fn fuzzy(paths: &[String], query: &str, limit: usize, boosts: &HashMap<String, u32>) -> Vec<usize> {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut scored: Vec<(u32, usize)> = paths
         .par_chunks(CHUNK)
@@ -74,7 +116,10 @@ fn fuzzy(paths: &[String], query: &str, limit: usize) -> Vec<usize> {
                 .filter_map(|(i, path)| {
                     pattern
                         .score(Utf32Str::new(path, &mut buf), &mut matcher)
-                        .map(|score| (score, base + i))
+                        .map(|score| {
+                            let boost = boosts.get(path).copied().unwrap_or(0);
+                            (score + boost, base + i)
+                        })
                 })
                 .collect::<Vec<_>>()
         })
@@ -85,7 +130,12 @@ fn fuzzy(paths: &[String], query: &str, limit: usize) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
-fn regex_filter(paths: &[String], query: &str, limit: usize) -> Result<Vec<usize>, String> {
+fn regex_filter(
+    paths: &[String],
+    query: &str,
+    limit: usize,
+    boosts: &HashMap<String, u32>,
+) -> Result<Vec<usize>, String> {
     let smart_case_insensitive = !query.chars().any(|c| c.is_uppercase());
     let re = regex::RegexBuilder::new(query)
         .case_insensitive(smart_case_insensitive)
@@ -98,6 +148,7 @@ fn regex_filter(paths: &[String], query: &str, limit: usize) -> Result<Vec<usize
         .map(|(i, _)| i)
         .collect();
     hits.sort_unstable();
+    apply_boost_order(&mut hits, paths, boosts);
     hits.truncate(limit);
     Ok(hits)
 }
@@ -163,6 +214,22 @@ mod tests {
     fn invalid_regex_is_err() {
         let p = paths(&["/a"]);
         assert!(search(&p, "[unclosed", FilenameMode::Regex, 10).is_err());
+    }
+
+    #[test]
+    fn boosts_break_fuzzy_ties_and_order_lists() {
+        let p = paths(&["/docs/readme-a.md", "/docs/readme-b.md"]);
+        let mut boosts = HashMap::new();
+        boosts.insert("/docs/readme-b.md".to_string(), 50u32);
+        // identical fuzzy quality: boost wins
+        let r = search_boosted(&p, "readme", FilenameMode::Fuzzy, 10, &boosts).unwrap();
+        assert_eq!(r[0], 1);
+        // empty query: boosted file floats to the top
+        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &boosts).unwrap();
+        assert_eq!(r, vec![1, 0]);
+        // regex: boosted file first, others keep index order
+        let r = search_boosted(&p, "readme", FilenameMode::Regex, 10, &boosts).unwrap();
+        assert_eq!(r, vec![1, 0]);
     }
 
     #[test]

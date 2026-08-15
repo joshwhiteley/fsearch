@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod content;
 pub mod engine;
+pub mod frecency;
 pub mod highlight;
 pub mod images;
 pub mod index;

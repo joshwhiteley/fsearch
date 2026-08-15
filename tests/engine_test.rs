@@ -42,7 +42,11 @@ fn end_to_end_filename_and_content_search() {
     let tree = make_tree();
     let cache_dir = tempfile::tempdir().unwrap();
     let cache = cache_dir.path().join("index.bin");
-    let mut engine = Engine::new(config_for(tree.path()), cache.clone());
+    let mut engine = Engine::new(
+        config_for(tree.path()),
+        cache.clone(),
+        cache_dir.path().join("history"),
+    );
 
     // index builds in the background (no cache on first run)
     wait_until(&mut engine, Duration::from_secs(5), |e| {
@@ -87,7 +91,7 @@ fn end_to_end_filename_and_content_search() {
 
     // cache was written; a second engine loads it instantly
     wait_until(&mut engine, Duration::from_secs(5), |_| cache.exists());
-    let mut engine2 = Engine::new(config_for(tree.path()), cache);
+    let mut engine2 = Engine::new(config_for(tree.path()), cache, cache_dir.path().join("h2"));
     wait_until(&mut engine2, Duration::from_secs(2), |e| {
         e.status().indexed == 2
     });
@@ -97,7 +101,11 @@ fn end_to_end_filename_and_content_search() {
 fn content_search_typed_char_by_char() {
     let tree = make_tree();
     let cache_dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(config_for(tree.path()), cache_dir.path().join("index.bin"));
+    let mut engine = Engine::new(
+        config_for(tree.path()),
+        cache_dir.path().join("index.bin"),
+        cache_dir.path().join("history"),
+    );
     wait_until(&mut engine, Duration::from_secs(5), |e| {
         !e.status().indexing
     });
@@ -128,7 +136,11 @@ fn results_sorted_by_last_modified_desc() {
         f.set_modified(now - age * hour).unwrap();
     }
     let cache_dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(config_for(p), cache_dir.path().join("index.bin"));
+    let mut engine = Engine::new(
+        config_for(p),
+        cache_dir.path().join("index.bin"),
+        cache_dir.path().join("history"),
+    );
     wait_until(&mut engine, Duration::from_secs(5), |e| {
         !e.status().indexing && e.status().indexed == 3
     });
@@ -151,4 +163,41 @@ fn results_sorted_by_last_modified_desc() {
         e.results().len() == 3 && e.results()[0].path.ends_with("newest.txt")
     });
     assert!(engine.results()[2].path.ends_with("old.txt"));
+}
+
+#[test]
+fn opened_files_rank_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let hour = Duration::from_secs(3600);
+    let now = std::time::SystemTime::now();
+    for (name, age) in [("stale-open.txt", 5), ("fresh.txt", 0)] {
+        let path = p.join(name);
+        std::fs::write(&path, "x\n").unwrap();
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(now - age * hour).unwrap();
+    }
+    let aux = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(
+        config_for(p),
+        aux.path().join("index.bin"),
+        aux.path().join("history"),
+    );
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().indexed == 2
+    });
+
+    // mtime order first: fresh.txt on top
+    engine.set_query("", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 2 && e.results()[0].path.ends_with("fresh.txt")
+    });
+
+    // open the stale file → it should outrank the fresher one
+    let stale = p.join("stale-open.txt").to_string_lossy().into_owned();
+    engine.record_open(&stale);
+    engine.set_query("", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results().len() == 2 && e.results()[0].path.ends_with("stale-open.txt")
+    });
 }

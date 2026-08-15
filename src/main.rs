@@ -88,7 +88,11 @@ fn print_search(query: &str) {
 }
 
 fn run_ui() {
-    let engine = Engine::new(load_config(), index::default_cache_path());
+    let engine = Engine::new(
+        load_config(),
+        index::default_cache_path(),
+        fsearch::frecency::default_history_path(),
+    );
     if let Err(e) = tui::run(engine) {
         eprintln!("fsearch: {e:#}");
         std::process::exit(1);
