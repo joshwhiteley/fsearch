@@ -13,13 +13,32 @@ pub enum Appearance {
     Light,
 }
 
+/// What the pre-init terminal probe learned.
+pub struct TerminalTraits {
+    pub appearance: Appearance,
+    /// True when the terminal answered the OSC background query. A terminal
+    /// that answers nothing must not receive further stdio queries: the
+    /// graphics-protocol probe leaks a reader thread that eats stdin forever
+    /// when its replies never come.
+    pub responsive: bool,
+}
+
 /// Queries the terminal background color. Must run before entering raw mode /
 /// the alternate screen, or the OSC reply interleaves with input events.
-pub fn detect_appearance() -> Appearance {
+pub fn detect_terminal() -> TerminalTraits {
     use terminal_colorsaurus::{QueryOptions, ThemeMode, theme_mode};
     match theme_mode(QueryOptions::default()) {
-        Ok(ThemeMode::Light) => Appearance::Light,
-        _ => Appearance::Dark,
+        Ok(mode) => TerminalTraits {
+            appearance: match mode {
+                ThemeMode::Light => Appearance::Light,
+                _ => Appearance::Dark,
+            },
+            responsive: true,
+        },
+        Err(_) => TerminalTraits {
+            appearance: Appearance::Dark,
+            responsive: false,
+        },
     }
 }
 

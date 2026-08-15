@@ -1,6 +1,9 @@
 use crate::actions;
 use crate::engine::{Engine, Mode};
 use crate::highlight::{self, Appearance};
+use crate::images;
+use ratatui_image::picker::Picker;
+use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -19,8 +22,14 @@ pub struct App {
     pub show_preview: bool,
     pub message: Option<String>,
     pub appearance: Appearance,
+    pub picker: Option<Picker>,
     preview_for: Option<(String, Option<u64>)>,
-    preview_lines: Vec<Line<'static>>,
+    preview: PreviewContent,
+}
+
+enum PreviewContent {
+    Lines(Vec<Line<'static>>),
+    Image(Box<StatefulProtocol>),
 }
 
 impl App {
@@ -33,8 +42,9 @@ impl App {
             show_preview: true,
             message: None,
             appearance: Appearance::Dark,
+            picker: None,
             preview_for: None,
-            preview_lines: Vec::new(),
+            preview: PreviewContent::Lines(Vec::new()),
         }
     }
 
@@ -98,7 +108,7 @@ impl App {
     fn load_preview(&mut self) {
         let Some(row) = self.engine.results().get(self.selected) else {
             self.preview_for = None;
-            self.preview_lines = vec![Line::from("no selection")];
+            self.preview = PreviewContent::Lines(vec![Line::from("no selection")]);
             return;
         };
         let key = (row.path.clone(), row.line_number);
@@ -106,7 +116,17 @@ impl App {
             return;
         }
         self.preview_for = Some(key);
-        self.preview_lines = match std::fs::read(&row.path) {
+        if images::is_image_path(&row.path) {
+            self.preview = match (&self.picker, images::load(&row.path, images::MAX_IMAGE_BYTES)) {
+                (Some(picker), Ok(img)) => {
+                    PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
+                }
+                (None, _) => PreviewContent::Lines(vec![Line::from("(image)")]),
+                (_, Err(e)) => PreviewContent::Lines(vec![Line::from(format!("(image: {e})"))]),
+            };
+            return;
+        }
+        let lines = match std::fs::read(&row.path) {
             Ok(bytes) if bytes.contains(&0) => vec![Line::from("(binary file)")],
             Ok(mut bytes) => {
                 bytes.truncate(PREVIEW_BYTES);
@@ -134,6 +154,7 @@ impl App {
             }
             Err(e) => vec![Line::from(format!("(unreadable: {e})"))],
         };
+        self.preview = PreviewContent::Lines(lines);
     }
 }
 
@@ -208,9 +229,17 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     app.load_preview();
-    let preview = Paragraph::new(app.preview_lines.clone())
-        .block(Block::default().borders(Borders::ALL).title("preview"));
-    frame.render_widget(preview, area);
+    let block = Block::default().borders(Borders::ALL).title("preview");
+    match &mut app.preview {
+        PreviewContent::Lines(lines) => {
+            frame.render_widget(Paragraph::new(lines.clone()).block(block), area);
+        }
+        PreviewContent::Image(protocol) => {
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_stateful_widget(StatefulImage::default(), inner, protocol.as_mut());
+        }
+    }
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -233,12 +262,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn run(engine: Engine) -> anyhow::Result<()> {
-    // query the terminal background and warm syntax dumps before raw mode
-    let appearance = highlight::detect_appearance();
+    // query the terminal background, graphics protocol, and warm syntax
+    // dumps — all before raw mode / the event loop consumes stdin
+    let traits = highlight::detect_terminal();
+    let picker = if traits.responsive {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    } else {
+        Picker::halfblocks()
+    };
     highlight::preload();
     let mut terminal = ratatui::init(); // installs a terminal-restoring panic hook
     let mut app = App::new(engine);
-    app.appearance = appearance;
+    app.appearance = traits.appearance;
+    app.picker = Some(picker);
     let result = loop {
         app.engine.tick();
         let len = app.engine.results().len();

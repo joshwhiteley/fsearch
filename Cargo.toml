@@ -12,10 +12,13 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+image = "0.25"
 nucleo-matcher = "0.3"
 ratatui = "0.30"
+ratatui-image = { version = "11", default-features = false, features = ["image-defaults", "crossterm"] }
 rayon = "1"
 regex = "1"
+resvg = { version = "0.48", default-features = false, features = ["raster-images"] }
 serde = { version = "1", features = ["derive"] }
 syntect = "5"
 terminal-colorsaurus = "1"
