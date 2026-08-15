@@ -415,12 +415,52 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// "412 B", "1.3 KB", "2.0 MB", "1.1 GB"
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// "just now", "5m ago", "3h ago", "12d ago", "2y ago"
+fn human_age(modified: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(modified)
+        .map_or(0, |d| d.as_secs());
+    match secs {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 24 * 3600 => format!("{}h ago", s / 3600),
+        s if s < 365 * 24 * 3600 => format!("{}d ago", s / (24 * 3600)),
+        s => format!("{}y ago", s / (365 * 24 * 3600)),
+    }
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let s = app.engine.status();
     let mut parts = vec![
         format!("{} indexed", s.indexed),
         format!("{} matches", s.matches),
     ];
+    if let Some(row) = app.engine.results().get(app.selected)
+        && let Ok(meta) = std::fs::metadata(&row.path)
+    {
+        if meta.is_file() {
+            parts.push(human_size(meta.len()));
+        }
+        if let Ok(modified) = meta.modified() {
+            parts.push(human_age(modified));
+        }
+    }
     if s.indexing {
         parts.push("indexing…".to_string());
     }
@@ -615,6 +655,28 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
         assert_eq!(app.input, "");
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn sizes_and_ages_humanize() {
+        assert_eq!(human_size(412), "412 B");
+        assert_eq!(human_size(1300), "1.3 KB");
+        assert_eq!(human_size(2_000_000), "2.0 MB");
+        assert_eq!(human_size(1_100_000_000), "1.1 GB");
+        let now = std::time::SystemTime::now();
+        assert_eq!(human_age(now), "just now");
+        assert_eq!(
+            human_age(now - std::time::Duration::from_secs(300)),
+            "5m ago"
+        );
+        assert_eq!(
+            human_age(now - std::time::Duration::from_secs(7200)),
+            "2h ago"
+        );
+        assert_eq!(
+            human_age(now - std::time::Duration::from_secs(3 * 24 * 3600)),
+            "3d ago"
+        );
     }
 
     #[test]
