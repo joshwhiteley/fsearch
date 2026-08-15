@@ -11,8 +11,9 @@ under your home folder, hit enter to open it. Inspired by Alfred.
 fsearch keeps a persisted index of every file under your home directory —
 hidden files included — and filters it as you type. Previews are
 syntax-highlighted; images (PNG, JPEG, TIFF, GIF, WebP, SVG…) render right
-in the terminal. Results are sorted by last modified, so the file you
-touched an hour ago is at the top.
+in the terminal. Results are sorted by last modified and by what you
+actually open, and the index updates live as files change on disk — no
+re-scanning, no staleness. Works on macOS and Linux.
 
 ## Install
 

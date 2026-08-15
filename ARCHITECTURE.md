@@ -64,6 +64,17 @@ grep stops burning CPU mid-file.
 queue to the newest job before running it, so typing fast never queues up
 redundant searches.
 
+**The watcher is armed before the walk.** Filesystem events (FSEvents /
+inotify via the notify crate) start buffering *before* the initial walk
+begins, then fold into fresh snapshots afterwards — changed files
+front-insert (they're the newest), deletions filter out, and re-statting
+each touched path makes replayed events idempotent. Without this ordering
+there's an unfixable race between "walk finished" and "stream started".
+
+**Frecency lives beside the index, not in it.** Opens append to a small
+history file; at search time they become per-path score boosts — tie-breaks
+in fuzzy mode, front-floats in recency-ordered lists.
+
 **The terminal is probed once, before raw mode.** Background color (for
 light/dark preview themes) and the graphics protocol (Kitty/iTerm2/halfblock
 image previews) are queried at startup, before ratatui takes the terminal.
@@ -80,7 +91,7 @@ UI thread (tui.rs)                 engine.tick() drains msg_rx every frame
 Engine ──── job_tx ────▶ search worker (latest job wins) ── msg_tx ──▶ results
   │                                                                     ▲
   ├─ indexer thread: load cache → publish → walk roots → publish fresh ─┤
-  │                    └── saves sorted cache atomically                │
+  │     └─ then folds fs events (notify) into new snapshots, forever    │
   └─ content thread (per query, debounced 300 ms, cancel flag) ────────┘
 ```
 
