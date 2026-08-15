@@ -93,6 +93,10 @@ pub struct Engine {
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
 const WATCH_SAVE_EVERY: Duration = Duration::from_secs(60);
 
+fn cache_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Starts watching `roots` and returns the live watcher (keep it alive!)
 /// plus the event stream. Armed *before* the initial walk so that no change
 /// can slip between walk completion and stream start.
@@ -125,6 +129,10 @@ fn watch_loop(
     mut current: Arc<Vec<String>>,
 ) {
     let mut last_save = Instant::now();
+    // single-writer courtesy: remember the cache state we produced; if the
+    // file changes underneath us (another instance, a --reindex), stop
+    // saving so we never clobber fresher data with our older snapshot
+    let mut our_stamp = cache_mtime(cache_path);
     loop {
         // block until something happens, then debounce-collect the burst
         let Ok(first) = event_rx.recv() else { return };
@@ -197,7 +205,10 @@ fn watch_loop(
         }
         if last_save.elapsed() >= WATCH_SAVE_EVERY {
             last_save = Instant::now();
-            let _ = index::save(&current, cache_path);
+            if cache_mtime(cache_path) == our_stamp {
+                let _ = index::save(&current, cache_path);
+                our_stamp = cache_mtime(cache_path);
+            }
         }
     }
 }
