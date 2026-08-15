@@ -1,4 +1,5 @@
 use crate::filters::Filters;
+use crate::walker::FileMeta;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
@@ -18,6 +19,7 @@ pub fn search(
 ) -> Result<Vec<usize>, String> {
     search_boosted(
         paths,
+        &[],
         query,
         mode,
         limit,
@@ -26,9 +28,15 @@ pub fn search(
     )
 }
 
+/// Missing metadata (e.g. an empty slice) never filters anything out.
+fn meta_at(metas: &[FileMeta], i: usize, filters: &Filters) -> bool {
+    metas.get(i).is_none_or(|m| filters.matches_meta(m))
+}
+
 /// Like [`search`], with per-path ranking boosts (from open history).
 pub fn search_boosted(
     paths: &[String],
+    metas: &[FileMeta],
     query: &str,
     mode: FilenameMode,
     limit: usize,
@@ -36,11 +44,11 @@ pub fn search_boosted(
     filters: &Filters,
 ) -> Result<Vec<usize>, String> {
     if query.is_empty() {
-        return Ok(head_with_boosts(paths, limit, boosts, filters));
+        return Ok(head_with_boosts(paths, metas, limit, boosts, filters));
     }
     match mode {
-        FilenameMode::Fuzzy => Ok(fuzzy(paths, query, limit, boosts, filters)),
-        FilenameMode::Regex => regex_filter(paths, query, limit, boosts, filters),
+        FilenameMode::Fuzzy => Ok(fuzzy(paths, metas, query, limit, boosts, filters)),
+        FilenameMode::Regex => regex_filter(paths, metas, query, limit, boosts, filters),
     }
 }
 
@@ -48,20 +56,21 @@ pub fn search_boosted(
 /// they sit in the full list — floated to the front.
 fn head_with_boosts(
     paths: &[String],
+    metas: &[FileMeta],
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
 ) -> Vec<usize> {
     if boosts.is_empty() {
         return (0..paths.len())
-            .filter(|&i| filters.matches(&paths[i]))
+            .filter(|&i| filters.matches(&paths[i]) && meta_at(metas, i, filters))
             .take(limit)
             .collect();
     }
     let mut boosted: Vec<(u32, usize)> = paths
         .iter()
         .enumerate()
-        .filter(|(_, p)| filters.matches(p))
+        .filter(|(i, p)| filters.matches(p) && meta_at(metas, *i, filters))
         .filter_map(|(i, p)| boosts.get(p).map(|&b| (b, i)))
         .collect();
     boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
@@ -69,7 +78,9 @@ fn head_with_boosts(
     let in_boosted: std::collections::HashSet<usize> = out.iter().copied().collect();
     out.extend(
         (0..paths.len())
-            .filter(|&i| !in_boosted.contains(&i) && filters.matches(&paths[i]))
+            .filter(|&i| {
+                !in_boosted.contains(&i) && filters.matches(&paths[i]) && meta_at(metas, i, filters)
+            })
             .take(limit),
     );
     out.truncate(limit);
@@ -119,6 +130,7 @@ const CHUNK: usize = 16_384;
 
 fn fuzzy(
     paths: &[String],
+    metas: &[FileMeta],
     query: &str,
     limit: usize,
     boosts: &HashMap<String, u32>,
@@ -137,7 +149,7 @@ fn fuzzy(
             chunk
                 .iter()
                 .enumerate()
-                .filter(|(_, path)| filters.matches(path))
+                .filter(|(i, path)| filters.matches(path) && meta_at(metas, base + i, filters))
                 .filter_map(|(i, path)| {
                     pattern
                         .score(Utf32Str::new(path, &mut buf), &mut matcher)
@@ -157,6 +169,7 @@ fn fuzzy(
 
 fn regex_filter(
     paths: &[String],
+    metas: &[FileMeta],
     query: &str,
     limit: usize,
     boosts: &HashMap<String, u32>,
@@ -170,7 +183,7 @@ fn regex_filter(
     let mut hits: Vec<usize> = paths
         .par_iter()
         .enumerate()
-        .filter(|(_, p)| filters.matches(p) && re.is_match(p))
+        .filter(|(i, p)| filters.matches(p) && meta_at(metas, *i, filters) && re.is_match(p))
         .map(|(i, _)| i)
         .collect();
     hits.sort_unstable();
@@ -250,6 +263,7 @@ mod tests {
         // identical fuzzy quality: boost wins
         let r = search_boosted(
             &p,
+            &[],
             "readme",
             FilenameMode::Fuzzy,
             10,
@@ -261,6 +275,7 @@ mod tests {
         // empty query: boosted file floats to the top
         let r = search_boosted(
             &p,
+            &[],
             "",
             FilenameMode::Fuzzy,
             10,
@@ -272,6 +287,7 @@ mod tests {
         // regex: boosted file first, others keep index order
         let r = search_boosted(
             &p,
+            &[],
             "readme",
             FilenameMode::Regex,
             10,
@@ -285,17 +301,17 @@ mod tests {
     #[test]
     fn filters_narrow_all_modes() {
         let p = paths(&["/docs/a.pdf", "/docs/a.txt", "/docs/sub/", "/extra/b.pdf"]);
-        let (f, _) = crate::filters::parse("ext:pdf path:docs x");
+        let (f, _) = crate::filters::parse("ext:pdf path:docs x", 0);
         let none = HashMap::new();
         // empty query honors filters
-        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
+        let r = search_boosted(&p, &[], "", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
         assert_eq!(r, vec![0]);
         // fuzzy honors filters
-        let r = search_boosted(&p, "a", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
+        let r = search_boosted(&p, &[], "a", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
         assert_eq!(r, vec![0]);
         // dirs only with dir:
-        let (fd, _) = crate::filters::parse("dir: x");
-        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &fd).unwrap();
+        let (fd, _) = crate::filters::parse("dir: x", 0);
+        let r = search_boosted(&p, &[], "", FilenameMode::Fuzzy, 10, &none, &fd).unwrap();
         assert_eq!(r, vec![2]);
         // default (no filters) excludes dirs
         let r = search(&p, "", FilenameMode::Fuzzy, 10).unwrap();

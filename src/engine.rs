@@ -2,6 +2,7 @@ use crate::content::{self, ContentMatch};
 use crate::filters::{self, Filters};
 use crate::frecency::Frecency;
 use crate::matcher::{self, FilenameMode};
+use crate::walker::FileMeta;
 use crate::{config::Config, index, walker};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ pub struct EngineStatus {
 enum Msg {
     IndexSnapshot {
         paths: Arc<Vec<String>>,
+        metas: Arc<Vec<FileMeta>>,
         indexing: bool,
     },
     FilenameResults {
@@ -67,6 +69,7 @@ struct FilenameJob {
     query: String,
     mode: FilenameMode,
     paths: Arc<Vec<String>>,
+    metas: Arc<Vec<FileMeta>>,
     boosts: Arc<HashMap<String, u32>>,
     filters: Filters,
 }
@@ -76,6 +79,7 @@ pub struct Engine {
     msg_tx: Sender<Msg>,
     job_tx: Sender<FilenameJob>,
     paths: Arc<Vec<String>>,
+    metas: Arc<Vec<FileMeta>>,
     results: Vec<ResultRow>,
     status: EngineStatus,
     mode: Mode,
@@ -126,7 +130,7 @@ fn watch_loop(
     excludes: &globset::GlobSet,
     cache_path: &std::path::Path,
     indexer_tx: &Sender<Msg>,
-    mut current: Arc<Vec<String>>,
+    mut current: Vec<(String, FileMeta)>,
 ) {
     let mut last_save = Instant::now();
     // single-writer courtesy: remember the cache state we produced; if the
@@ -151,12 +155,14 @@ fn watch_loop(
             }
         }
 
-        let mut fronts: Vec<String> = Vec::new();
+        let mut fronts: Vec<(String, FileMeta)> = Vec::new();
         let mut gone: std::collections::HashSet<String> = HashSet::new();
         let mut gone_dir_prefixes: Vec<String> = Vec::new();
-        let push_front = |fronts: &mut Vec<String>, gone: &mut HashSet<String>, s: String| {
-            if gone.insert(s.clone()) {
-                fronts.push(s);
+        let push_front = |fronts: &mut Vec<(String, FileMeta)>,
+                          gone: &mut HashSet<String>,
+                          entry: (String, FileMeta)| {
+            if gone.insert(entry.0.clone()) {
+                fronts.push(entry);
             }
         };
         for path in touched {
@@ -167,12 +173,21 @@ fn watch_loop(
             if path.is_file() {
                 // front-inserted (it is the newest); the stale base copy is
                 // filtered via `gone`
-                push_front(&mut fronts, &mut gone, s);
+                let std_meta = std::fs::metadata(&path).ok();
+                let meta = FileMeta {
+                    mtime: std_meta
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs() as i64),
+                    size: std_meta.map_or(0, |m| m.len()),
+                };
+                push_front(&mut fronts, &mut gone, (s, meta));
             } else if path.is_dir() {
                 // a directory appeared or changed: index its files
-                let (files, _) = walker::collect_sorted(&[path], excludes);
-                for f in files {
-                    push_front(&mut fronts, &mut gone, f);
+                let (entries, _) = walker::collect_sorted(&[path], excludes);
+                for entry in entries {
+                    push_front(&mut fronts, &mut gone, entry);
                 }
             } else {
                 // deleted: could have been a file or a whole directory
@@ -183,20 +198,22 @@ fn watch_loop(
         if fronts.is_empty() && gone.is_empty() {
             continue;
         }
-        let mut next: Vec<String> = Vec::with_capacity(current.len() + fronts.len());
+        let mut next: Vec<(String, FileMeta)> = Vec::with_capacity(current.len() + fronts.len());
         next.extend(fronts);
         next.extend(
             current
                 .iter()
-                .filter(|p| {
-                    !gone.contains(*p) && !gone_dir_prefixes.iter().any(|d| p.starts_with(d))
+                .filter(|(p, _)| {
+                    !gone.contains(p) && !gone_dir_prefixes.iter().any(|d| p.starts_with(d))
                 })
                 .cloned(),
         );
-        current = Arc::new(next);
+        current = next;
+        let (p, m): (Vec<_>, Vec<_>) = current.iter().cloned().unzip();
         if indexer_tx
             .send(Msg::IndexSnapshot {
-                paths: current.clone(),
+                paths: Arc::new(p),
+                metas: Arc::new(m),
                 indexing: false,
             })
             .is_err()
@@ -237,6 +254,7 @@ impl Engine {
                 }
                 let (indices, error) = match matcher::search_boosted(
                     &job.paths,
+                    &job.metas,
                     &job.query,
                     job.mode,
                     FILENAME_LIMIT,
@@ -263,15 +281,17 @@ impl Engine {
         let indexer_tx = msg_tx.clone();
         let max_content_filesize = config.max_content_filesize;
         std::thread::spawn(move || {
-            if let Some(cached) = index::load(&cache_path) {
+            if let Some((cached_paths, cached_metas)) = index::load(&cache_path) {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
-                    paths: Arc::new(cached),
+                    paths: Arc::new(cached_paths),
+                    metas: Arc::new(cached_metas),
                     indexing: true,
                 });
             }
             let Ok(excludes) = walker::build_exclude_set(&config.excludes) else {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
                     paths: Arc::new(Vec::new()),
+                    metas: Arc::new(Vec::new()),
                     indexing: false,
                 });
                 return;
@@ -280,14 +300,14 @@ impl Engine {
             // the channel and are folded in afterwards (re-stat makes them
             // idempotent), so nothing slips through the startup window
             let watcher = start_watcher(&config.roots);
-            let (path_tx, path_rx) = mpsc::channel::<(String, i64)>();
+            let (path_tx, path_rx) = mpsc::channel::<(String, FileMeta)>();
             let roots = config.roots.clone();
             let walk_excludes = excludes.clone();
             let walk_thread =
                 std::thread::spawn(move || walker::walk(&roots, &walk_excludes, &path_tx));
             // the index is ordered newest-first, so head-of-list results,
             // regex hits (index order) and fuzzy score ties all favor recency
-            let mut fresh: Vec<(String, i64)> = Vec::new();
+            let mut fresh: Vec<(String, FileMeta)> = Vec::new();
             let mut last_publish = Instant::now();
             for entry in path_rx {
                 fresh.push(entry);
@@ -298,23 +318,26 @@ impl Engine {
                     last_publish = Instant::now();
                     let mut snapshot = fresh.clone();
                     snapshot.sort_unstable_by(walker::mtime_cmp);
+                    let (p, m): (Vec<_>, Vec<_>) = snapshot.into_iter().unzip();
                     let _ = indexer_tx.send(Msg::IndexSnapshot {
-                        paths: Arc::new(snapshot.into_iter().map(|(p, _)| p).collect()),
+                        paths: Arc::new(p),
+                        metas: Arc::new(m),
                         indexing: true,
                     });
                 }
             }
             let _ = walk_thread.join();
             fresh.sort_unstable_by(walker::mtime_cmp);
-            let paths = Arc::new(fresh.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
+            let (p, m): (Vec<_>, Vec<_>) = fresh.iter().cloned().unzip();
             let _ = indexer_tx.send(Msg::IndexSnapshot {
-                paths: paths.clone(),
+                paths: Arc::new(p),
+                metas: Arc::new(m),
                 indexing: false,
             });
-            let _ = index::save(&paths, &cache_path);
+            let _ = index::save(&fresh, &cache_path);
             if let Some((_watcher, event_rx)) = watcher {
                 // _watcher must stay alive for events to keep flowing
-                watch_loop(&event_rx, &excludes, &cache_path, &indexer_tx, paths);
+                watch_loop(&event_rx, &excludes, &cache_path, &indexer_tx, fresh);
             }
         });
 
@@ -325,6 +348,7 @@ impl Engine {
             msg_tx,
             job_tx,
             paths: Arc::new(Vec::new()),
+            metas: Arc::new(Vec::new()),
             results: Vec::new(),
             status: EngineStatus {
                 indexing: true,
@@ -351,7 +375,7 @@ impl Engine {
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
         let (mode, query) = parse_query(input, regex_mode);
-        let (query_filters, pattern) = filters::parse(&query);
+        let (query_filters, pattern) = filters::parse(&query, unix_now());
         // rejoin preserves regex/content patterns without filter tokens
         let query = if query_filters.is_empty() {
             query
@@ -383,8 +407,13 @@ impl Engine {
         self.fire_due_content_search();
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
-                Msg::IndexSnapshot { paths, indexing } => {
+                Msg::IndexSnapshot {
+                    paths,
+                    metas,
+                    indexing,
+                } => {
                     self.paths = paths;
+                    self.metas = metas;
                     self.status.indexed = self.paths.len();
                     self.status.indexing = indexing;
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
@@ -452,6 +481,7 @@ impl Engine {
             query: self.query.clone(),
             mode,
             paths: self.paths.clone(),
+            metas: self.metas.clone(),
             boosts: self.boosts.clone(),
             filters: self.filters.clone(),
         });
@@ -476,8 +506,9 @@ impl Engine {
             Arc::new(
                 self.paths
                     .iter()
-                    .filter(|p| f.matches(p))
-                    .cloned()
+                    .zip(self.metas.iter())
+                    .filter(|(p, m)| f.matches(p) && f.matches_meta(m))
+                    .map(|(p, _)| p.clone())
                     .collect::<Vec<_>>(),
             )
         };

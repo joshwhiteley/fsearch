@@ -54,20 +54,31 @@ fn doctor() {
 
 /// Non-interactive search: prints matches to stdout, exits 1 when none.
 /// Uses the cached index when present; builds (and saves) one otherwise.
-fn print_search(query: &str) {
-    let config = load_config();
+/// Loads the cached index, building (and saving) it when absent.
+fn load_index(config: &config::Config) -> (Vec<String>, Vec<fsearch::walker::FileMeta>) {
     let cache = index::default_cache_path();
-    let paths = index::load(&cache).unwrap_or_else(|| {
+    index::load(&cache).unwrap_or_else(|| {
         let excludes = walker::build_exclude_set(&config.excludes).unwrap_or_else(|e| {
             eprintln!("fsearch: invalid exclude pattern: {e:#}");
             std::process::exit(1);
         });
-        let (paths, _) = walker::collect_sorted(&config.roots, &excludes);
-        let _ = index::save(&paths, &cache);
-        paths
-    });
+        let (entries, _) = walker::collect_sorted(&config.roots, &excludes);
+        let _ = index::save(&entries, &cache);
+        entries.into_iter().unzip()
+    })
+}
 
-    let (query_filters, stripped) = fsearch::filters::parse(query);
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn print_search(query: &str) {
+    let config = load_config();
+    let (paths, metas) = load_index(&config);
+
+    let (query_filters, stripped) = fsearch::filters::parse(query, unix_now());
     let query = if query_filters.is_empty() {
         query.to_string()
     } else {
@@ -80,8 +91,9 @@ fn print_search(query: &str) {
         } else {
             paths
                 .iter()
-                .filter(|p| query_filters.matches(p))
-                .cloned()
+                .zip(metas.iter())
+                .filter(|(p, m)| query_filters.matches(p) && query_filters.matches_meta(m))
+                .map(|(p, _)| p.clone())
                 .collect()
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -111,6 +123,7 @@ fn print_search(query: &str) {
     } else {
         match fsearch::matcher::search_boosted(
             &paths,
+            &metas,
             &query,
             fsearch::matcher::FilenameMode::Fuzzy,
             500,
@@ -192,9 +205,9 @@ fn reindex() {
         }
     };
     let start = Instant::now();
-    let (paths, stats) = walker::collect_sorted(&config.roots, &excludes);
+    let (entries, stats) = walker::collect_sorted(&config.roots, &excludes);
     let cache = index::default_cache_path();
-    if let Err(e) = index::save(&paths, &cache) {
+    if let Err(e) = index::save(&entries, &cache) {
         eprintln!("fsearch: writing {}: {e}", cache.display());
         std::process::exit(1);
     }

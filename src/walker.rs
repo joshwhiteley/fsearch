@@ -4,6 +4,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
+/// Per-file metadata carried through the index.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FileMeta {
+    pub mtime: i64,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WalkStats {
     pub files: u64,
@@ -20,22 +27,25 @@ pub fn build_exclude_set(excludes: &[String]) -> anyhow::Result<GlobSet> {
 }
 
 /// Newest first; equal mtimes fall back to path order for determinism.
-pub fn mtime_cmp(a: &(String, i64), b: &(String, i64)) -> std::cmp::Ordering {
-    b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+pub fn mtime_cmp(a: &(String, FileMeta), b: &(String, FileMeta)) -> std::cmp::Ordering {
+    b.1.mtime.cmp(&a.1.mtime).then_with(|| a.0.cmp(&b.0))
 }
 
-/// Walks the roots and returns all file paths ordered newest-first.
-pub fn collect_sorted(roots: &[PathBuf], excludes: &GlobSet) -> (Vec<String>, WalkStats) {
+/// Walks the roots and returns all entries (with metadata) newest-first.
+pub fn collect_sorted(
+    roots: &[PathBuf],
+    excludes: &GlobSet,
+) -> (Vec<(String, FileMeta)>, WalkStats) {
     let (tx, rx) = std::sync::mpsc::channel();
     let stats = walk(roots, excludes, &tx);
     drop(tx);
-    let mut entries: Vec<(String, i64)> = rx.into_iter().collect();
+    let mut entries: Vec<(String, FileMeta)> = rx.into_iter().collect();
     entries.sort_unstable_by(mtime_cmp);
-    (entries.into_iter().map(|(p, _)| p).collect(), stats)
+    (entries, stats)
 }
 
-/// Sends `(path, mtime)` pairs; mtime is seconds since the Unix epoch (0 when unavailable).
-pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, i64)>) -> WalkStats {
+/// Sends `(path, meta)` pairs; times are seconds since the Unix epoch.
+pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, FileMeta)>) -> WalkStats {
     let mut roots = roots.iter().filter(|r| r.exists());
     let Some(first) = roots.next() else {
         return WalkStats::default();
@@ -69,18 +79,23 @@ pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, i64)>) -
                     if is_file {
                         files.fetch_add(1, Ordering::Relaxed);
                     }
-                    let mtime = e
-                        .metadata()
-                        .ok()
+                    let meta = e.metadata().ok();
+                    let mtime = meta
+                        .as_ref()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map_or(0, |d| d.as_secs() as i64);
+                    let size = if is_file {
+                        meta.as_ref().map_or(0, |m| m.len())
+                    } else {
+                        0
+                    };
                     let mut path = e.path().to_string_lossy().into_owned();
                     if is_dir {
                         // directories are marked with a trailing slash
                         path.push('/');
                     }
-                    if tx.send((path, mtime)).is_err() {
+                    if tx.send((path, FileMeta { mtime, size })).is_err() {
                         return WalkState::Quit;
                     }
                 }
@@ -156,10 +171,11 @@ mod tests {
             f.set_modified(now - age * hour).unwrap();
         }
         let set = build_exclude_set(&[]).unwrap();
-        let (paths, stats) = collect_sorted(&[dir.path().to_path_buf()], &set);
+        let (entries, stats) = collect_sorted(&[dir.path().to_path_buf()], &set);
         assert_eq!(stats.files, 2);
-        assert!(paths[0].ends_with("new.txt"));
-        assert!(paths[1].ends_with("old.txt"));
+        assert!(entries[0].0.ends_with("new.txt"));
+        assert!(entries[1].0.ends_with("old.txt"));
+        assert_eq!(entries[0].1.size, 1); // "x"
     }
 
     #[test]
@@ -169,10 +185,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         walk(&[PathBuf::from(dir.path())], &set, &tx);
         drop(tx);
-        let entries: Vec<(String, i64)> = rx.into_iter().collect();
+        let entries: Vec<(String, FileMeta)> = rx.into_iter().collect();
         assert!(!entries.is_empty());
         // every freshly created file has an mtime after 2020-01-01
-        assert!(entries.iter().all(|(_, m)| *m > 1_577_836_800));
+        assert!(entries.iter().all(|(_, m)| m.mtime > 1_577_836_800));
     }
 
     #[test]

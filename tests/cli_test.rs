@@ -98,7 +98,7 @@ fn reindex_builds_the_cache() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("indexed 2 files"), "got: {text}");
-    let saved = fsearch::index::load(&cache.join("fsearch").join("index.bin")).unwrap();
+    let (saved, _metas) = fsearch::index::load(&cache.join("fsearch").join("index.bin")).unwrap();
     assert_eq!(saved.len(), 2);
 }
 
