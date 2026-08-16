@@ -4,6 +4,7 @@ use crate::highlight::{self, Appearance};
 use crate::images;
 use crate::matcher::Highlighter;
 use crate::theme::Theme;
+use crate::util::human_size;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -634,22 +635,6 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             frame.render_widget(Paragraph::new(lines.clone()).block(block), area);
         }
-    }
-}
-
-/// "412 B", "1.3 KB", "2.0 MB", "1.1 GB"
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
