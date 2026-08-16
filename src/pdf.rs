@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 /// PDF extraction reads and parses the whole file; skip anything larger.
 pub const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Upper bound on cached extracted texts; oldest entries are evicted.
+pub const MAX_PDF_CACHE_FILES: usize = 4096;
+
 pub fn is_pdf_path(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -37,14 +40,45 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     let key = format!("{:016x}-{mtime}-{}.txt", hasher.finish(), meta.len());
-    let cached = cache_dir.join(key);
+    let cached = cache_dir.join(&key);
     if let Ok(text) = std::fs::read_to_string(&cached) {
         return Ok(text);
     }
     let text = extract(path)?;
     let _ = std::fs::create_dir_all(cache_dir);
-    let _ = std::fs::write(&cached, &text);
+    // write to a pid-unique temp then rename, so two concurrent instances
+    // never observe a half-written cache entry
+    let tmp = cache_dir.join(format!(".{key}.{}.tmp", std::process::id()));
+    let _ = std::fs::write(&tmp, &text);
+    let _ = std::fs::rename(&tmp, &cached);
+    evict_oldest(cache_dir);
     Ok(text)
+}
+
+/// Keeps the cache from growing without bound: on a miss, removes the oldest
+/// entries (by modified time) until only MAX_PDF_CACHE_FILES remain.
+fn evict_oldest(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= MAX_PDF_CACHE_FILES {
+        return;
+    }
+    files.sort_by_key(|(m, _)| *m);
+    let excess = files.len() - MAX_PDF_CACHE_FILES;
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// pdf-extract is known to panic on malformed files; contain that.

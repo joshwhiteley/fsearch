@@ -14,4 +14,5 @@ pub mod pdf;
 pub mod sem;
 pub mod theme;
 pub mod tui;
+pub mod util;
 pub mod walker;
