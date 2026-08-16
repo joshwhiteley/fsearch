@@ -4,6 +4,7 @@
 //! milliseconds, so there is no vector database and no daemon, in keeping
 //! with the rest of fsearch.
 
+use rayon::prelude::*;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -248,14 +249,15 @@ impl SemStore {
         });
     }
 
-    /// Best-chunk-per-document cosine ranking, highest first.
+    /// Best-chunk-per-document cosine ranking, highest first. Each
+    /// document's chunk loop stays scalar; documents are scored in parallel.
     pub fn query(&self, qvec: &[f32], top: usize) -> Vec<Hit> {
         let dim = self.dim as usize;
         let mut hits: Vec<Hit> = self
             .docs
-            .iter()
+            .par_iter()
             .enumerate()
-            .filter_map(|(doc, entry)| {
+            .map(|(doc, entry)| {
                 let mut best: Option<(f32, u32)> = None;
                 for c in 0..entry.chunk_count {
                     let ci = (entry.chunk_start + c) as usize;
@@ -271,6 +273,9 @@ impl SemStore {
                     score,
                 })
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
             .collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
         hits.truncate(top);
@@ -387,6 +392,36 @@ pub fn build(
         .unwrap_or_default();
     let mut store = SemStore::new(dim as u32);
     let mut stats = BuildStats::default();
+    // accumulate docs that need embedding and flush them in batches so a
+    // many-file walk makes one embedder call per ~64 chunks, not one per file
+    let mut pending: Vec<(&str, i64, u64, Vec<Chunk>)> = Vec::new();
+    let mut pending_chunks = 0usize;
+    fn flush_batch(
+        store: &mut SemStore,
+        embedder: &mut dyn Embedder,
+        stats: &mut BuildStats,
+        pending: &mut Vec<(&str, i64, u64, Vec<Chunk>)>,
+    ) -> Result<(), String> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let all_texts: Vec<String> = pending
+            .iter()
+            .flat_map(|(_, _, _, chunks)| chunks.iter().map(|c| c.text.clone()))
+            .collect();
+        let all_vecs = embedder.embed(&all_texts)?;
+        let mut vecs = all_vecs.into_iter();
+        for (path, mtime, size, chunks) in pending.drain(..) {
+            let pairs: Vec<(u32, Vec<f32>)> = chunks
+                .iter()
+                .zip(&mut vecs)
+                .map(|(c, v)| (c.line_start, v.clone()))
+                .collect();
+            stats.embedded += 1;
+            store.push_doc(path, mtime, size, &pairs);
+        }
+        Ok(())
+    }
     for (i, (path, mtime, size)) in files.iter().enumerate() {
         progress(i, files.len());
         if let Some(entry) = prior_docs.get(path.as_str())
@@ -416,16 +451,14 @@ pub fn build(
             stats.skipped += 1;
             continue;
         }
-        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let vecs = embedder.embed(&texts)?;
-        let pairs: Vec<(u32, Vec<f32>)> = chunks
-            .iter()
-            .zip(vecs)
-            .map(|(c, v)| (c.line_start, v))
-            .collect();
-        store.push_doc(path, *mtime, *size, &pairs);
-        stats.embedded += 1;
+        pending_chunks += chunks.len();
+        pending.push((path.as_str(), *mtime, *size, chunks));
+        if pending_chunks >= 64 {
+            flush_batch(&mut store, embedder, &mut stats, &mut pending)?;
+            pending_chunks = 0;
+        }
     }
+    flush_batch(&mut store, embedder, &mut stats, &mut pending)?;
     Ok((store, stats))
 }
 
