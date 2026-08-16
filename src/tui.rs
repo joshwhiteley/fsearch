@@ -20,6 +20,7 @@ use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 const PREVIEW_BYTES: usize = 64 * 1024;
+const PREVIEW_SCROLL_PAGE: usize = 20;
 
 /// Where the preview lives; Tab cycles. Full trades the results list for
 /// a much larger canvas — images render at ~3x the cell resolution.
@@ -52,6 +53,8 @@ pub enum UiMode {
 pub struct App {
     pub engine: Engine,
     pub input: String,
+    /// Byte offset of the edit cursor, always on a char boundary.
+    pub input_cursor: usize,
     pub selected: usize,
     pub regex_mode: bool,
     pub preview_layout: PreviewLayout,
@@ -78,6 +81,8 @@ pub struct App {
     /// Cached stat of the status line's selected path (is_file, size, mtime).
     status_path: String,
     status_meta: Option<(bool, u64, Option<SystemTime>)>,
+    /// First line shown in the text preview; reset on selection change.
+    preview_scroll: usize,
 }
 
 enum PreviewContent {
@@ -221,6 +226,7 @@ impl App {
         App {
             engine,
             input: String::new(),
+            input_cursor: 0,
             selected: 0,
             regex_mode: false,
             preview_layout: PreviewLayout::Side,
@@ -243,6 +249,7 @@ impl App {
             highlighter: None,
             status_path: String::new(),
             status_meta: None,
+            preview_scroll: 0,
         }
     }
 
@@ -280,6 +287,7 @@ impl App {
                 // stepped past the newest entry: back to a blank query
                 self.history_pos = None;
                 self.input.clear();
+                self.input_cursor = 0;
                 self.refresh_query();
                 return;
             }
@@ -287,6 +295,7 @@ impl App {
         self.history_pos = next;
         if let Some(i) = next {
             self.input = self.history[i].clone();
+            self.input_cursor = self.input.len();
             self.refresh_query_keep_history();
         }
     }
@@ -301,6 +310,88 @@ impl App {
         if let Some(file) = &self.history_file {
             crate::frecency::append_query(file, &q);
         }
+    }
+
+    /// Byte offset of the start of the last char in `s[..end]` (0 if none).
+    fn prev_char_boundary(s: &str, end: usize) -> usize {
+        s[..end].char_indices().next_back().map_or(0, |(i, _)| i)
+    }
+
+    fn cursor_left(&mut self) {
+        if self.input_cursor > 0 {
+            self.input_cursor = Self::prev_char_boundary(&self.input, self.input_cursor);
+        }
+    }
+
+    fn cursor_right(&mut self) {
+        if self.input_cursor < self.input.len() {
+            self.input_cursor += self.input[self.input_cursor..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8);
+        }
+    }
+
+    fn cursor_start(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn cursor_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
+    fn delete_backward(&mut self) {
+        if self.input_cursor > 0 {
+            let start = Self::prev_char_boundary(&self.input, self.input_cursor);
+            self.input.drain(start..self.input_cursor);
+            self.input_cursor = start;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.input_cursor < self.input.len() {
+            let end = self.input_cursor
+                + self.input[self.input_cursor..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+            self.input.drain(self.input_cursor..end);
+        }
+    }
+
+    /// readline-style ctrl-w: delete trailing whitespace plus the preceding
+    /// run of non-whitespace chars before the cursor.
+    fn delete_word_backward(&mut self) {
+        let mut start = self.input_cursor;
+        while start > 0 {
+            let prev = Self::prev_char_boundary(&self.input, start);
+            if !self.input[prev..start]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace())
+            {
+                break;
+            }
+            start = prev;
+        }
+        while start > 0 {
+            let prev = Self::prev_char_boundary(&self.input, start);
+            if self.input[prev..start]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace())
+            {
+                break;
+            }
+            start = prev;
+        }
+        self.input.drain(start..self.input_cursor);
+        self.input_cursor = start;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.input.insert(self.input_cursor, c);
+        self.input_cursor += c.len_utf8();
     }
 
     /// Returns false when the app should quit.
@@ -322,9 +413,14 @@ impl App {
         }
         match (key.code, ctrl) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => return false,
-            (KeyCode::Right, _) if !self.engine.results().is_empty() => {
-                self.menu = Some(0);
+            (KeyCode::Right, _) => {
+                if self.input_cursor < self.input.len() {
+                    self.cursor_right();
+                } else if !self.engine.results().is_empty() {
+                    self.menu = Some(0);
+                }
             }
+            (KeyCode::Left, _) => self.cursor_left(),
             (KeyCode::Char('p'), true) => self.history_step(true),
             (KeyCode::Char('n'), true) => self.history_step(false),
             (KeyCode::Char(' '), true) => self.act(actions::quick_look, "quick look"),
@@ -334,6 +430,17 @@ impl App {
             }
             (KeyCode::Char('u'), true) => {
                 self.input.clear();
+                self.input_cursor = 0;
+                self.refresh_query();
+            }
+            (KeyCode::Char('a'), true) => self.cursor_start(),
+            (KeyCode::Char('e'), true) => self.cursor_end(),
+            (KeyCode::Char('w'), true) => {
+                self.delete_word_backward();
+                self.refresh_query();
+            }
+            (KeyCode::Char('d'), true) => {
+                self.delete_forward();
                 self.refresh_query();
             }
             (KeyCode::Char('j'), true) | (KeyCode::Down, _) => self.move_selection(1),
@@ -341,6 +448,12 @@ impl App {
             (KeyCode::Char('y'), true) => self.act(actions::copy, "copied"),
             (KeyCode::Char('f'), true) => self.act(actions::reveal, "revealed"),
             (KeyCode::Tab, _) => self.preview_layout = self.preview_layout.next(),
+            (KeyCode::PageDown, _) => {
+                self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_PAGE);
+            }
+            (KeyCode::PageUp, _) => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_SCROLL_PAGE);
+            }
             (KeyCode::Enter, _) => match self.ui_mode {
                 UiMode::Open => {
                     self.push_history();
@@ -360,11 +473,11 @@ impl App {
                 }
             },
             (KeyCode::Backspace, _) => {
-                self.input.pop();
+                self.delete_backward();
                 self.refresh_query();
             }
             (KeyCode::Char(c), false) => {
-                self.input.push(c);
+                self.insert_char(c);
                 self.refresh_query();
             }
             _ => {}
@@ -426,6 +539,7 @@ impl App {
             return;
         }
         self.preview_for = Some(key);
+        self.preview_scroll = 0;
         if row.path.ends_with('/') {
             // cheap; stays on the UI thread
             self.preview = PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
@@ -602,7 +716,10 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let input = Paragraph::new(app.input.as_str())
         .block(themed_block(&format!("fsearch [{mode}]"), &app.theme));
     frame.render_widget(input, area);
-    frame.set_cursor_position((area.x + 1 + app.input.len() as u16, area.y + 1));
+    frame.set_cursor_position((
+        area.x + 1 + app.input[..app.input_cursor].chars().count() as u16,
+        area.y + 1,
+    ));
 }
 
 /// Splits `shown` into spans, styling the chars at `positions` (char indices).
@@ -734,7 +851,10 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = themed_block("preview", &app.theme);
     match &mut app.preview {
         PreviewContent::Lines(lines) => {
-            frame.render_widget(Paragraph::new(lines.clone()).block(block), area);
+            app.preview_scroll = app.preview_scroll.min(lines.len().saturating_sub(1));
+            let shown: Vec<Line<'static>> =
+                lines.iter().skip(app.preview_scroll).cloned().collect();
+            frame.render_widget(Paragraph::new(shown).block(block), area);
         }
         PreviewContent::Image(protocol) => {
             let inner = block.inner(area);
@@ -906,6 +1026,7 @@ pub fn run(
     app.history_file = Some(queries_path);
     if !initial_query.is_empty() {
         app.input = initial_query.to_string();
+        app.input_cursor = app.input.len();
         app.engine.set_query(&app.input, app.regex_mode);
     }
     let result = loop {
@@ -1150,5 +1271,88 @@ mod tests {
         assert!(!app.regex_mode);
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert!(app.regex_mode);
+    }
+
+    #[test]
+    fn insert_at_cursor_keeps_cursor_after_typed_char() {
+        let mut app = test_app();
+        app.input = "ab".to_string();
+        app.input_cursor = 1;
+        app.insert_char('X');
+        assert_eq!(app.input, "aXb");
+        assert_eq!(app.input_cursor, 2);
+    }
+
+    #[test]
+    fn cursor_arrows_move_across_multibyte_chars() {
+        let mut app = test_app();
+        app.input = "héllo".to_string(); // 'é' is two bytes
+        app.input_cursor = app.input.len();
+        // stepping left crosses the two-byte 'é' exactly once
+        for expected in [5usize, 4, 3, 1, 0] {
+            app.cursor_left();
+            assert_eq!(app.input_cursor, expected, "left step");
+        }
+        // stepping right from 0 crosses 'é' in one char-width jump
+        for expected in [1usize, 3, 4, 5, 6] {
+            app.cursor_right();
+            assert_eq!(app.input_cursor, expected, "right step");
+        }
+        // moving left at the start / right at the end is a no-op
+        app.cursor_start();
+        app.cursor_left();
+        assert_eq!(app.input_cursor, 0);
+        app.cursor_end();
+        app.cursor_right();
+        assert_eq!(app.input_cursor, app.input.len());
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word() {
+        let mut app = test_app();
+        app.input = "needle   haystack".to_string();
+        app.input_cursor = app.input.len();
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "needle   ");
+        assert_eq!(app.input_cursor, "needle   ".len());
+        // readline ctrl-w also eats the trailing whitespace
+        app.delete_word_backward();
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_d_deletes_char_under_cursor() {
+        let mut app = test_app();
+        app.input = "abcd".to_string();
+        app.input_cursor = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "acd");
+        assert_eq!(app.input_cursor, 1);
+    }
+
+    #[test]
+    fn ctrl_a_e_jump_to_ends() {
+        let mut app = test_app();
+        app.input = "fsearch".to_string();
+        app.input_cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.input_cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.input_cursor, app.input.len());
+    }
+
+    #[test]
+    fn page_keys_scroll_preview_text_clamped() {
+        let mut app = test_app();
+        app.preview_scroll = 5;
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.preview_scroll, 25);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.preview_scroll, 5);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.preview_scroll, 0); // saturates at zero
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.preview_scroll, 0);
     }
 }
