@@ -61,6 +61,9 @@ enum Msg {
         store: Arc<PathStore>,
         indexing: bool,
     },
+    IndexProgress {
+        count: usize,
+    },
     FilenameResults {
         generation: u64,
         indices: Vec<usize>,
@@ -296,7 +299,9 @@ impl Engine {
         let indexer_tx = msg_tx.clone();
         let max_content_filesize = config.max_content_filesize;
         std::thread::spawn(move || {
-            if let Some(cached) = index::load(&cache_path) {
+            let cached = index::load(&cache_path);
+            let had_cache = cached.is_some();
+            if let Some(cached) = cached {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
                     store: Arc::new(cached),
                     indexing: true,
@@ -324,17 +329,15 @@ impl Engine {
             let mut last_publish = Instant::now();
             for entry in path_rx {
                 fresh.push(entry);
-                // stream early results on a cold start so the UI isn't empty
+                // stream early results on a cold start so the UI isn't empty;
+                // with a cached index, skip progress so the on-screen count
+                // doesn't regress while re-walking
                 if fresh.len().is_multiple_of(8192)
                     && last_publish.elapsed() > Duration::from_millis(250)
+                    && !had_cache
                 {
                     last_publish = Instant::now();
-                    let mut snapshot = fresh.clone();
-                    snapshot.sort_unstable_by(walker::mtime_cmp);
-                    let _ = indexer_tx.send(Msg::IndexSnapshot {
-                        store: Arc::new(PathStore::from_entries(&snapshot)),
-                        indexing: true,
-                    });
+                    let _ = indexer_tx.send(Msg::IndexProgress { count: fresh.len() });
                 }
             }
             let _ = walk_thread.join();
@@ -435,6 +438,11 @@ impl Engine {
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
                         self.generation += 1;
                         self.dispatch_filename();
+                    }
+                }
+                Msg::IndexProgress { count } => {
+                    if self.status.indexing {
+                        self.status.indexed = count;
                     }
                 }
                 Msg::FilenameResults {
