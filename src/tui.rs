@@ -16,7 +16,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
 
 const PREVIEW_BYTES: usize = 64 * 1024;
 
@@ -67,6 +68,16 @@ pub struct App {
     history_file: Option<std::path::PathBuf>,
     preview_for: Option<(String, Option<u64>)>,
     preview: PreviewContent,
+    /// Preview loading runs on a worker thread; these move requests/results.
+    preview_tx: mpsc::Sender<PreviewRequest>,
+    preview_rx: mpsc::Receiver<PreviewResult>,
+    preview_gen: u64,
+    /// Cached fuzzy-match highlighter, rebuilt only when input changes.
+    highlighter_input: String,
+    highlighter: Option<Highlighter>,
+    /// Cached stat of the status line's selected path (is_file, size, mtime).
+    status_path: String,
+    status_meta: Option<(bool, u64, Option<SystemTime>)>,
 }
 
 enum PreviewContent {
@@ -83,8 +94,130 @@ enum PreviewContent {
     },
 }
 
+/// One preview load job; everything the worker needs (no Picker/ratatui
+/// image types cross the channel — protocol construction stays on the UI
+/// thread).
+struct PreviewRequest {
+    generation: u64,
+    path: String,
+    line_number: Option<u64>,
+    appearance: Appearance,
+    gutter: Color,
+}
+
+struct PreviewResult {
+    generation: u64,
+    path: String,
+    line_number: Option<u64>,
+    payload: PreviewPayload,
+}
+
+enum PreviewPayload {
+    /// Styled, line-numbered preview lines (text and PDFs).
+    Lines(Vec<Line<'static>>),
+    /// Decoded image; not yet converted to a ratatui-image protocol.
+    Image(image::DynamicImage),
+}
+
+/// The expensive half of preview loading — read, syntax-highlight, PDF
+/// extract, image decode — runs on this worker thread so the UI thread only
+/// applies results. Mirrors the former synchronous load_preview logic.
+fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
+    if crate::pdf::is_pdf_path(&req.path) {
+        return match crate::pdf::extract_cached(&req.path, &crate::pdf::default_cache_dir()) {
+            Ok(text) => match req.line_number {
+                Some(n) => {
+                    let start = (n as usize).saturating_sub(6);
+                    let gutter = Style::default().fg(req.gutter);
+                    PreviewPayload::Lines(
+                        text.lines()
+                            .enumerate()
+                            .skip(start)
+                            .take(40)
+                            .map(|(i, l)| {
+                                Line::from(vec![
+                                    Span::styled(format!("{:>5} ", i + 1), gutter),
+                                    Span::raw(l.to_string()),
+                                ])
+                            })
+                            .collect(),
+                    )
+                }
+                None => PreviewPayload::Lines(
+                    text.lines()
+                        .take(100)
+                        .map(|l| Line::from(l.to_string()))
+                        .collect(),
+                ),
+            },
+            Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(pdf: {e})"))]),
+        };
+    }
+    if images::is_image_path(&req.path) {
+        return match images::load(&req.path, images::MAX_IMAGE_BYTES) {
+            Ok(img) => PreviewPayload::Image(img),
+            Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(image: {e})"))]),
+        };
+    }
+    match std::fs::read(&req.path) {
+        Ok(bytes) if bytes.contains(&0) => PreviewPayload::Lines(vec![Line::from("(binary file)")]),
+        Ok(mut bytes) => {
+            bytes.truncate(PREVIEW_BYTES);
+            let text = String::from_utf8_lossy(&bytes);
+            match req.line_number {
+                // center the preview on the matching line, with a gutter
+                Some(n) => {
+                    let start = (n as usize).saturating_sub(6);
+                    let end = start + 40;
+                    PreviewPayload::Lines(
+                        highlight::highlight(&req.path, &text, req.appearance, end)
+                            .into_iter()
+                            .enumerate()
+                            .skip(start)
+                            .map(|(i, line)| {
+                                let gutter = Style::default().fg(req.gutter);
+                                let mut spans =
+                                    vec![Span::styled(format!("{:>5} ", i + 1), gutter)];
+                                spans.extend(line.spans);
+                                Line::from(spans)
+                            })
+                            .collect(),
+                    )
+                }
+                None => PreviewPayload::Lines(highlight::highlight(
+                    &req.path,
+                    &text,
+                    req.appearance,
+                    100,
+                )),
+            }
+        }
+        Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(unreadable: {e})"))]),
+    }
+}
+
 impl App {
     pub fn new(engine: Engine) -> App {
+        let (preview_tx, preview_rx) = mpsc::channel::<PreviewRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
+        // one preview worker for the app's lifetime; exits when the app
+        // (and thus preview_tx) is dropped
+        std::thread::spawn(move || {
+            while let Ok(req) = preview_rx.recv() {
+                let payload = preview_payload(&req);
+                if result_tx
+                    .send(PreviewResult {
+                        generation: req.generation,
+                        path: req.path,
+                        line_number: req.line_number,
+                        payload,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
         App {
             engine,
             input: String::new(),
@@ -103,6 +236,13 @@ impl App {
             history_file: None,
             preview_for: None,
             preview: PreviewContent::Lines(Vec::new()),
+            preview_tx,
+            preview_rx: result_rx,
+            preview_gen: 0,
+            highlighter_input: String::new(),
+            highlighter: None,
+            status_path: String::new(),
+            status_meta: None,
         }
     }
 
@@ -287,91 +427,61 @@ impl App {
         }
         self.preview_for = Some(key);
         if row.path.ends_with('/') {
+            // cheap; stays on the UI thread
             self.preview = PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
             return;
         }
-        if crate::pdf::is_pdf_path(&row.path) {
-            self.preview = PreviewContent::Lines(
-                match crate::pdf::extract_cached(&row.path, &crate::pdf::default_cache_dir()) {
-                    Ok(text) => match row.line_number {
-                        Some(n) => {
-                            let start = (n as usize).saturating_sub(6);
-                            let gutter = Style::default().fg(self.theme.dim);
-                            text.lines()
-                                .enumerate()
-                                .skip(start)
-                                .take(40)
-                                .map(|(i, l)| {
-                                    Line::from(vec![
-                                        Span::styled(format!("{:>5} ", i + 1), gutter),
-                                        Span::raw(l.to_string()),
-                                    ])
-                                })
-                                .collect()
-                        }
-                        None => text
-                            .lines()
-                            .take(100)
-                            .map(|l| Line::from(l.to_string()))
-                            .collect(),
-                    },
-                    Err(e) => vec![Line::from(format!("(pdf: {e})"))],
-                },
-            );
-            return;
-        }
-        if images::is_image_path(&row.path) {
-            self.preview = match (
-                &self.picker,
-                images::load(&row.path, images::MAX_IMAGE_BYTES),
-            ) {
-                (Some(picker), Ok(img)) => {
-                    #[cfg(feature = "chafa")]
-                    if picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks {
-                        self.preview = PreviewContent::CellArt {
-                            img,
-                            cols: 0,
-                            rows: 0,
-                            lines: Vec::new(),
-                        };
-                        return;
-                    }
-                    PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
-                }
-                (None, _) => PreviewContent::Lines(vec![Line::from("(image)")]),
-                (_, Err(e)) => PreviewContent::Lines(vec![Line::from(format!("(image: {e})"))]),
-            };
-            return;
-        }
-        let lines = match std::fs::read(&row.path) {
-            Ok(bytes) if bytes.contains(&0) => vec![Line::from("(binary file)")],
-            Ok(mut bytes) => {
-                bytes.truncate(PREVIEW_BYTES);
-                let text = String::from_utf8_lossy(&bytes);
-                match row.line_number {
-                    // center the preview on the matching line, with a gutter
-                    Some(n) => {
-                        let start = (n as usize).saturating_sub(6);
-                        let end = start + 40;
-                        highlight::highlight(&row.path, &text, self.appearance, end)
-                            .into_iter()
-                            .enumerate()
-                            .skip(start)
-                            .map(|(i, line)| {
-                                let gutter = Style::default().fg(self.theme.dim);
-                                let mut spans =
-                                    vec![Span::styled(format!("{:>5} ", i + 1), gutter)];
-                                spans.extend(line.spans);
-                                Line::from(spans)
-                            })
-                            .collect()
-                    }
-                    None => highlight::highlight(&row.path, &text, self.appearance, 100),
-                }
+        // expensive loading (file read, highlight, PDF/image decode) happens
+        // on the preview worker; show a placeholder until poll_preview
+        // delivers the result on a later draw
+        self.preview = PreviewContent::Lines(vec![Line::from("loading...")]);
+        self.preview_gen += 1;
+        let _ = self.preview_tx.send(PreviewRequest {
+            generation: self.preview_gen,
+            path: row.path.clone(),
+            line_number: row.line_number,
+            appearance: self.appearance,
+            gutter: self.theme.dim,
+        });
+    }
+
+    /// Applies preview results that arrived since the last draw. Stale
+    /// generations and superseded selections are dropped.
+    fn poll_preview(&mut self) {
+        while let Ok(result) = self.preview_rx.try_recv() {
+            if result.generation != self.preview_gen {
+                continue;
             }
-            Err(e) => vec![Line::from(format!("(unreadable: {e})"))],
-        };
-        self.preview = PreviewContent::Lines(lines);
+            if !self
+                .preview_for
+                .as_ref()
+                .is_some_and(|(p, n)| p == &result.path && *n == result.line_number)
+            {
+                continue;
+            }
+            self.preview = match result.payload {
+                PreviewPayload::Lines(lines) => PreviewContent::Lines(lines),
+                PreviewPayload::Image(img) => match &self.picker {
+                    Some(picker) => {
+                        #[cfg(feature = "chafa")]
+                        if picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks
+                        {
+                            PreviewContent::CellArt {
+                                img,
+                                cols: 0,
+                                rows: 0,
+                                lines: Vec::new(),
+                            }
+                        } else {
+                            PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
+                        }
+                        #[cfg(not(feature = "chafa"))]
+                        PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
+                    }
+                    None => PreviewContent::Lines(vec![Line::from("(image)")]),
+                },
+            };
+        }
     }
 }
 
@@ -525,13 +635,23 @@ fn spans_with_positions(shown: &str, positions: &[u32], highlight: Style) -> Vec
     spans
 }
 
-fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
     let accent = Style::default()
         .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
-    let mut highlighter = (matches!(app.engine.mode(), Mode::Fuzzy) && !app.input.is_empty())
-        .then(|| Highlighter::new(&app.input));
+    // take the cached highlighter out so the results borrow doesn't block
+    // rebuilding it; it goes back on App before the frame renders
+    let mut highlighter = std::mem::take(&mut app.highlighter);
+    if matches!(app.engine.mode(), Mode::Fuzzy) && !app.input.is_empty() {
+        if app.highlighter_input != app.input {
+            app.highlighter_input = app.input.clone();
+            highlighter = Some(Highlighter::new(&app.input));
+        }
+    } else {
+        app.highlighter_input.clear();
+        highlighter = None;
+    }
     let items: Vec<ListItem> = app
         .engine
         .results()
@@ -599,6 +719,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         display_items = with_headers;
         display_selected += if app.selected < opened { 1 } else { 2 };
     }
+    app.highlighter = highlighter;
     let list = List::new(display_items)
         .block(themed_block("results", &app.theme))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -608,6 +729,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.poll_preview();
     app.load_preview();
     let block = themed_block("preview", &app.theme);
     match &mut app.preview {
@@ -652,20 +774,28 @@ fn human_age(modified: std::time::SystemTime) -> String {
     }
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let s = app.engine.status();
     let mut parts = vec![
         format!("{} indexed", s.indexed),
         format!("{} matches", s.matches),
     ];
-    if let Some(row) = app.engine.results().get(app.selected)
-        && let Ok(meta) = std::fs::metadata(&row.path)
-    {
-        if meta.is_file() {
-            parts.push(human_size(meta.len()));
+    // stat the selected path only when the selection changes; the cached
+    // triple is reused while the same row stays selected
+    if let Some(row) = app.engine.results().get(app.selected) {
+        if app.status_path != row.path {
+            app.status_path = row.path.clone();
+            app.status_meta = std::fs::metadata(&row.path)
+                .ok()
+                .map(|meta| (meta.is_file(), meta.len(), meta.modified().ok()));
         }
-        if let Ok(modified) = meta.modified() {
-            parts.push(human_age(modified));
+        if let Some((is_file, len, modified)) = app.status_meta {
+            if is_file {
+                parts.push(human_size(len));
+            }
+            if let Some(modified) = modified {
+                parts.push(human_age(modified));
+            }
         }
     }
     if s.indexing {
