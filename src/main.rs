@@ -150,13 +150,12 @@ fn print_search(query: &str) {
         any
     } else if let Some(pattern) = query.strip_prefix('>') {
         let pattern = pattern.trim_start().to_string();
-        let paths: Vec<String> = (0..store.len())
+        let indices: Vec<usize> = (0..store.len())
             .filter(|&i| {
                 query_filters.is_empty()
                     || (query_filters.matches(store.get(i))
                         && query_filters.matches_meta(&store.meta(i)))
             })
-            .map(|i| store.get(i).to_string())
             .collect();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -164,7 +163,15 @@ fn print_search(query: &str) {
         let result = std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
                 let pdf_cache = fsearch::pdf::default_cache_dir();
-                let r = fsearch::content::search(&paths, &pattern, max, &pdf_cache, &cancel, &tx);
+                let r = fsearch::content::search(
+                    &indices,
+                    |i| store.get(i),
+                    &pattern,
+                    max,
+                    &pdf_cache,
+                    &cancel,
+                    &tx,
+                );
                 drop(tx);
                 r
             });

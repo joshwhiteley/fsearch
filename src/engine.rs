@@ -552,18 +552,17 @@ impl Engine {
         let cancel = Arc::new(AtomicBool::new(false));
         self.content_cancel = Some(cancel.clone());
         // scope the grep with any ext:/path: filters from the query
-        // content search still wants owned strings (it runs for seconds on a
-        // background thread while snapshots keep swapping underneath)
+        // candidates are indices into the store; the store Arc is passed
+        // along so the search thread resolves paths without materializing
+        // a full Vec<String> of path clones per query
         let f = &self.filters;
-        let paths: Arc<Vec<String>> = Arc::new(
-            (0..self.store.len())
-                .filter(|&i| {
-                    f.is_empty()
-                        || (f.matches(self.store.get(i)) && f.matches_meta(&self.store.meta(i)))
-                })
-                .map(|i| self.store.get(i).to_string())
-                .collect(),
-        );
+        let indices: Vec<usize> = (0..self.store.len())
+            .filter(|&i| {
+                f.is_empty()
+                    || (f.matches(self.store.get(i)) && f.matches_meta(&self.store.meta(i)))
+            })
+            .collect();
+        let store = self.store.clone();
         let tx = self.msg_tx.clone();
         let generation = self.generation;
         let max = self.max_content_filesize;
@@ -571,11 +570,11 @@ impl Engine {
         std::thread::spawn(move || {
             let (hit_tx, hit_rx) = mpsc::channel::<ContentMatch>();
             let search_cancel = cancel.clone();
-            let search_paths = paths.clone();
             let pattern2 = pattern.clone();
             let searcher = std::thread::spawn(move || {
                 content::search(
-                    &search_paths,
+                    &indices,
+                    |i| store.get(i),
                     &pattern2,
                     max,
                     &pdf_cache,
