@@ -16,8 +16,9 @@ pub struct ContentMatch {
 
 const PER_FILE_CAP: usize = 20;
 
-pub fn search(
-    paths: &[String],
+pub fn search<'a>(
+    indices: &[usize],
+    resolve: impl Fn(usize) -> &'a str + Sync,
     pattern: &str,
     max_filesize: u64,
     pdf_cache: &Path,
@@ -30,10 +31,11 @@ pub fn search(
         .build(pattern)
         .map_err(|e| e.to_string())?;
 
-    paths.par_iter().for_each(|path| {
+    indices.par_iter().for_each(|&i| {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
+        let path = resolve(i);
         let is_pdf = pdf::is_pdf_path(path);
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() && (is_pdf || m.len() <= max_filesize) => {}
@@ -49,7 +51,7 @@ pub fn search(
                 return Ok(false);
             }
             let hit = ContentMatch {
-                path: path.clone(),
+                path: path.to_string(),
                 line_number,
                 line: line.trim_end().to_string(),
             };
@@ -93,7 +95,16 @@ mod tests {
         }
         let (tx, rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        search(&paths, pattern, max, &dir.join("pdfcache"), &cancel, &tx)?;
+        let indices: Vec<usize> = (0..paths.len()).collect();
+        search(
+            &indices,
+            |i| paths[i].as_str(),
+            pattern,
+            max,
+            &dir.join("pdfcache"),
+            &cancel,
+            &tx,
+        )?;
         drop(tx);
         Ok(rx.into_iter().collect())
     }
