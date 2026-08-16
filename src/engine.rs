@@ -83,6 +83,7 @@ enum Msg {
 struct SemJob {
     generation: u64,
     query: String,
+    filters: crate::filters::Filters,
 }
 
 struct FilenameJob {
@@ -619,6 +620,7 @@ impl Engine {
         let _ = tx.send(SemJob {
             generation: self.generation,
             query,
+            filters: self.filters.clone(),
         });
     }
 
@@ -670,9 +672,27 @@ impl Engine {
                     (Some((embedder, store)), _) => {
                         match embedder.embed(std::slice::from_ref(&job.query)) {
                             Ok(qv) => {
-                                let rows = store
-                                    .query(&qv[0], SEMANTIC_LIMIT)
+                                // over-fetch when metadata/path filters are
+                                // active (they are applied after ranking) so
+                                // filtering doesn't drop the recall count
+                                let fetch = if job.filters.is_empty() {
+                                    SEMANTIC_LIMIT
+                                } else {
+                                    SEMANTIC_LIMIT * 4
+                                };
+                                let rows: Vec<ResultRow> = store
+                                    .query(&qv[0], fetch)
                                     .into_iter()
+                                    .filter(|h| {
+                                        let doc = &store.docs[h.doc];
+                                        job.filters.is_empty()
+                                            || (job.filters.matches(&doc.path)
+                                                && job.filters.matches_meta(&FileMeta {
+                                                    mtime: doc.mtime,
+                                                    size: doc.size,
+                                                }))
+                                    })
+                                    .take(SEMANTIC_LIMIT)
                                     .map(|h| ResultRow {
                                         path: store.docs[h.doc].path.clone(),
                                         line_number: Some(h.line_start as u64),
