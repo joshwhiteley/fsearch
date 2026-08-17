@@ -36,6 +36,8 @@ usage:
 query syntax:
   plain text           fuzzy match on file names and paths
   ctrl-r               toggle regex match on the full path
+  'word                exact substring (^word prefix, word$ suffix,
+                       !word excludes)
   > pattern            regex search inside file contents
   ? words              search documents by meaning (semantic; run
                        fsearch --index-semantic first)

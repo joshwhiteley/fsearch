@@ -120,6 +120,10 @@ impl Highlighter {
 
 const CHUNK: usize = 16_384;
 
+/// Floor on how many fuzzy results survive the low-score cutoff, so a
+/// "best / 2" tail trim never empties the list of an only-match.
+const MIN_KEEP: usize = 8;
+
 fn fuzzy(
     store: &PathStore,
     query: &str,
@@ -142,8 +146,19 @@ fn fuzzy(
                     let path = store.get(i);
                     if let Some(score) = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)
                     {
+                        // a query that also matches within the filename alone is far more
+                        // likely what the user meant than letters scattered across the path;
+                        // adding the basename score roughly doubles such results
+                        let name = path
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(path);
+                        let fname_bonus = pattern
+                            .score(Utf32Str::new(name, &mut buf), &mut matcher)
+                            .unwrap_or(0);
                         let boost = boosts.get(path).copied().unwrap_or(0);
-                        acc.push((score + boost, i));
+                        acc.push((score + fname_bonus + boost, i));
                     }
                 }
                 (matcher, buf, acc)
@@ -155,6 +170,15 @@ fn fuzzy(
             a
         });
     scored.par_sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Because filename matches score roughly double (change 1), a "best / 2"
+    // floor self-regulates: when a real filename match exists, scattered
+    // path-only matches fall below it and disappear; when nothing matches the
+    // filename, all candidates score within range of each other and survive.
+    if let Some(&(best, _)) = scored.first() {
+        let floor = best / 2;
+        let strong = scored.partition_point(|&(s, _)| s >= floor);
+        scored.truncate(strong.max(MIN_KEEP.min(scored.len())));
+    }
     scored.truncate(limit);
     scored.into_iter().map(|(_, i)| i).collect()
 }
@@ -317,6 +341,52 @@ mod tests {
         assert_eq!(pos, vec![6, 7, 8, 9]);
         // non-matching text yields no positions
         assert!(h.positions("/zzz").is_empty());
+    }
+
+    #[test]
+    fn passport_ranks_real_files_and_cuts_scattered_junk() {
+        let mut owned: Vec<String> = vec![
+            "/documents/passport.pdf".to_string(),
+            "/scans/Passport-2024.jpg".to_string(),
+        ];
+        // each decoy carries p-a-s-s-p-o-r-t scattered across
+        // pkgs/assets/support but its filename does not match
+        owned.extend((0..30).map(|i| format!("/code{i}/pkgs/assets/support/notes.txt")));
+        let strs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let p = paths(&strs);
+        let r = search(&p, "passport", FilenameMode::Fuzzy, 500).unwrap();
+        // the two real files are the top two results, in some order
+        assert_ne!(r[0], r[1]);
+        assert!(r[0] == 0 || r[0] == 1);
+        assert!(r[1] == 0 || r[1] == 1);
+        // more than 8 candidates matched (the decoys are real subsequence
+        // matches), so a length of exactly MIN_KEEP proves the tail trim
+        // dropped the scattered junk
+        assert_eq!(r.len(), 8);
+    }
+
+    #[test]
+    fn exact_atom_requires_contiguous_substring() {
+        let p = paths(&["/a/passport.pdf", "/a/pass_port.txt"]);
+        // plain fuzzy matches the underscore-scattered path as a subsequence
+        assert_eq!(
+            search(&p, "passport", FilenameMode::Fuzzy, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        // the ' atom requires a contiguous substring
+        assert_eq!(
+            search(&p, "'passport", FilenameMode::Fuzzy, 10).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn filename_bonus_outranks_path_only_match() {
+        let p = paths(&["/passport/archive/list.txt", "/misc/passport.pdf"]);
+        let r = search(&p, "passport", FilenameMode::Fuzzy, 10).unwrap();
+        assert_eq!(r[0], 1);
     }
 
     #[test]

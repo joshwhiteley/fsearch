@@ -29,6 +29,7 @@ Run `fsearch` and start typing.
 
 - plain text — fuzzy search on file names, matches highlighted
 - `ctrl-r` — regex on the full path
+- `'word` — exact substring; also `^word` prefix, `word$` suffix, `!word` excludes
 - `> pattern` — regex search inside files, streamed as `path:line`;
   PDFs are searched through their extracted text (cached, so repeats are
   instant)
