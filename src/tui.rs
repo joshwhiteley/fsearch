@@ -5,13 +5,14 @@ use crate::images;
 use crate::matcher::Highlighter;
 use crate::theme::Theme;
 use crate::util::human_size;
+use crate::walker::FileMeta;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
@@ -42,6 +43,23 @@ impl PreviewLayout {
     }
 }
 
+/// Row layout for the results list; ctrl-t toggles between them.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Density {
+    #[default]
+    Comfy, // two-line rows
+    Compact, // single-line rows
+}
+
+impl Density {
+    fn toggle(self) -> Density {
+        match self {
+            Density::Comfy => Density::Compact,
+            Density::Compact => Density::Comfy,
+        }
+    }
+}
+
 /// What Enter does: open the file, or print its path and exit (`--pick`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum UiMode {
@@ -58,6 +76,7 @@ pub struct App {
     pub selected: usize,
     pub regex_mode: bool,
     pub preview_layout: PreviewLayout,
+    pub density: Density,
     pub message: Option<String>,
     pub appearance: Appearance,
     pub picker: Option<Picker>,
@@ -78,6 +97,10 @@ pub struct App {
     /// Cached fuzzy-match highlighter, rebuilt only when input changes.
     highlighter_input: String,
     highlighter: Option<Highlighter>,
+    /// Cached first-match regex for content rows, rebuilt only when input
+    /// changes (same take/rebuild pattern as the highlighter).
+    content_highlight_input: String,
+    content_highlight: Option<regex::Regex>,
     /// Cached stat of the status line's selected path (is_file, size, mtime).
     status_path: String,
     status_meta: Option<(bool, u64, Option<SystemTime>)>,
@@ -230,6 +253,7 @@ impl App {
             selected: 0,
             regex_mode: false,
             preview_layout: PreviewLayout::Side,
+            density: Density::Comfy,
             message: None,
             appearance: Appearance::Dark,
             picker: None,
@@ -247,6 +271,8 @@ impl App {
             preview_gen: 0,
             highlighter_input: String::new(),
             highlighter: None,
+            content_highlight_input: String::new(),
+            content_highlight: None,
             status_path: String::new(),
             status_meta: None,
             preview_scroll: 0,
@@ -428,6 +454,7 @@ impl App {
                 self.regex_mode = !self.regex_mode;
                 self.refresh_query();
             }
+            (KeyCode::Char('t'), true) => self.density = self.density.toggle(),
             (KeyCode::Char('u'), true) => {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -722,8 +749,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     ));
 }
 
-/// Splits `shown` into spans, styling the chars at `positions` (char indices).
-fn spans_with_positions(shown: &str, positions: &[u32], highlight: Style) -> Vec<Span<'static>> {
+/// Splits `shown` into spans, styling the chars at `positions` (char
+/// indices) with `highlight` and everything else with `plain`.
+fn spans_with_styles(
+    shown: &str,
+    positions: &[u32],
+    plain: Style,
+    highlight: Style,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut run = String::new();
     let mut run_highlighted = false;
@@ -733,23 +766,92 @@ fn spans_with_positions(shown: &str, positions: &[u32], highlight: Style) -> Vec
         let highlighted = next.peek().is_some_and(|&&p| p as usize == i);
         if highlighted != run_highlighted && !run.is_empty() {
             let text = std::mem::take(&mut run);
-            spans.push(if run_highlighted {
-                Span::styled(text, highlight)
-            } else {
-                Span::raw(text)
-            });
+            spans.push(Span::styled(
+                text,
+                if run_highlighted { highlight } else { plain },
+            ));
         }
         run_highlighted = highlighted;
         run.push(ch);
     }
     if !run.is_empty() {
-        spans.push(if run_highlighted {
-            Span::styled(run, highlight)
-        } else {
-            Span::raw(run)
-        });
+        spans.push(Span::styled(
+            run,
+            if run_highlighted { highlight } else { plain },
+        ));
     }
     spans
+}
+
+/// The first regex match in `line`, split into plain spans around an
+/// accent-styled match span.
+fn highlight_first_match(line: &str, re: &regex::Regex, accent: Style) -> Vec<Span<'static>> {
+    let Some(m) = re.find(line) else {
+        return vec![Span::raw(line.to_string())];
+    };
+    let (start, end) = (m.start(), m.end());
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::raw(line[..start].to_string()));
+    }
+    spans.push(Span::styled(line[start..end].to_string(), accent));
+    if end < line.len() {
+        spans.push(Span::raw(line[end..].to_string()));
+    }
+    spans
+}
+
+/// (label, color) for the little kind badge in front of a row.
+fn badge_for(path: &str) -> (String, Color) {
+    if path.ends_with('/') {
+        return ("DIR".to_string(), Color::Blue);
+    }
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if ext.is_empty() {
+        return ("FILE".to_string(), Color::DarkGray);
+    }
+    let label: String = ext.chars().take(4).collect::<String>().to_uppercase();
+    let color = match crate::filters::kind_for_ext(ext) {
+        Some("image") => Color::Cyan,
+        Some("video") | Some("audio") => Color::Magenta,
+        Some("doc") => Color::Yellow,
+        Some("code") => Color::Green,
+        Some("archive") => Color::Red,
+        _ => Color::DarkGray,
+    };
+    (label, color)
+}
+
+/// The badge span (`" PDF "` on its kind color) plus the gap space after it,
+/// and the total visual width of both (used to indent second lines).
+fn badge_spans(path: &str) -> (Vec<Span<'static>>, usize) {
+    let (label, color) = badge_for(path);
+    let width = label.chars().count() + 3; // " label " + the gap
+    let span = Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(color)
+            .add_modifier(Modifier::BOLD),
+    );
+    (vec![span, Span::raw(" ")], width)
+}
+
+/// Spaces to push the right column flush against the row's right edge; None
+/// when there is no room for even one gap (callers then drop the column).
+fn right_pad(left: usize, right: usize, inner_width: usize) -> Option<usize> {
+    let pad = inner_width.saturating_sub(left + right);
+    (pad >= 1).then_some(pad)
+}
+
+/// "5m ago" for a row's mtime; None when the meta is missing or bogus
+/// (mtime <= 0).
+fn row_age(meta: Option<FileMeta>) -> Option<String> {
+    meta.filter(|m| m.mtime > 0)
+        .map(|m| human_age(SystemTime::UNIX_EPOCH + Duration::from_secs(m.mtime as u64)))
 }
 
 fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -757,6 +859,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let accent = Style::default()
         .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(app.theme.dim);
     // take the cached highlighter out so the results borrow doesn't block
     // rebuilding it; it goes back on App before the frame renders
     let mut highlighter = std::mem::take(&mut app.highlighter);
@@ -769,6 +872,26 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         app.highlighter_input.clear();
         highlighter = None;
     }
+    // same take/rebuild cache for the first-match content highlight
+    let mut content_re = std::mem::take(&mut app.content_highlight);
+    if matches!(app.engine.mode(), Mode::Content) && !app.input.is_empty() {
+        if app.content_highlight_input != app.input {
+            app.content_highlight_input = app.input.clone();
+            let (_, pattern) = crate::engine::parse_query(&app.input, app.regex_mode);
+            content_re = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(!pattern.chars().any(char::is_uppercase))
+                .build()
+                .ok();
+        }
+    } else {
+        app.content_highlight_input.clear();
+        content_re = None;
+    }
+    let inner_width = area.width.saturating_sub(2) as usize; // minus the borders
+    let name_plain = Style::default().add_modifier(Modifier::BOLD);
+    let parent_hl = Style::default()
+        .fg(app.theme.accent)
+        .add_modifier(Modifier::DIM);
     let items: Vec<ListItem> = app
         .engine
         .results()
@@ -780,33 +903,149 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
                 _ => (r.path.clone(), 0),
             };
+            // split the shown path at the name boundary: the final component
+            // (trailing '/' kept for directories) is the hero, the rest is
+            // the dim parent
+            let name = {
+                let stem = r.path.trim_end_matches('/');
+                let last = stem.rsplit('/').next().unwrap_or("");
+                if r.path.ends_with('/') {
+                    format!("{last}/")
+                } else {
+                    last.to_string()
+                }
+            };
+            let parent = shown[..shown.len() - name.len()].to_string();
+            let name_chars = name.chars().count();
+            let parent_chars = shown.chars().count() - name_chars;
             match (r.line_number, &r.line) {
-                (Some(n), Some(line)) => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{shown}:{n} "),
-                        Style::default().fg(app.theme.accent),
-                    ),
-                    Span::raw(line.clone()),
-                ])),
-                _ => match highlighter.as_mut() {
-                    Some(hl) => {
-                        // positions refer to the full path; shift them onto the
-                        // `~`-shortened string and drop hits inside the prefix
-                        let shift = if trimmed_chars > 0 {
-                            trimmed_chars - 1
-                        } else {
-                            0
-                        };
-                        let positions: Vec<u32> = hl
-                            .positions(&r.path)
-                            .into_iter()
-                            .filter(|&p| p as usize >= trimmed_chars)
-                            .map(|p| (p as usize - shift) as u32)
-                            .collect();
-                        ListItem::new(Line::from(spans_with_positions(&shown, &positions, accent)))
+                (Some(n), Some(line)) => {
+                    let (badge, badge_width) = badge_spans(&r.path);
+                    let colon = format!(":{n}");
+                    let age = row_age(r.meta);
+                    match app.density {
+                        Density::Comfy => ListItem::new(Text::from(vec![
+                            // badge, bold name, dim :n, age flush right
+                            Line::from({
+                                let mut spans = badge;
+                                spans.push(Span::styled(name.clone(), name_plain));
+                                spans.push(Span::styled(colon.clone(), dim));
+                                if let Some(age) = &age {
+                                    let left = badge_width + name_chars + colon.chars().count();
+                                    if let Some(pad) =
+                                        right_pad(left, age.chars().count(), inner_width)
+                                    {
+                                        spans.push(Span::raw(" ".repeat(pad)));
+                                        spans.push(Span::styled(age.clone(), dim));
+                                    }
+                                }
+                                spans
+                            }),
+                            // indented matched line text
+                            Line::from({
+                                let mut spans = vec![Span::raw(" ".repeat(badge_width))];
+                                match &content_re {
+                                    Some(re) => {
+                                        spans.extend(highlight_first_match(line, re, accent))
+                                    }
+                                    None => spans.push(Span::raw(line.clone())),
+                                }
+                                spans
+                            }),
+                        ])),
+                        Density::Compact => ListItem::new(Line::from({
+                            let mut spans = badge;
+                            spans.push(Span::styled(name.clone(), name_plain));
+                            spans.push(Span::styled(format!("{colon} "), dim));
+                            match &content_re {
+                                Some(re) => spans.extend(highlight_first_match(line, re, accent)),
+                                None => spans.push(Span::raw(line.clone())),
+                            }
+                            spans
+                        })),
                     }
-                    None => ListItem::new(shown),
-                },
+                }
+                _ => {
+                    let (badge, badge_width) = badge_spans(&r.path);
+                    // positions refer to the full path; shift them onto the
+                    // `~`-shortened string, then partition them at the name
+                    // boundary (the parent starts at index 0 of `shown`)
+                    let (in_name, in_parent): (Vec<u32>, Vec<u32>) = match highlighter.as_mut() {
+                        Some(hl) => {
+                            let shift = if trimmed_chars > 0 {
+                                trimmed_chars - 1
+                            } else {
+                                0
+                            };
+                            let positions: Vec<u32> = hl
+                                .positions(&r.path)
+                                .into_iter()
+                                .filter(|&p| p as usize >= trimmed_chars)
+                                .map(|p| (p as usize - shift) as u32)
+                                .collect();
+                            positions
+                                .into_iter()
+                                .partition(|&p| p as usize >= parent_chars)
+                        }
+                        None => (Vec::new(), Vec::new()),
+                    };
+                    let name_positions: Vec<u32> = in_name
+                        .into_iter()
+                        .map(|p| p - parent_chars as u32)
+                        .collect();
+                    let name_spans = spans_with_styles(&name, &name_positions, name_plain, accent);
+                    match app.density {
+                        Density::Comfy => {
+                            // line 1: badge, bold name (highlights), age flush right
+                            let age = row_age(r.meta);
+                            let mut line1 = badge;
+                            line1.extend(name_spans);
+                            if let Some(age) = &age {
+                                let left = badge_width + name_chars;
+                                if let Some(pad) = right_pad(left, age.chars().count(), inner_width)
+                                {
+                                    line1.push(Span::raw(" ".repeat(pad)));
+                                    line1.push(Span::styled(age.clone(), dim));
+                                }
+                            }
+                            // line 2: indented dim parent (+ size when known)
+                            let mut line2 = vec![Span::raw(" ".repeat(badge_width))];
+                            line2.extend(spans_with_styles(&parent, &in_parent, dim, parent_hl));
+                            if let Some(size) = r
+                                .meta
+                                .filter(|_| !r.path.ends_with('/'))
+                                .map(|m| format!(" · {}", human_size(m.size)))
+                            {
+                                line2.push(Span::raw(size));
+                            }
+                            ListItem::new(Text::from(vec![Line::from(line1), Line::from(line2)]))
+                        }
+                        Density::Compact => {
+                            // badge, bold name, dim " — parent", size/age right
+                            let right = r.meta.map(|m| {
+                                let size = human_size(m.size);
+                                match row_age(Some(m)) {
+                                    Some(age) => format!("{size} · {age}"),
+                                    None => size,
+                                }
+                            });
+                            let mut line1 = badge;
+                            line1.extend(name_spans);
+                            line1.push(Span::styled(" — ".to_string(), dim));
+                            line1.extend(spans_with_styles(&parent, &in_parent, dim, parent_hl));
+                            if let Some(right) = &right {
+                                let left = badge_width + name_chars + 3 + parent.chars().count();
+                                if let Some(pad) =
+                                    right_pad(left, right.chars().count(), inner_width)
+                                {
+                                    line1.push(Span::raw(" ".repeat(pad)));
+                                    line1.push(Span::styled(right.clone(), dim));
+                                }
+                            }
+                            ListItem::new(Line::from(line1))
+                        }
+                    }
+                }
             }
         })
         .collect();
@@ -1150,13 +1389,16 @@ mod tests {
     #[test]
     fn spans_split_on_highlight_boundaries() {
         let hl = Style::default().fg(Color::Cyan);
-        let spans = spans_with_positions("abcd", &[1, 2], hl);
+        let spans = spans_with_styles("abcd", &[1, 2], Style::default(), hl);
         let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["a", "bc", "d"]);
         assert_eq!(spans[1].style, hl);
         assert_eq!(spans[0].style, Style::default());
-        // no positions → single raw span
-        assert_eq!(spans_with_positions("abcd", &[], hl).len(), 1);
+        // no positions → single plain span
+        assert_eq!(
+            spans_with_styles("abcd", &[], Style::default(), hl).len(),
+            1
+        );
     }
 
     #[test]
@@ -1193,12 +1435,14 @@ mod tests {
                 line_number: None,
                 line: None,
                 recent_open: true,
+                meta: None,
             },
             ResultRow {
                 path: "/a/fresh.txt".into(),
                 line_number: None,
                 line: None,
                 recent_open: false,
+                meta: None,
             },
         ]);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1263,6 +1507,100 @@ mod tests {
         // no results yet: Enter does nothing
         assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(app.picked.is_none());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_row_density() {
+        let mut app = test_app();
+        assert_eq!(app.density, Density::Comfy);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.density, Density::Compact);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.density, Density::Comfy);
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn comfy_rows_render_name_badge_size_and_parent() {
+        use crate::engine::ResultRow;
+        use crate::walker::FileMeta;
+        let mut app = test_app();
+        app.engine.inject_results_for_test(vec![ResultRow {
+            path: "/a/b/notes.md".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: Some(FileMeta {
+                mtime: now_secs(),
+                size: 2048,
+            }),
+        }]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("notes.md"), "name missing");
+        assert!(text.contains("MD"), "badge missing");
+        assert!(text.contains("2.0 KB"), "size missing");
+        assert!(text.contains("/a/b"), "parent missing");
+    }
+
+    #[test]
+    fn compact_rows_keep_name_and_parent_on_one_line() {
+        use crate::engine::ResultRow;
+        use crate::walker::FileMeta;
+        let mut app = test_app();
+        app.density = Density::Compact;
+        app.engine.inject_results_for_test(vec![ResultRow {
+            path: "/a/b/notes.md".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: Some(FileMeta {
+                mtime: now_secs(),
+                size: 2048,
+            }),
+        }]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("notes.md"), "name missing");
+        assert!(text.contains("/a/b"), "parent missing");
+    }
+
+    #[test]
+    fn badges_map_extensions_and_kinds() {
+        assert_eq!(badge_for("/x/a.pdf"), ("PDF".to_string(), Color::Yellow));
+        assert_eq!(
+            badge_for("/x/photo.jpeg"),
+            ("JPEG".to_string(), Color::Cyan)
+        );
+        assert_eq!(badge_for("/x/dir/"), ("DIR".to_string(), Color::Blue));
+        assert_eq!(badge_for("/x/noext"), ("FILE".to_string(), Color::DarkGray));
+        assert_eq!(badge_for("/x/a.tar.gz"), ("GZ".to_string(), Color::Red));
+    }
+
+    #[test]
+    fn content_rows_render_line_number_and_text() {
+        use crate::engine::ResultRow;
+        let mut app = test_app();
+        app.engine.inject_results_for_test(vec![ResultRow {
+            path: "/a/b/notes.rs".into(),
+            line_number: Some(3),
+            line: Some("let needle = 1;".into()),
+            recent_open: false,
+            meta: None,
+        }]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("needle"), "matched line missing");
+        assert!(text.contains(":3"), "line number missing");
     }
 
     #[test]

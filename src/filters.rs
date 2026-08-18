@@ -44,6 +44,14 @@ const KINDS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The `kind:` bucket this extension belongs to ("image", "video", ...).
+pub fn kind_for_ext(ext: &str) -> Option<&'static str> {
+    KINDS
+        .iter()
+        .find(|(_, exts)| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+        .map(|(name, _)| *name)
+}
+
 /// "7d", "12h", "30m", "2w" → seconds.
 fn parse_duration_secs(s: &str) -> Option<i64> {
     let (num, unit) = s.split_at(s.len().checked_sub(1)?);
@@ -275,6 +283,16 @@ mod tests {
         assert!(f.matches_meta(&fresh_big));
         assert!(!f.matches_meta(&fresh_small));
         assert!(!f.matches_meta(&old_big));
+    }
+
+    #[test]
+    fn kind_for_ext_maps_extension_to_kind() {
+        assert_eq!(kind_for_ext("png"), Some("image"));
+        assert_eq!(kind_for_ext("PNG"), Some("image"));
+        assert_eq!(kind_for_ext("rs"), Some("code"));
+        assert_eq!(kind_for_ext("pdf"), Some("doc"));
+        assert_eq!(kind_for_ext("zzz"), None);
+        assert_eq!(kind_for_ext(""), None);
     }
 
     #[test]
