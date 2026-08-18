@@ -57,6 +57,9 @@ pub struct EngineStatus {
     pub indexing: bool,
     pub matches: usize,
     pub error: Option<String>,
+    /// (files walked so far, expected total from the previous index) during
+    /// the startup walk; None once the walk finishes.
+    pub walk: Option<(usize, Option<usize>)>,
 }
 
 enum Msg {
@@ -66,6 +69,9 @@ enum Msg {
     },
     IndexProgress {
         count: usize,
+        /// Some when the walk is re-checking a cached index (expected total
+        /// = cached store length), None on a cold start with no cache.
+        expected: Option<usize>,
     },
     FilenameResults {
         generation: u64,
@@ -304,7 +310,7 @@ impl Engine {
         let max_content_filesize = config.max_content_filesize;
         std::thread::spawn(move || {
             let cached = index::load(&cache_path);
-            let had_cache = cached.is_some();
+            let expected = cached.as_ref().map(|c| c.len());
             if let Some(cached) = cached {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
                     store: Arc::new(cached),
@@ -333,15 +339,17 @@ impl Engine {
             let mut last_publish = Instant::now();
             for entry in path_rx {
                 fresh.push(entry);
-                // stream early results on a cold start so the UI isn't empty;
-                // with a cached index, skip progress so the on-screen count
-                // doesn't regress while re-walking
+                // stream walk progress so the status gauge climbs even when a
+                // cached index is already searchable; the on-screen "indexed"
+                // count is only touched on a cold start (progress marks that)
                 if fresh.len().is_multiple_of(8192)
                     && last_publish.elapsed() > Duration::from_millis(250)
-                    && !had_cache
                 {
                     last_publish = Instant::now();
-                    let _ = indexer_tx.send(Msg::IndexProgress { count: fresh.len() });
+                    let _ = indexer_tx.send(Msg::IndexProgress {
+                        count: fresh.len(),
+                        expected,
+                    });
                 }
             }
             let _ = walk_thread.join();
@@ -439,13 +447,20 @@ impl Engine {
                     self.store = store;
                     self.status.indexed = self.store.len();
                     self.status.indexing = indexing;
+                    if !indexing {
+                        // the startup walk (fresh or re-walk) is done
+                        self.status.walk = None;
+                    }
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
                         self.generation += 1;
                         self.dispatch_filename();
                     }
                 }
-                Msg::IndexProgress { count } => {
-                    if self.status.indexing {
+                Msg::IndexProgress { count, expected } => {
+                    self.status.walk = Some((count, expected));
+                    // cold start: keep the indexed count climbing so the UI
+                    // isn't stuck at 0 while the store is still empty
+                    if expected.is_none() && self.status.indexing {
                         self.status.indexed = count;
                     }
                 }
