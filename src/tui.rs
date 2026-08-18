@@ -18,7 +18,7 @@ use ratatui::{Frame, Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const PREVIEW_BYTES: usize = 64 * 1024;
 const PREVIEW_SCROLL_PAGE: usize = 20;
@@ -77,7 +77,9 @@ pub struct App {
     pub regex_mode: bool,
     pub preview_layout: PreviewLayout,
     pub density: Density,
-    pub message: Option<String>,
+    /// Floating confirmation toast: (text, when it was raised); auto-expires
+    /// after a couple of seconds and is dismissed by the next keypress.
+    pub message: Option<(String, Instant)>,
     pub appearance: Appearance,
     pub picker: Option<Picker>,
     pub theme: Theme,
@@ -536,23 +538,29 @@ impl App {
             return;
         };
         let path = row.path.clone();
-        self.message = Some(match actions::open(&path) {
-            Ok(()) => {
-                self.engine.record_open(&path);
-                format!("opened: {path}")
-            }
-            Err(e) => format!("error: {e}"),
-        });
+        self.message = Some((
+            match actions::open(&path) {
+                Ok(()) => {
+                    self.engine.record_open(&path);
+                    format!("opened: {path}")
+                }
+                Err(e) => format!("error: {e}"),
+            },
+            Instant::now(),
+        ));
     }
 
     fn act(&mut self, f: impl Fn(&str) -> std::io::Result<()>, verb: &str) {
         let Some(row) = self.engine.results().get(self.selected) else {
             return;
         };
-        self.message = Some(match f(&row.path) {
-            Ok(()) => format!("{verb}: {}", row.path),
-            Err(e) => format!("error: {e}"),
-        });
+        self.message = Some((
+            match f(&row.path) {
+                Ok(()) => format!("{verb}: {}", row.path),
+                Err(e) => format!("error: {e}"),
+            },
+            Instant::now(),
+        ));
     }
 
     fn load_preview(&mut self) {
@@ -673,6 +681,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     draw_status(frame, app, status_area);
+    // floating toast under the menu popup so the menu stays on top
+    match &app.message {
+        Some((_, at)) if at.elapsed() < Duration::from_millis(2500) => {
+            draw_toast(frame, app, body);
+        }
+        Some(_) => app.message = None, // expired
+        None => {}
+    }
     if let Some(selected) = app.menu {
         draw_menu(frame, selected, body, &app.theme);
     }
@@ -733,6 +749,67 @@ fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Styled spans for the query input: a leading `>` / `?` mode prefix lights
+/// up in the accent, and tokens the real parser consumes as filters (ext:,
+/// kind:, changed:, ...) turn yellow. Concatenating the span contents
+/// reproduces `input` exactly, so the cursor math below stays valid.
+fn query_spans(input: &str, accent: Color) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // leading whitespace stays raw
+    let trimmed = input.trim_start();
+    let ws_len = input.len() - trimmed.len();
+    if ws_len > 0 {
+        spans.push(Span::raw(input[..ws_len].to_string()));
+    }
+    let mut rest = trimmed;
+    // the '>' / '?' mode prefix lights up
+    if let Some(p) = rest.chars().next()
+        && (p == '>' || p == '?')
+    {
+        spans.push(Span::styled(
+            p.to_string(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[p.len_utf8()..];
+    }
+    // walk whitespace-delimited tokens; whitespace runs stay raw
+    let mut i = 0usize;
+    while i < rest.len() {
+        let ws_start = i;
+        while let Some(c) = rest[i..].chars().next() {
+            if c.is_whitespace() {
+                i += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if i > ws_start {
+            spans.push(Span::raw(rest[ws_start..i].to_string()));
+        }
+        let tok_start = i;
+        while let Some(c) = rest[i..].chars().next() {
+            if !c.is_whitespace() {
+                i += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if i > tok_start {
+            let token = &rest[tok_start..i];
+            let (filters, remaining) = crate::filters::parse(token, 0);
+            if remaining.is_empty() && !filters.is_empty() {
+                spans.push(Span::styled(
+                    token.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else {
+                spans.push(Span::raw(token.to_string()));
+            }
+        }
+    }
+    spans
+}
+
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match (app.engine.mode(), app.regex_mode) {
         (Mode::Content, _) => "content",
@@ -740,7 +817,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         (_, true) => "regex",
         _ => "fuzzy",
     };
-    let input = Paragraph::new(app.input.as_str())
+    let input = Paragraph::new(Line::from(query_spans(&app.input, app.theme.accent)))
         .block(themed_block(&format!("fsearch [{mode}]"), &app.theme));
     frame.render_widget(input, area);
     frame.set_cursor_position((
@@ -1135,10 +1212,9 @@ fn human_age(modified: std::time::SystemTime) -> String {
 
 fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let s = app.engine.status();
-    let mut parts = vec![
-        format!("{} indexed", s.indexed),
-        format!("{} matches", s.matches),
-    ];
+    let dim = Style::default().fg(app.theme.dim);
+    let mut spans = vec![Span::raw(format!("{} indexed", s.indexed))];
+    spans.push(Span::raw(format!(" · {} matches", s.matches)));
     // stat the selected path only when the selection changes; the cached
     // triple is reused while the same row stays selected
     if let Some(row) = app.engine.results().get(app.selected) {
@@ -1150,24 +1226,83 @@ fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         if let Some((is_file, len, modified)) = app.status_meta {
             if is_file {
-                parts.push(human_size(len));
+                spans.push(Span::raw(format!(" · {}", human_size(len))));
             }
             if let Some(modified) = modified {
-                parts.push(human_age(modified));
+                spans.push(Span::raw(format!(" · {}", human_age(modified))));
             }
         }
     }
     if s.indexing {
-        parts.push("indexing…".to_string());
+        match s.walk {
+            Some((done, Some(total))) if total > 0 => {
+                // ... indexing ▰▰▰▱▱▱▱▱▱▱▱▱ 33% · 712,401 files
+                let filled = gauge_cells(done, total, 12);
+                let pct = ((done * 100) / total).min(100);
+                let accent = Style::default().fg(app.theme.accent);
+                let filled_bar: String = (0..filled).map(|_| '▰').collect();
+                let empty_bar: String = (0..12 - filled).map(|_| '▱').collect();
+                spans.push(Span::styled(" · indexing ", dim));
+                spans.push(Span::styled(filled_bar, accent));
+                spans.push(Span::styled(empty_bar, dim));
+                spans.push(Span::styled(format!(" {pct}% · {done} files"), dim));
+            }
+            Some((done, None)) => {
+                spans.push(Span::styled(format!(" · indexing… {done} files"), dim));
+            }
+            Some((_, Some(_))) | None => {
+                spans.push(Span::styled(" · indexing…", dim));
+            }
+        }
     }
     if let Some(e) = &s.error {
-        parts.push(e.clone());
+        spans.push(Span::raw(format!(" · {e}")));
     }
-    if let Some(m) = &app.message {
-        parts.push(m.clone());
-    }
-    let status = Paragraph::new(parts.join(" · ")).style(Style::default().fg(app.theme.dim));
+    let status = Paragraph::new(Line::from(spans)).style(dim);
     frame.render_widget(status, area);
+}
+
+/// Cells filled in a `width`-cell progress bar; clamps at `width`.
+fn gauge_cells(done: usize, total: usize, width: usize) -> usize {
+    (done * width / total).min(width)
+}
+
+/// `s` clipped to `max` chars, with a trailing "…" when clipped.
+fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let clipped: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{clipped}…")
+    }
+}
+
+/// Floating confirmation toast, top-right of the body.
+fn draw_toast(frame: &mut Frame, app: &mut App, body: Rect) {
+    let Some((text, _)) = &app.message else {
+        return;
+    };
+    let (color, content) = if text.starts_with("error") {
+        (Color::Red, text.clone())
+    } else {
+        (Color::Green, format!("✓ {text}"))
+    };
+    let width = (content.chars().count() + 4).min(body.width as usize) as u16;
+    let height = 3u16.min(body.height);
+    let area = Rect {
+        x: body.x + body.width.saturating_sub(width),
+        y: body.y,
+        width,
+        height,
+    };
+    let shown = clip_chars(&content, width.saturating_sub(2) as usize); // borders
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let toast = Paragraph::new(Line::from(Span::styled(shown, Style::default().fg(color)))).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color)),
+    );
+    frame.render_widget(toast, area);
 }
 
 /// A generous cell-size guess for terminals that support a graphics protocol
@@ -1692,5 +1827,77 @@ mod tests {
         assert_eq!(app.preview_scroll, 0); // saturates at zero
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn query_spans_light_up_prefix_and_filter_tokens() {
+        let spans = query_spans("> ext:md TODO", Color::Yellow);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "> ext:md TODO");
+        assert_eq!(spans.len(), 5);
+        // the '>' mode prefix lights up in the accent
+        assert_eq!(spans[0].content.as_ref(), ">");
+        assert_eq!(spans[0].style.fg, Some(Color::Yellow));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        // whitespace stays raw, a live filter token turns yellow
+        assert_eq!(spans[1].content.as_ref(), " ");
+        assert_eq!(spans[2].content.as_ref(), "ext:md");
+        assert_eq!(spans[2].style.fg, Some(Color::Yellow));
+        // plain tokens stay unstyled
+        assert_eq!(spans[3].content.as_ref(), " ");
+        assert_eq!(spans[4].content.as_ref(), "TODO");
+        assert_eq!(spans[4].style, Style::default());
+        // '?' lights up too; typos like changed:soon stay plain; kind:image lives
+        let spans = query_spans("? notes changed:soon kind:image", Color::Yellow);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "? notes changed:soon kind:image");
+        let fgs: Vec<Option<Color>> = spans.iter().map(|s| s.style.fg).collect();
+        assert_eq!(fgs[0], Some(Color::Yellow)); // '?'
+        assert_eq!(fgs[2], None); // notes
+        assert_eq!(fgs[4], None); // changed:soon is a typo
+        assert_eq!(fgs[6], Some(Color::Yellow)); // kind:image
+    }
+
+    #[test]
+    fn gauge_cells_counts_filled_cells() {
+        assert_eq!(gauge_cells(0, 100, 12), 0);
+        assert_eq!(gauge_cells(50, 100, 12), 6);
+        assert_eq!(gauge_cells(200, 100, 12), 12);
+    }
+
+    #[test]
+    fn toast_renders_then_auto_expires() {
+        let mut app = test_app();
+        app.message = Some(("copied: /a/b".into(), Instant::now()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("copied"));
+        // an old toast is dropped on draw instead of rendered
+        app.message = Some((
+            "copied: /a/b".into(),
+            Instant::now().checked_sub(Duration::from_secs(3)).unwrap(),
+        ));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains("copied"));
+        assert!(app.message.is_none());
+    }
+
+    #[test]
+    fn keypress_dismisses_toast() {
+        let mut app = test_app();
+        app.message = Some(("copied: /a/b".into(), Instant::now()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.message.is_none());
+    }
+
+    #[test]
+    fn toast_error_renders_red_without_checkmark() {
+        let mut app = test_app();
+        app.message = Some(("error: no such file".into(), Instant::now()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("error: no such file"));
+        assert!(!text.contains("✓"));
     }
 }
