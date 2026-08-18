@@ -46,6 +46,9 @@ pub struct ResultRow {
     /// True when this row ranks high because the user opened it before
     /// (frecency) — the UI groups these under "recent opens".
     pub recent_open: bool,
+    /// Index metadata (mtime seconds, size bytes) for filename rows;
+    /// content-hit and semantic rows carry none.
+    pub meta: Option<crate::walker::FileMeta>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -465,6 +468,7 @@ impl Engine {
                                 line_number: None,
                                 line: None,
                                 recent_open,
+                                meta: Some(self.store.meta(i)),
                             }
                         })
                         .collect();
@@ -480,6 +484,7 @@ impl Engine {
                         line_number: Some(hit.line_number),
                         line: Some(hit.line),
                         recent_open: false,
+                        meta: None,
                     });
                     self.status.matches = self.results.len();
                     if self.results.len() >= CONTENT_LIMIT {
@@ -700,6 +705,7 @@ impl Engine {
                                             h.score.clamp(0.0, 1.0) * 100.0
                                         )),
                                         recent_open: false,
+                                        meta: None,
                                     })
                                     .collect();
                                 Msg::SemanticResults {

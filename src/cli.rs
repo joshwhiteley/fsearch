@@ -55,6 +55,7 @@ keys:
   ctrl-y               copy path to clipboard
   ctrl-u               clear query
   tab                  cycle preview: side, full-window, hidden
+  ctrl-t               toggle row density (two-line / compact)
   esc, ctrl-c          quit
 
 files:
@@ -229,6 +230,7 @@ mod tests {
             "? words",
             "--index-semantic",
             "ctrl-r",
+            "ctrl-t",
         ] {
             assert!(HELP.contains(needle), "help is missing {needle:?}");
         }
