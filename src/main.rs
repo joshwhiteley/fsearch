@@ -186,11 +186,13 @@ fn print_search(query: &str) {
             &std::collections::HashMap::new(),
             &query_filters,
         ) {
-            Ok(indices) => {
-                for i in &indices {
+            Ok(r) => {
+                // scripting keeps the old behavior: print only the strong
+                // matches, not the fold-away weaker tail
+                for i in r.indices.iter().take(r.strong) {
                     println!("{}", store.get(*i));
                 }
-                !indices.is_empty()
+                !r.indices.is_empty()
             }
             Err(e) => {
                 eprintln!("fsearch: {e}");

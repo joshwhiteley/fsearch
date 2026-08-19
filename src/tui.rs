@@ -80,6 +80,9 @@ pub struct App {
     pub regex_mode: bool,
     pub preview_layout: PreviewLayout,
     pub density: Density,
+    /// When false and the fuzzy score floor leaves weaker matches, only the
+    /// strong block is shown (weak matches behind the ctrl-x fold row).
+    pub show_weak: bool,
     /// Floating confirmation toast: (text, when it was raised); auto-expires
     /// after a couple of seconds and is dismissed by the next keypress.
     pub message: Option<(String, Instant)>,
@@ -261,6 +264,7 @@ impl App {
             regex_mode: false,
             preview_layout: PreviewLayout::Side,
             density: Density::Comfy,
+            show_weak: false,
             message: None,
             appearance: Appearance::Dark,
             picker: None,
@@ -462,6 +466,16 @@ impl App {
                 self.regex_mode = !self.regex_mode;
                 self.refresh_query();
             }
+            (KeyCode::Char('x'), true) => {
+                self.show_weak = !self.show_weak;
+                // folding the weaker tail back up clamps onto the last strong row
+                if !self.show_weak {
+                    let len = self.visible_len();
+                    if self.selected >= len && len > 0 {
+                        self.selected = len - 1;
+                    }
+                }
+            }
             (KeyCode::Char('t'), true) => self.density = self.density.toggle(),
             (KeyCode::Char('u'), true) => {
                 self.input.clear();
@@ -527,11 +541,26 @@ impl App {
 
     fn refresh_query_keep_history(&mut self) {
         self.selected = 0;
+        self.show_weak = false;
         self.engine.set_query(&self.input, self.regex_mode);
     }
 
+    /// Rows currently on screen: the strong block when weaker matches are
+    /// folded away, otherwise every result.
+    fn visible_len(&self) -> usize {
+        if matches!(self.engine.mode(), Mode::Fuzzy)
+            && !self.input.is_empty()
+            && !self.show_weak
+            && self.engine.strong_count() < self.engine.results().len()
+        {
+            self.engine.strong_count()
+        } else {
+            self.engine.results().len()
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
-        let len = self.engine.results().len();
+        let len = self.visible_len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -971,6 +1000,31 @@ fn row_age(meta: Option<FileMeta>) -> Option<String> {
         .map(|m| human_age(SystemTime::UNIX_EPOCH + Duration::from_secs(m.mtime as u64)))
 }
 
+/// Filled/empty cells of a 5-cell score bar for a 0..=1 similarity score.
+/// Returns the number filled and the bar glyph string.
+fn score_bar(s: f32) -> (usize, String) {
+    let filled = ((s.clamp(0.0, 1.0) * 5.0).round() as usize).min(5);
+    (filled, "▰".repeat(filled) + &"▱".repeat(5 - filled))
+}
+
+/// Right-aligned score readout for a semantic row: a styled 5-cell bar plus
+/// the percent, returning its cell width and the spans to render.
+fn score_readout(s: f32, accent: Color, dim: Style) -> (usize, Vec<Span<'static>>) {
+    let (filled, bar) = score_bar(s);
+    let (fill, rest) = bar.split_at(filled);
+    let pct = format!(" {:.0}%", s * 100.0);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !fill.is_empty() {
+        spans.push(Span::styled(fill.to_string(), Style::default().fg(accent)));
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), dim));
+    }
+    let width = bar.chars().count() + pct.chars().count();
+    spans.push(Span::styled(pct, dim));
+    (width, spans)
+}
+
 fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
     let match_color = app.theme.match_fg.unwrap_or(app.theme.accent);
@@ -1014,6 +1068,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .engine
         .results()
         .iter()
+        .take(app.visible_len())
         .map(|r| {
             let (shown, trimmed_chars) = match &home {
                 Some(h) if r.path.starts_with(h.as_str()) => {
@@ -1048,13 +1103,18 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                                 let mut spans = badge;
                                 spans.push(Span::styled(name.clone(), name_plain));
                                 spans.push(Span::styled(colon.clone(), dim));
-                                if let Some(age) = &age {
+                                // semantic rows show a score bar; others call out age
+                                let right = match r.score {
+                                    Some(s) => Some(score_readout(s, app.theme.accent, dim)),
+                                    None => age.as_ref().map(|a| {
+                                        (a.chars().count(), vec![Span::styled(a.clone(), dim)])
+                                    }),
+                                };
+                                if let Some((right_width, right_spans)) = right {
                                     let left = badge_width + name_chars + colon.chars().count();
-                                    if let Some(pad) =
-                                        right_pad(left, age.chars().count(), inner_width)
-                                    {
+                                    if let Some(pad) = right_pad(left, right_width, inner_width) {
                                         spans.push(Span::raw(" ".repeat(pad)));
-                                        spans.push(Span::styled(age.clone(), dim));
+                                        spans.extend(right_spans);
                                     }
                                 }
                                 spans
@@ -1078,6 +1138,20 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                             match &content_re {
                                 Some(re) => spans.extend(highlight_first_match(line, re, accent)),
                                 None => spans.push(Span::raw(line.clone())),
+                            }
+                            // score rows right-align the bar after the snippet
+                            if let Some(s) = r.score {
+                                let (right_width, right_spans) =
+                                    score_readout(s, app.theme.accent, dim);
+                                let left = badge_width
+                                    + name_chars
+                                    + colon.chars().count()
+                                    + 1
+                                    + line.chars().count();
+                                if let Some(pad) = right_pad(left, right_width, inner_width) {
+                                    spans.push(Span::raw(" ".repeat(pad)));
+                                    spans.extend(right_spans);
+                                }
                             }
                             spans
                         })),
@@ -1171,6 +1245,9 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     // opens" (frecency) and "recently modified" with dim section headers.
     // Headers are extra list rows, so the selection index shifts past them.
     let rows = app.engine.results();
+    let visible = app.visible_len();
+    let strong = app.engine.strong_count();
+    let hidden = rows.len().saturating_sub(visible);
     let opened = rows.iter().take_while(|r| r.recent_open).count();
     let sectioned = app.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
     let mut display_items = items;
@@ -1192,6 +1269,35 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         display_items = with_headers;
         display_selected += if app.selected < opened { 1 } else { 2 };
+    }
+    // The weaker-match fold: a one-line dim fold after the last strong row
+    // while weak matches are hidden, or — once revealed — a section header
+    // before the first weaker row. Extra non-result rows (like the launch
+    // sections above); the trailing fold row never shifts the selection.
+    if hidden > 0 || (app.show_weak && strong < rows.len()) {
+        let mut out = Vec::with_capacity(display_items.len() + 2);
+        if app.show_weak && strong < rows.len() {
+            for (i, item) in display_items.into_iter().enumerate() {
+                if i == strong {
+                    out.push(ListItem::new(Span::styled(
+                        "─ WEAKER MATCHES ─",
+                        Style::default().fg(app.theme.section.unwrap_or(app.theme.dim)),
+                    )));
+                }
+                out.push(item);
+            }
+            display_items = out;
+            // the header sits just before the first weaker row; a selection
+            // at or past it shifts one place
+            display_selected += if app.selected < strong { 0 } else { 1 };
+        } else {
+            out.extend(display_items);
+            out.push(ListItem::new(Span::styled(
+                format!("▸ {hidden} weaker matches hidden · ctrl-x show"),
+                Style::default().fg(app.theme.dim),
+            )));
+            display_items = out;
+        }
     }
     app.highlighter = highlighter;
     let list = List::new(display_items)
@@ -1601,7 +1707,7 @@ pub fn run(
     }
     let result = loop {
         app.engine.tick();
-        let len = app.engine.results().len();
+        let len = app.visible_len();
         if app.selected >= len && len > 0 {
             app.selected = len - 1;
         }
@@ -1767,6 +1873,7 @@ mod tests {
                 line: None,
                 recent_open: true,
                 meta: None,
+                score: None,
             },
             ResultRow {
                 path: "/a/fresh.txt".into(),
@@ -1774,6 +1881,7 @@ mod tests {
                 line: None,
                 recent_open: false,
                 meta: None,
+                score: None,
             },
         ]);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1871,6 +1979,7 @@ mod tests {
                 mtime: now_secs(),
                 size: 2048,
             }),
+            score: None,
         }]);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1896,6 +2005,7 @@ mod tests {
                 mtime: now_secs(),
                 size: 2048,
             }),
+            score: None,
         }]);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1937,6 +2047,7 @@ mod tests {
             line: Some("let needle = 1;".into()),
             recent_open: false,
             meta: None,
+            score: None,
         }]);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -2122,6 +2233,7 @@ mod tests {
                 mtime: now_secs(),
                 size: 2048,
             }),
+            score: None,
         }]);
         let lines: Vec<Line<'static>> =
             (1..=100).map(|i| Line::from(format!("line {i}"))).collect();
@@ -2149,6 +2261,7 @@ mod tests {
             line: None,
             recent_open: false,
             meta: None,
+            score: None,
         }]);
         let lines: Vec<Line<'static>> =
             (1..=100).map(|i| Line::from(format!("line {i}"))).collect();
@@ -2186,5 +2299,18 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("╭"), "rounded corner missing");
         assert!(!text.contains("┌"), "sharp corner still present");
+    }
+
+    #[test]
+    fn score_bar_fill_counts_round() {
+        // 0.5 * 5 = 2.5 rounds half-away-from-zero to 3
+        assert_eq!(score_bar(0.0).0, 0);
+        assert_eq!(score_bar(0.5).0, 3);
+        assert_eq!(score_bar(1.0).0, 5);
+        assert_eq!(score_bar(1.5).0, 5); // clamps at 5
+        // 0.7 * 5 = 3.5 -> rounds to 4
+        assert_eq!(score_bar(0.7).0, 4);
+        // every bar is exactly 5 cells
+        assert_eq!(score_bar(0.35).1.chars().count(), 5);
     }
 }
