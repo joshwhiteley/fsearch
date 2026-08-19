@@ -9,6 +9,7 @@ pub mod frecency;
 pub mod highlight;
 pub mod images;
 pub mod index;
+pub mod keymap;
 pub mod matcher;
 pub mod pdf;
 pub mod sem;

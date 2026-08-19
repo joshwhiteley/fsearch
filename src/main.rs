@@ -207,13 +207,16 @@ fn print_search(query: &str) {
 
 fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     let config = load_config();
+    // build the keymap and mouse flag before the engine consumes the config
+    let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
+    let mouse = config.mouse;
     let theme = fsearch::theme::resolve_config(&config.theme);
     let engine = Engine::new(
         config,
         index::default_cache_path(),
         fsearch::frecency::default_history_path(),
     );
-    match tui::run(engine, ui_mode, initial_query, theme) {
+    match tui::run(engine, ui_mode, initial_query, theme, keymap, mouse) {
         Ok(Some(picked)) => println!("{picked}"),
         Ok(None) => {
             if ui_mode == tui::UiMode::Pick {

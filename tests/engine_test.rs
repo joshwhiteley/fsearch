@@ -23,6 +23,8 @@ fn config_for(root: &std::path::Path) -> Config {
         excludes: vec!["node_modules".to_string()],
         max_content_filesize: 1024 * 1024,
         theme: Default::default(),
+        keys: Default::default(),
+        mouse: true,
     }
 }
 

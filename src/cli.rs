@@ -58,6 +58,7 @@ keys:
   ctrl-t               toggle row density (two-line / compact)
   ctrl-x               show or hide weaker matches
   esc, ctrl-c          quit
+  all bindings         remappable via [keys] in config.toml
 
 files:
   config               ~/.config/fsearch/config.toml
