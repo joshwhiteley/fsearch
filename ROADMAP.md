@@ -1,5 +1,13 @@
 # Roadmap
 
+Shipped in v0.6.0:
+
+- Rich result rows + density toggle, precision ranking with a
+  weaker-match fold, readline editing, mouse support, configurable
+  keybindings, preview header/scrolling, background preview loading,
+  indexing gauge, action toasts, theme border styles + tokens, and a
+  performance round (indexing, content search, semantic search)
+
 Shipped in v0.4.0:
 
 - Metadata filters (kind:/changed:/larger:), `--big`, actions menu,
@@ -30,7 +38,6 @@ Planned:
 - Homebrew tap publishing (`brew install joshwhiteley/tap/fsearch`)
 - crates.io release
 - Office document text extraction (docx, xlsx)
-- Configurable keybindings
 - Optional persistent full-text index for instant content search
 
 Ideas welcome — open an issue.

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.0 — 2026-08-19
+
+- Rich result rows: colored kind badges, bold filenames, dim parent
+  path + size, right-aligned age; grep and semantic hits show the
+  matched line under the file. `ctrl-t` toggles a compact single-line
+  density
+- Precision ranking: filename matches outrank letters scattered across
+  the path, and the low-scoring tail folds away behind
+  "weaker matches" (`ctrl-x` shows them). fzf-style atoms documented:
+  `'word` exact, `^word` prefix, `word$` suffix, `!word` excludes
+- Semantic results show the matched line and a score bar, and honor
+  `changed:` / `larger:` / `smaller:` filters
+- Preview: breadcrumb + metadata header, scrollbar with `pgup`/`pgdn`
+  paging, image dimensions — and loading runs off the UI thread, so
+  big PDFs and images never freeze the app
+- Query input: real cursor with readline-style editing
+  (ctrl-a/e/w/d, arrows), live coloring of `>`/`?` prefixes and
+  filter tokens
+- Mouse support: click selects, double-click opens, wheel scrolls
+  results and preview (`mouse = false` disables)
+- Configurable keybindings: `[keys]` section in config.toml
+- Action toasts instead of status-line messages; indexing shows a
+  progress gauge
+- Themes: `borders = "rounded"` / `"none"`, `selection_bg` /
+  `match_fg` / `section` overrides, per-preset badge palettes
+- Performance: cold-start indexing is no longer quadratic, content
+  search stops cloning the whole path list per query, semantic
+  indexing batches embeddings and queries score in parallel, PDF text
+  cache writes are atomic and bounded
+
 ## 0.5.0 — 2026-08-15
 
 - Semantic search: `? growing tomatoes` ranks notes, docs and PDFs by
