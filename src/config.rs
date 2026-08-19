@@ -34,6 +34,12 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
 pub struct ThemeConfig {
     pub preset: String,
     pub accent: Option<String>,
+    /// "sharp" (default) | "rounded" | "none"; None keeps the preset.
+    pub borders: Option<String>,
+    /// Hex overrides; None keeps the preset's choice.
+    pub selection_bg: Option<String>,
+    pub match_fg: Option<String>,
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +73,10 @@ struct RawConfig {
 struct RawTheme {
     preset: Option<String>,
     accent: Option<String>,
+    borders: Option<String>,
+    selection_bg: Option<String>,
+    match_fg: Option<String>,
+    section: Option<String>,
 }
 
 pub fn expand_tilde(s: &str) -> PathBuf {
@@ -100,6 +110,9 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # max_content_filesize: content search skips files larger than this (bytes)
 # [theme] preset: default, catppuccin, gruvbox, nord, tokyonight
 #         accent: optional hex override, e.g. \"#7aa2f7\"
+#         borders: \"sharp\" (default), \"rounded\", or \"none\"
+#         selection_bg / match_fg / section: optional hex overrides,
+#           e.g. selection_bg = \"#313244\"
 ";
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
@@ -130,6 +143,10 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
             .map(|t| ThemeConfig {
                 preset: t.preset.unwrap_or_default(),
                 accent: t.accent,
+                borders: t.borders,
+                selection_bg: t.selection_bg,
+                match_fg: t.match_fg,
+                section: t.section,
             })
             .unwrap_or_default(),
     })
@@ -207,6 +224,33 @@ mod tests {
         // absent section: defaults
         let d = Config::default();
         assert_eq!(d.theme.preset, "");
+    }
+
+    #[test]
+    fn theme_section_parses_borders_and_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[theme]\npreset = \"nord\"\nborders = \"rounded\"\n\
+             selection_bg = \"#3b4252\"\nmatch_fg = \"#88c0d0\"\nsection = \"#8fbcbb\"\n",
+        )
+        .unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert_eq!(c.theme.preset, "nord");
+        assert_eq!(c.theme.borders.as_deref(), Some("rounded"));
+        assert_eq!(c.theme.selection_bg.as_deref(), Some("#3b4252"));
+        assert_eq!(c.theme.match_fg.as_deref(), Some("#88c0d0"));
+        assert_eq!(c.theme.section.as_deref(), Some("#8fbcbb"));
+        // a [theme] with only the preset leaves the new keys None
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("config.toml");
+        std::fs::write(&path2, "[theme]\npreset = \"gruvbox\"\n").unwrap();
+        let c2 = load_or_create(&path2).unwrap();
+        assert_eq!(c2.theme.preset, "gruvbox");
+        assert_eq!(c2.theme.borders, None);
+        assert_eq!(c2.theme.selection_bg, None);
+        assert_eq!(c2.theme.accent, None);
     }
 
     #[test]
