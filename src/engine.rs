@@ -49,6 +49,8 @@ pub struct ResultRow {
     /// Index metadata (mtime seconds, size bytes) for filename rows;
     /// content-hit and semantic rows carry none.
     pub meta: Option<crate::walker::FileMeta>,
+    /// Semantic match score 0..=1; None for every non-semantic row.
+    pub score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +78,7 @@ enum Msg {
     FilenameResults {
         generation: u64,
         indices: Vec<usize>,
+        strong: usize,
         error: Option<String>,
     },
     ContentHit {
@@ -93,6 +96,21 @@ struct SemJob {
     generation: u64,
     query: String,
     filters: crate::filters::Filters,
+}
+
+/// The text line a semantic hit starts on, trimmed and capped, for row display.
+fn snippet_line(path: &str, line: u64, pdf_cache: &std::path::Path) -> Option<String> {
+    let text = if crate::pdf::is_pdf_path(path) {
+        crate::pdf::extract_cached(path, pdf_cache).ok()
+    } else {
+        std::fs::read_to_string(path).ok()
+    }?;
+    let s = text.lines().nth(line.saturating_sub(1) as usize)?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.chars().take(160).collect())
 }
 
 struct FilenameJob {
@@ -114,6 +132,7 @@ pub struct Engine {
     mode: Mode,
     generation: u64,
     query: String,
+    strong: usize,
     max_content_filesize: u64,
     pdf_cache: PathBuf,
     filters: Filters,
@@ -281,7 +300,7 @@ impl Engine {
                 while let Ok(newer) = job_rx.try_recv() {
                     job = newer;
                 }
-                let (indices, error) = match matcher::search_boosted(
+                let (indices, strong, error) = match matcher::search_boosted(
                     &job.store,
                     &job.query,
                     job.mode,
@@ -289,13 +308,14 @@ impl Engine {
                     &job.boosts,
                     &job.filters,
                 ) {
-                    Ok(ix) => (ix, None),
-                    Err(e) => (Vec::new(), Some(format!("invalid pattern: {e}"))),
+                    Ok(r) => (r.indices, r.strong, None),
+                    Err(e) => (Vec::new(), 0, Some(format!("invalid pattern: {e}"))),
                 };
                 if worker_tx
                     .send(Msg::FilenameResults {
                         generation: job.generation,
                         indices,
+                        strong,
                         error,
                     })
                     .is_err()
@@ -380,6 +400,7 @@ impl Engine {
             mode: Mode::Fuzzy,
             generation: 0,
             query: String::new(),
+            strong: 0,
             max_content_filesize,
             pdf_cache,
             filters: Filters::default(),
@@ -467,6 +488,7 @@ impl Engine {
                 Msg::FilenameResults {
                     generation,
                     indices,
+                    strong,
                     error,
                 } => {
                     if generation != self.generation {
@@ -484,9 +506,11 @@ impl Engine {
                                 line: None,
                                 recent_open,
                                 meta: Some(self.store.meta(i)),
+                                score: None,
                             }
                         })
                         .collect();
+                    self.strong = strong.min(self.results.len());
                     self.status.matches = self.results.len();
                     self.status.error = error;
                 }
@@ -500,6 +524,7 @@ impl Engine {
                         line: Some(hit.line),
                         recent_open: false,
                         meta: None,
+                        score: None,
                     });
                     self.status.matches = self.results.len();
                     if self.results.len() >= CONTENT_LIMIT {
@@ -528,6 +553,16 @@ impl Engine {
 
     pub fn results(&self) -> &[ResultRow] {
         &self.results
+    }
+
+    /// How many leading filename rows sit above the relative score floor
+    /// (equal to the result count for content/semantic modes, which have no
+    /// score floor).
+    pub fn strong_count(&self) -> usize {
+        match self.mode {
+            Mode::Fuzzy | Mode::Regex => self.strong,
+            _ => self.results.len(),
+        }
     }
 
     /// Test-only: place rows directly so UI states can be rendered without
@@ -614,6 +649,7 @@ impl Engine {
                 let _ = tx.send(Msg::FilenameResults {
                     generation,
                     indices: Vec::new(),
+                    strong: 0,
                     error: Some(format!("invalid pattern: {e}")),
                 });
             }
@@ -651,6 +687,7 @@ impl Engine {
         if let Some(tx) = &self.sem_tx {
             return tx.clone();
         }
+        let pdf_cache = self.pdf_cache.clone();
         let (tx, rx) = mpsc::channel::<SemJob>();
         let msg_tx = self.msg_tx.clone();
         std::thread::spawn(move || {
@@ -712,15 +749,27 @@ impl Engine {
                                                 }))
                                     })
                                     .take(SEMANTIC_LIMIT)
-                                    .map(|h| ResultRow {
-                                        path: store.docs[h.doc].path.clone(),
-                                        line_number: Some(h.line_start as u64),
-                                        line: Some(format!(
-                                            "{:.0}% match",
-                                            h.score.clamp(0.0, 1.0) * 100.0
-                                        )),
-                                        recent_open: false,
-                                        meta: None,
+                                    .enumerate()
+                                    .map(|(i, h)| {
+                                        let score = h.score.clamp(0.0, 1.0);
+                                        let line = if i < 24 {
+                                            snippet_line(
+                                                &store.docs[h.doc].path,
+                                                h.line_start as u64,
+                                                &pdf_cache,
+                                            )
+                                            .or(Some(format!("{:.0}% match", score * 100.0)))
+                                        } else {
+                                            Some(format!("{:.0}% match", score * 100.0))
+                                        };
+                                        ResultRow {
+                                            path: store.docs[h.doc].path.clone(),
+                                            line_number: Some(h.line_start as u64),
+                                            line,
+                                            recent_open: false,
+                                            meta: None,
+                                            score: Some(score),
+                                        }
                                     })
                                     .collect();
                                 Msg::SemanticResults {
@@ -796,5 +845,21 @@ mod tests {
         // regex toggle does not override semantic mode
         assert_eq!(parse_query("?x", true), (Mode::Semantic, "x".to_string()));
         assert_eq!(parse_query("?", false), (Mode::Semantic, String::new()));
+    }
+
+    #[test]
+    fn snippet_line_returns_trimmed_capped_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, "first line\n  second line padded  \nthird line\n").unwrap();
+        let p = path.to_str().unwrap();
+        let cache = std::path::Path::new("/nonexistent/pdftext");
+        // 1-based line lookup, trimmed; not a pdf so the cache path is unused
+        assert_eq!(
+            snippet_line(p, 2, cache),
+            Some("second line padded".to_string())
+        );
+        // out-of-range line yields None
+        assert_eq!(snippet_line(p, 99, cache), None);
     }
 }

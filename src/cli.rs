@@ -56,6 +56,7 @@ keys:
   ctrl-u               clear query
   tab                  cycle preview: side, full-window, hidden
   ctrl-t               toggle row density (two-line / compact)
+  ctrl-x               show or hide weaker matches
   esc, ctrl-c          quit
 
 files:

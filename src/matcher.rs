@@ -11,12 +11,29 @@ pub enum FilenameMode {
     Regex,
 }
 
+/// Ranked indices plus how many lead entries are "strong" (above the
+/// relative score floor). Non-fuzzy modes report everything strong.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ranked {
+    pub indices: Vec<usize>,
+    pub strong: usize,
+}
+
+impl Ranked {
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
 pub fn search(
     store: &PathStore,
     query: &str,
     mode: FilenameMode,
     limit: usize,
-) -> Result<Vec<usize>, String> {
+) -> Result<Ranked, String> {
     search_boosted(
         store,
         query,
@@ -35,7 +52,7 @@ pub fn search_boosted(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
-) -> Result<Vec<usize>, String> {
+) -> Result<Ranked, String> {
     if query.is_empty() {
         return Ok(head_with_boosts(store, limit, boosts, filters));
     }
@@ -56,27 +73,30 @@ fn head_with_boosts(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
-) -> Vec<usize> {
-    if boosts.is_empty() {
-        return (0..store.len())
+) -> Ranked {
+    let indices = if boosts.is_empty() {
+        (0..store.len())
             .filter(|&i| passes(store, i, filters))
             .take(limit)
+            .collect()
+    } else {
+        let mut boosted: Vec<(u32, usize)> = (0..store.len())
+            .filter(|&i| passes(store, i, filters))
+            .filter_map(|i| boosts.get(store.get(i)).map(|&b| (b, i)))
             .collect();
-    }
-    let mut boosted: Vec<(u32, usize)> = (0..store.len())
-        .filter(|&i| passes(store, i, filters))
-        .filter_map(|i| boosts.get(store.get(i)).map(|&b| (b, i)))
-        .collect();
-    boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
-    let mut out: Vec<usize> = boosted.iter().map(|&(_, i)| i).collect();
-    let in_boosted: std::collections::HashSet<usize> = out.iter().copied().collect();
-    out.extend(
-        (0..store.len())
-            .filter(|&i| !in_boosted.contains(&i) && passes(store, i, filters))
-            .take(limit),
-    );
-    out.truncate(limit);
-    out
+        boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
+        let mut out: Vec<usize> = boosted.iter().map(|&(_, i)| i).collect();
+        let in_boosted: std::collections::HashSet<usize> = out.iter().copied().collect();
+        out.extend(
+            (0..store.len())
+                .filter(|&i| !in_boosted.contains(&i) && passes(store, i, filters))
+                .take(limit),
+        );
+        out.truncate(limit);
+        out
+    };
+    let strong = indices.len();
+    Ranked { indices, strong }
 }
 
 fn apply_boost_order(hits: &mut [usize], store: &PathStore, boosts: &HashMap<String, u32>) {
@@ -130,7 +150,7 @@ fn fuzzy(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
-) -> Vec<usize> {
+) -> Ranked {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut scored: Vec<(u32, usize)> = (0..store.len())
         .into_par_iter()
@@ -174,13 +194,16 @@ fn fuzzy(
     // floor self-regulates: when a real filename match exists, scattered
     // path-only matches fall below it and disappear; when nothing matches the
     // filename, all candidates score within range of each other and survive.
+    let mut strong = 0;
     if let Some(&(best, _)) = scored.first() {
         let floor = best / 2;
-        let strong = scored.partition_point(|&(s, _)| s >= floor);
-        scored.truncate(strong.max(MIN_KEEP.min(scored.len())));
+        strong = scored.partition_point(|&(s, _)| s >= floor);
+        strong = strong.max(MIN_KEEP.min(scored.len()));
     }
     scored.truncate(limit);
-    scored.into_iter().map(|(_, i)| i).collect()
+    strong = strong.min(scored.len());
+    let indices = scored.into_iter().map(|(_, i)| i).collect();
+    Ranked { indices, strong }
 }
 
 fn regex_filter(
@@ -189,7 +212,7 @@ fn regex_filter(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
-) -> Result<Vec<usize>, String> {
+) -> Result<Ranked, String> {
     let smart_case_insensitive = !query.chars().any(|c| c.is_uppercase());
     let re = regex::RegexBuilder::new(query)
         .case_insensitive(smart_case_insensitive)
@@ -203,7 +226,11 @@ fn regex_filter(
     hits.sort_unstable();
     apply_boost_order(&mut hits, store, boosts);
     hits.truncate(limit);
-    Ok(hits)
+    let strong = hits.len();
+    Ok(Ranked {
+        indices: hits,
+        strong,
+    })
 }
 
 #[cfg(test)]
@@ -221,7 +248,10 @@ mod tests {
     #[test]
     fn empty_query_returns_head() {
         let p = paths(&["/a", "/b", "/c"]);
-        assert_eq!(search(&p, "", FilenameMode::Fuzzy, 2).unwrap(), vec![0, 1]);
+        assert_eq!(
+            search(&p, "", FilenameMode::Fuzzy, 2).unwrap().indices,
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -231,7 +261,7 @@ mod tests {
             "/docs/rest-api.md",                     // filename match
         ]);
         let r = search(&p, "rest", FilenameMode::Fuzzy, 10).unwrap();
-        assert_eq!(r[0], 1);
+        assert_eq!(r.indices[0], 1);
     }
 
     #[test]
@@ -239,30 +269,38 @@ mod tests {
         let p = paths(&["/docs/README.md", "/docs/readme-draft.md"]);
         // lowercase query matches both
         assert_eq!(
-            search(&p, "readme", FilenameMode::Fuzzy, 10).unwrap().len(),
+            search(&p, "readme", FilenameMode::Fuzzy, 10)
+                .unwrap()
+                .indices
+                .len(),
             2
         );
         // uppercase query matches only the uppercase path
         let r = search(&p, "README", FilenameMode::Fuzzy, 10).unwrap();
-        assert_eq!(r, vec![0]);
+        assert_eq!(r.indices, vec![0]);
     }
 
     #[test]
     fn regex_filters_by_full_path() {
         let p = paths(&["/a/report_2024.pdf", "/a/report.txt", "/b/2024.pdf"]);
         let r = search(&p, r"report_\d+\.pdf$", FilenameMode::Regex, 10).unwrap();
-        assert_eq!(r, vec![0]);
+        assert_eq!(r.indices, vec![0]);
     }
 
     #[test]
     fn regex_is_smart_case() {
         let p = paths(&["/a/README.md", "/a/readme.md"]);
         assert_eq!(
-            search(&p, "readme", FilenameMode::Regex, 10).unwrap().len(),
+            search(&p, "readme", FilenameMode::Regex, 10)
+                .unwrap()
+                .indices
+                .len(),
             2
         );
         assert_eq!(
-            search(&p, "README", FilenameMode::Regex, 10).unwrap(),
+            search(&p, "README", FilenameMode::Regex, 10)
+                .unwrap()
+                .indices,
             vec![0]
         );
     }
@@ -288,7 +326,7 @@ mod tests {
             &Filters::default(),
         )
         .unwrap();
-        assert_eq!(r[0], 1);
+        assert_eq!(r.indices[0], 1);
         // empty query: boosted file floats to the top
         let r = search_boosted(
             &p,
@@ -299,7 +337,7 @@ mod tests {
             &Filters::default(),
         )
         .unwrap();
-        assert_eq!(r, vec![1, 0]);
+        assert_eq!(r.indices, vec![1, 0]);
         // regex: boosted file first, others keep index order
         let r = search_boosted(
             &p,
@@ -310,7 +348,7 @@ mod tests {
             &Filters::default(),
         )
         .unwrap();
-        assert_eq!(r, vec![1, 0]);
+        assert_eq!(r.indices, vec![1, 0]);
     }
 
     #[test]
@@ -320,17 +358,17 @@ mod tests {
         let none = HashMap::new();
         // empty query honors filters
         let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
-        assert_eq!(r, vec![0]);
+        assert_eq!(r.indices, vec![0]);
         // fuzzy honors filters
         let r = search_boosted(&p, "a", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
-        assert_eq!(r, vec![0]);
+        assert_eq!(r.indices, vec![0]);
         // dirs only with dir:
         let (fd, _) = crate::filters::parse("dir: x", 0);
         let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &fd).unwrap();
-        assert_eq!(r, vec![2]);
+        assert_eq!(r.indices, vec![2]);
         // default (no filters) excludes dirs
         let r = search(&p, "", FilenameMode::Fuzzy, 10).unwrap();
-        assert_eq!(r, vec![0, 1, 3]);
+        assert_eq!(r.indices, vec![0, 1, 3]);
     }
 
     #[test]
@@ -356,13 +394,16 @@ mod tests {
         let p = paths(&strs);
         let r = search(&p, "passport", FilenameMode::Fuzzy, 500).unwrap();
         // the two real files are the top two results, in some order
-        assert_ne!(r[0], r[1]);
-        assert!(r[0] == 0 || r[0] == 1);
-        assert!(r[1] == 0 || r[1] == 1);
+        assert_ne!(r.indices[0], r.indices[1]);
+        assert!(r.indices[0] == 0 || r.indices[0] == 1);
+        assert!(r.indices[1] == 0 || r.indices[1] == 1);
         // more than 8 candidates matched (the decoys are real subsequence
-        // matches), so a length of exactly MIN_KEEP proves the tail trim
-        // dropped the scattered junk
-        assert_eq!(r.len(), 8);
+        // matches), so a strong count of exactly MIN_KEEP marks the relative
+        // score floor while the decoys live on as fold-away weaker matches
+        assert_eq!(r.strong, 8);
+        // the decoys are retained after the strong block, ready to be
+        // revealed with ctrl-x
+        assert_eq!(r.indices.len(), 32);
     }
 
     #[test]
@@ -372,12 +413,15 @@ mod tests {
         assert_eq!(
             search(&p, "passport", FilenameMode::Fuzzy, 10)
                 .unwrap()
+                .indices
                 .len(),
             2
         );
         // the ' atom requires a contiguous substring
         assert_eq!(
-            search(&p, "'passport", FilenameMode::Fuzzy, 10).unwrap(),
+            search(&p, "'passport", FilenameMode::Fuzzy, 10)
+                .unwrap()
+                .indices,
             vec![0]
         );
     }
@@ -386,7 +430,7 @@ mod tests {
     fn filename_bonus_outranks_path_only_match() {
         let p = paths(&["/passport/archive/list.txt", "/misc/passport.pdf"]);
         let r = search(&p, "passport", FilenameMode::Fuzzy, 10).unwrap();
-        assert_eq!(r[0], 1);
+        assert_eq!(r.indices[0], 1);
     }
 
     #[test]
@@ -394,6 +438,12 @@ mod tests {
         let owned: Vec<String> = (0..100).map(|i| format!("/f/file{i}.txt")).collect();
         let strs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
         let p = paths(&strs);
-        assert_eq!(search(&p, "file", FilenameMode::Fuzzy, 5).unwrap().len(), 5);
+        assert_eq!(
+            search(&p, "file", FilenameMode::Fuzzy, 5)
+                .unwrap()
+                .indices
+                .len(),
+            5
+        );
     }
 }
