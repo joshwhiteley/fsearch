@@ -3,7 +3,7 @@ use crate::engine::{Engine, Mode};
 use crate::highlight::{self, Appearance};
 use crate::images;
 use crate::matcher::Highlighter;
-use crate::theme::Theme;
+use crate::theme::{BorderKind, Theme};
 use crate::util::human_size;
 use crate::walker::FileMeta;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -13,7 +13,10 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::{Frame, Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
@@ -106,6 +109,8 @@ pub struct App {
     /// Cached stat of the status line's selected path (is_file, size, mtime).
     status_path: String,
     status_meta: Option<(bool, u64, Option<SystemTime>)>,
+    /// Pixel dimensions of the image preview, from the decode on the worker.
+    preview_image_dims: Option<(u32, u32)>,
     /// First line shown in the text preview; reset on selection change.
     preview_scroll: usize,
 }
@@ -277,6 +282,7 @@ impl App {
             content_highlight: None,
             status_path: String::new(),
             status_meta: None,
+            preview_image_dims: None,
             preview_scroll: 0,
         }
     }
@@ -567,6 +573,7 @@ impl App {
         let Some(row) = self.engine.results().get(self.selected) else {
             self.preview_for = None;
             self.preview = PreviewContent::Lines(vec![Line::from("no selection")]);
+            self.preview_image_dims = None;
             return;
         };
         let key = (row.path.clone(), row.line_number);
@@ -575,6 +582,7 @@ impl App {
         }
         self.preview_for = Some(key);
         self.preview_scroll = 0;
+        self.preview_image_dims = None;
         if row.path.ends_with('/') {
             // cheap; stays on the UI thread
             self.preview = PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
@@ -610,25 +618,29 @@ impl App {
             }
             self.preview = match result.payload {
                 PreviewPayload::Lines(lines) => PreviewContent::Lines(lines),
-                PreviewPayload::Image(img) => match &self.picker {
-                    Some(picker) => {
-                        #[cfg(feature = "chafa")]
-                        if picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks
-                        {
-                            PreviewContent::CellArt {
-                                img,
-                                cols: 0,
-                                rows: 0,
-                                lines: Vec::new(),
+                PreviewPayload::Image(img) => {
+                    self.preview_image_dims = Some((img.width(), img.height()));
+                    match &self.picker {
+                        Some(picker) => {
+                            #[cfg(feature = "chafa")]
+                            if picker.protocol_type()
+                                == ratatui_image::picker::ProtocolType::Halfblocks
+                            {
+                                PreviewContent::CellArt {
+                                    img,
+                                    cols: 0,
+                                    rows: 0,
+                                    lines: Vec::new(),
+                                }
+                            } else {
+                                PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
                             }
-                        } else {
+                            #[cfg(not(feature = "chafa"))]
                             PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
                         }
-                        #[cfg(not(feature = "chafa"))]
-                        PreviewContent::Image(Box::new(picker.new_resize_protocol(img)))
+                        None => PreviewContent::Lines(vec![Line::from("(image)")]),
                     }
-                    None => PreviewContent::Lines(vec![Line::from("(image)")]),
-                },
+                }
             };
         }
     }
@@ -637,22 +649,45 @@ impl App {
 const HINTS: &str = "> grep in files \u{b7} ? semantic \u{b7} 'word exact \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
 
 fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
+    let mut block = Block::default()
+        .borders(if theme.borders == BorderKind::None {
+            Borders::NONE
+        } else {
+            Borders::ALL
+        })
         .border_style(Style::default().fg(theme.border))
         .title(Span::styled(
             title.to_string(),
             Style::default().fg(theme.title),
-        ))
+        ));
+    if theme.borders == BorderKind::Rounded {
+        block = block.border_type(BorderType::Rounded);
+    }
+    block
+}
+
+/// Selection highlight for lists: the theme's background when it provides
+/// one, otherwise today's REVERSED style.
+fn selection_style(theme: &Theme) -> Style {
+    match theme.selection_bg {
+        Some(bg) => Style::default().bg(bg),
+        None => Style::default().add_modifier(Modifier::REVERSED),
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // show syntax reminders under the search bar until typing starts
     let hint_rows = if app.input.is_empty() { 1 } else { 0 };
+    // without borders the search bar only needs a title row + the text row
+    let input_height = if app.theme.borders == BorderKind::None {
+        2
+    } else {
+        3
+    };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(hint_rows),
             Constraint::Min(1),
             Constraint::Length(1),
@@ -711,7 +746,7 @@ fn draw_menu(frame: &mut Frame, selected: usize, body: Rect, theme: &Theme) {
         .collect();
     let list = List::new(items)
         .block(themed_block("actions", theme))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(selection_style(theme));
     let mut state = ListState::default();
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
@@ -817,12 +852,15 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         (_, true) => "regex",
         _ => "fuzzy",
     };
-    let input = Paragraph::new(Line::from(query_spans(&app.input, app.theme.accent)))
-        .block(themed_block(&format!("fsearch [{mode}]"), &app.theme));
+    let block = themed_block(&format!("fsearch [{mode}]"), &app.theme);
+    // the cursor sits in the block's inner rect, so borderless mode (which
+    // keeps one row for the title and none for borders) stays in step
+    let inner = block.inner(area);
+    let input = Paragraph::new(Line::from(query_spans(&app.input, app.theme.accent))).block(block);
     frame.render_widget(input, area);
     frame.set_cursor_position((
-        area.x + 1 + app.input[..app.input_cursor].chars().count() as u16,
-        area.y + 1,
+        inner.x + app.input[..app.input_cursor].chars().count() as u16,
+        inner.y,
     ));
 }
 
@@ -878,34 +916,36 @@ fn highlight_first_match(line: &str, re: &regex::Regex, accent: Style) -> Vec<Sp
     spans
 }
 
-/// (label, color) for the little kind badge in front of a row.
-fn badge_for(path: &str) -> (String, Color) {
+/// (label, color) for the little kind badge in front of a row; `badges` is
+/// the theme's [image, video/audio, doc, code, archive, other] palette and
+/// `accent` colors directory badges.
+fn badge_for(path: &str, badges: [Color; 6], accent: Color) -> (String, Color) {
     if path.ends_with('/') {
-        return ("DIR".to_string(), Color::Blue);
+        return ("DIR".to_string(), accent);
     }
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
     if ext.is_empty() {
-        return ("FILE".to_string(), Color::DarkGray);
+        return ("FILE".to_string(), badges[5]);
     }
     let label: String = ext.chars().take(4).collect::<String>().to_uppercase();
     let color = match crate::filters::kind_for_ext(ext) {
-        Some("image") => Color::Cyan,
-        Some("video") | Some("audio") => Color::Magenta,
-        Some("doc") => Color::Yellow,
-        Some("code") => Color::Green,
-        Some("archive") => Color::Red,
-        _ => Color::DarkGray,
+        Some("image") => badges[0],
+        Some("video") | Some("audio") => badges[1],
+        Some("doc") => badges[2],
+        Some("code") => badges[3],
+        Some("archive") => badges[4],
+        _ => badges[5],
     };
     (label, color)
 }
 
 /// The badge span (`" PDF "` on its kind color) plus the gap space after it,
 /// and the total visual width of both (used to indent second lines).
-fn badge_spans(path: &str) -> (Vec<Span<'static>>, usize) {
-    let (label, color) = badge_for(path);
+fn badge_spans(path: &str, badges: [Color; 6], accent: Color) -> (Vec<Span<'static>>, usize) {
+    let (label, color) = badge_for(path, badges, accent);
     let width = label.chars().count() + 3; // " label " + the gap
     let span = Span::styled(
         format!(" {label} "),
@@ -933,10 +973,13 @@ fn row_age(meta: Option<FileMeta>) -> Option<String> {
 
 fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    let match_color = app.theme.match_fg.unwrap_or(app.theme.accent);
     let accent = Style::default()
-        .fg(app.theme.accent)
+        .fg(match_color)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(app.theme.dim);
+    let badges = app.theme.badges;
+    let dir_color = app.theme.accent;
     // take the cached highlighter out so the results borrow doesn't block
     // rebuilding it; it goes back on App before the frame renders
     let mut highlighter = std::mem::take(&mut app.highlighter);
@@ -966,9 +1009,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let inner_width = area.width.saturating_sub(2) as usize; // minus the borders
     let name_plain = Style::default().add_modifier(Modifier::BOLD);
-    let parent_hl = Style::default()
-        .fg(app.theme.accent)
-        .add_modifier(Modifier::DIM);
+    let parent_hl = Style::default().fg(match_color).add_modifier(Modifier::DIM);
     let items: Vec<ListItem> = app
         .engine
         .results()
@@ -997,7 +1038,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             let parent_chars = shown.chars().count() - name_chars;
             match (r.line_number, &r.line) {
                 (Some(n), Some(line)) => {
-                    let (badge, badge_width) = badge_spans(&r.path);
+                    let (badge, badge_width) = badge_spans(&r.path, badges, dir_color);
                     let colon = format!(":{n}");
                     let age = row_age(r.meta);
                     match app.density {
@@ -1043,7 +1084,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
                 _ => {
-                    let (badge, badge_width) = badge_spans(&r.path);
+                    let (badge, badge_width) = badge_spans(&r.path, badges, dir_color);
                     // positions refer to the full path; shift them onto the
                     // `~`-shortened string, then partition them at the name
                     // boundary (the parent starts at index 0 of `shown`)
@@ -1138,7 +1179,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         let header = |label: &str| {
             ListItem::new(Span::styled(
                 format!("─ {label} ────────"),
-                Style::default().fg(app.theme.dim),
+                Style::default().fg(app.theme.section.unwrap_or(app.theme.dim)),
             ))
         };
         let mut with_headers = Vec::with_capacity(display_items.len() + 2);
@@ -1155,27 +1196,183 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     app.highlighter = highlighter;
     let list = List::new(display_items)
         .block(themed_block("results", &app.theme))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(selection_style(&app.theme));
     let mut state = ListState::default();
     state.select(Some(display_selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// `path` with a home-directory prefix shortened to `~`; unchanged otherwise.
+fn shorten_home(path: &str) -> String {
+    match dirs::home_dir() {
+        Some(h) => {
+            let h = h.to_string_lossy();
+            if path.starts_with(h.as_ref()) {
+                format!("~{}", &path[h.len()..])
+            } else {
+                path.to_string()
+            }
+        }
+        None => path.to_string(),
+    }
+}
+
+/// Final path component, trailing '/' kept for directories.
+fn path_name(path: &str) -> String {
+    let stem = path.trim_end_matches('/');
+    let last = stem.rsplit('/').next().unwrap_or("");
+    if path.ends_with('/') {
+        format!("{last}/")
+    } else {
+        last.to_string()
+    }
+}
+
+/// Metadata for the selected row: its own index meta, else the status-line
+/// stat cache when that covers the same path.
+fn preview_meta(app: &App) -> Option<FileMeta> {
+    let row = app.engine.results().get(app.selected)?;
+    if let Some(m) = row.meta {
+        return Some(m);
+    }
+    if app.status_path == row.path
+        && let Some((_, len, modified)) = app.status_meta
+    {
+        let mtime = modified
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        return Some(FileMeta { mtime, size: len });
+    }
+    None
+}
+
+/// Kind label for the preview header: uppercased extension, or DIR / FILE.
+fn kind_label(path: &str) -> String {
+    if path.ends_with('/') {
+        "DIR".to_string()
+    } else {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("FILE")
+            .to_uppercase()
+    }
 }
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     app.poll_preview();
     app.load_preview();
     let block = themed_block("preview", &app.theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // 2-line header: dim parent path + bold filename, then a dim
+    // kind · size · age line (with pixel dims for images, line count for text)
+    if let Some(row) = app.engine.results().get(app.selected) {
+        let shown = shorten_home(&row.path);
+        let name = path_name(&row.path);
+        let parent = shown[..shown.len() - name.len()].to_string();
+        let dim = Style::default().fg(app.theme.dim);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(parent, dim),
+                Span::styled(name, bold),
+            ])),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        let mut meta_line = vec![Span::styled(kind_label(&row.path), dim)];
+        // image previews carry their pixels between the kind and the size
+        if !matches!(&app.preview, PreviewContent::Lines(_))
+            && let Some((w, h)) = app.preview_image_dims
+        {
+            meta_line.push(Span::styled(format!(" · {w}×{h}"), dim));
+        }
+        if let Some(meta) = preview_meta(app) {
+            meta_line.push(Span::styled(format!(" · {}", human_size(meta.size)), dim));
+            if let Some(age) = row_age(Some(meta)) {
+                meta_line.push(Span::styled(format!(" · {age}"), dim));
+            }
+        }
+        if let PreviewContent::Lines(lines) = &app.preview
+            && !lines.is_empty()
+        {
+            meta_line.push(Span::styled(format!(" · {} lines", lines.len()), dim));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(meta_line)),
+            Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+    // the preview body: everything below the two header rows
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
+    };
+    let dim = Style::default().fg(app.theme.dim);
     match &mut app.preview {
         PreviewContent::Lines(lines) => {
-            app.preview_scroll = app.preview_scroll.min(lines.len().saturating_sub(1));
-            let shown: Vec<Line<'static>> =
-                lines.iter().skip(app.preview_scroll).cloned().collect();
-            frame.render_widget(Paragraph::new(shown).block(block), area);
+            let total = lines.len();
+            let visible = body.height as usize;
+            if total > visible && visible > 1 {
+                // the last body row shows the position line, so the content
+                // gets one row less
+                let content_rows = visible - 1;
+                app.preview_scroll = app.preview_scroll.min(total.saturating_sub(content_rows));
+                let shown: Vec<Line<'static>> = lines
+                    .iter()
+                    .skip(app.preview_scroll)
+                    .take(content_rows)
+                    .cloned()
+                    .collect();
+                frame.render_widget(
+                    Paragraph::new(shown),
+                    Rect {
+                        x: body.x,
+                        y: body.y,
+                        width: body.width,
+                        height: content_rows as u16,
+                    },
+                );
+                let first = app.preview_scroll + 1;
+                let last = (app.preview_scroll + content_rows).min(total);
+                let pos = format!("{first}–{last} / {total}");
+                let avail = body.width.saturating_sub(1); // scrollbar column
+                let pad = avail.saturating_sub(pos.chars().count() as u16) as usize;
+                let line = Line::from(Span::styled(format!("{}{pos}", " ".repeat(pad)), dim));
+                frame.render_widget(
+                    Paragraph::new(line),
+                    Rect {
+                        x: body.x,
+                        y: body.y + body.height - 1,
+                        width: body.width,
+                        height: 1,
+                    },
+                );
+                let mut bar_state = ScrollbarState::new(total)
+                    .viewport_content_length(content_rows)
+                    .position(app.preview_scroll);
+                let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight).style(dim);
+                frame.render_stateful_widget(bar, body, &mut bar_state);
+            } else {
+                app.preview_scroll = 0;
+                let shown: Vec<Line<'static>> = lines.to_vec();
+                frame.render_widget(Paragraph::new(shown), body);
+            }
         }
         PreviewContent::Image(protocol) => {
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            frame.render_stateful_widget(StatefulImage::default(), inner, protocol.as_mut());
+            frame.render_stateful_widget(StatefulImage::default(), body, protocol.as_mut());
         }
         #[cfg(feature = "chafa")]
         PreviewContent::CellArt {
@@ -1184,14 +1381,13 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             rows,
             lines,
         } => {
-            let inner = block.inner(area);
             let (want_cols, want_rows) =
-                crate::cellart::fit_cells(img.width(), img.height(), inner.width, inner.height);
+                crate::cellart::fit_cells(img.width(), img.height(), body.width, body.height);
             if (*cols, *rows) != (want_cols, want_rows) {
                 *lines = crate::cellart::render(img, want_cols, want_rows);
                 (*cols, *rows) = (want_cols, want_rows);
             }
-            frame.render_widget(Paragraph::new(lines.clone()).block(block), area);
+            frame.render_widget(Paragraph::new(lines.clone()), body);
         }
     }
 }
@@ -1710,14 +1906,25 @@ mod tests {
 
     #[test]
     fn badges_map_extensions_and_kinds() {
-        assert_eq!(badge_for("/x/a.pdf"), ("PDF".to_string(), Color::Yellow));
-        assert_eq!(
-            badge_for("/x/photo.jpeg"),
-            ("JPEG".to_string(), Color::Cyan)
+        let theme = crate::theme::resolve("default", None);
+        let (pd, jpeg, dir, file, gz) = (
+            badge_for("/x/a.pdf", theme.badges, theme.accent),
+            badge_for("/x/photo.jpeg", theme.badges, theme.accent),
+            badge_for("/x/dir/", theme.badges, theme.accent),
+            badge_for("/x/noext", theme.badges, theme.accent),
+            badge_for("/x/a.tar.gz", theme.badges, theme.accent),
         );
-        assert_eq!(badge_for("/x/dir/"), ("DIR".to_string(), Color::Blue));
-        assert_eq!(badge_for("/x/noext"), ("FILE".to_string(), Color::DarkGray));
-        assert_eq!(badge_for("/x/a.tar.gz"), ("GZ".to_string(), Color::Red));
+        assert_eq!(pd, ("PDF".to_string(), Color::Yellow));
+        assert_eq!(jpeg, ("JPEG".to_string(), Color::Cyan));
+        // directories use the theme accent rather than a hardcoded blue
+        assert_eq!(dir, ("DIR".to_string(), theme.accent));
+        assert_eq!(file, ("FILE".to_string(), Color::DarkGray));
+        assert_eq!(gz, ("GZ".to_string(), Color::Red));
+        // a catppuccin palette flows through too
+        let cp = crate::theme::resolve("catppuccin", None);
+        let (label, color) = badge_for("/x/pic.png", cp.badges, cp.accent);
+        assert_eq!(label, "PNG");
+        assert_eq!(color, cp.badges[0]);
     }
 
     #[test]
@@ -1899,5 +2106,85 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("error: no such file"));
         assert!(!text.contains("✓"));
+    }
+
+    #[test]
+    fn preview_header_shows_name_and_line_count() {
+        use crate::engine::ResultRow;
+        let mut app = test_app();
+        app.preview_layout = PreviewLayout::Full; // keeps the buffer header-only
+        app.engine.inject_results_for_test(vec![ResultRow {
+            path: "/a/b/notes.md".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: Some(FileMeta {
+                mtime: now_secs(),
+                size: 2048,
+            }),
+        }]);
+        let lines: Vec<Line<'static>> =
+            (1..=100).map(|i| Line::from(format!("line {i}"))).collect();
+        // hand the preview pane ready-made content plus the matching cache key
+        // so load_preview keeps it instead of replacing it with "loading..."
+        app.preview_for = Some(("/a/b/notes.md".into(), None));
+        app.preview = PreviewContent::Lines(lines);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("notes.md"), "header filename missing");
+        assert!(text.contains("/a/b/"), "header parent path missing");
+        assert!(text.contains("100 lines"), "line count missing");
+        assert!(text.contains("2.0 KB"), "size missing");
+    }
+
+    #[test]
+    fn preview_position_indicator_overflows_short_pane() {
+        use crate::engine::ResultRow;
+        let mut app = test_app();
+        app.preview_layout = PreviewLayout::Full;
+        app.engine.inject_results_for_test(vec![ResultRow {
+            path: "/a/b/notes.md".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: None,
+        }]);
+        let lines: Vec<Line<'static>> =
+            (1..=100).map(|i| Line::from(format!("line {i}"))).collect();
+        app.preview_for = Some(("/a/b/notes.md".into(), None));
+        app.preview = PreviewContent::Lines(lines);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        // body = 17 inner rows minus 2 header rows = 15; content gets 14,
+        // the bottom row shows 1–14 / 100
+        assert!(text.contains("1–14 / 100"), "position indicator missing");
+    }
+
+    #[test]
+    fn borderless_theme_renders_input_title() {
+        let mut app = test_app();
+        app.theme.borders = BorderKind::None;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("fsearch"),
+            "input title missing with borderless chrome"
+        );
+        // the preview pane still shows its label line
+        assert!(text.contains("preview"));
+    }
+
+    #[test]
+    fn rounded_borders_render_rounded_corners() {
+        let mut app = test_app();
+        app.theme.borders = BorderKind::Rounded;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("╭"), "rounded corner missing");
+        assert!(!text.contains("┌"), "sharp corner still present");
     }
 }

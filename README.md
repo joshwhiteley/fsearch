@@ -101,7 +101,9 @@ Box…) are skipped by default; remove them from `excludes` to index them.
 
 Themes: add a `[theme]` section with `preset = "catppuccin"` (also
 `gruvbox`, `nord`, `tokyonight`) and an optional `accent = "#7aa2f7"`
-override.
+override. Border style is `borders = "sharp"` (default), `"rounded"`, or
+`"none"`; `selection_bg`, `match_fg` and `section` accept hex overrides
+(e.g. `selection_bg = "#313244"`).
 
 Image previews auto-negotiate the best graphics protocol and fall back to
 colored cells elsewhere (multiplexers included — a terminal merely claiming

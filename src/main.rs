@@ -205,7 +205,7 @@ fn print_search(query: &str) {
 
 fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     let config = load_config();
-    let theme = fsearch::theme::resolve(&config.theme.preset, config.theme.accent.as_deref());
+    let theme = fsearch::theme::resolve_config(&config.theme);
     let engine = Engine::new(
         config,
         index::default_cache_path(),
