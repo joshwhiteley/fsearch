@@ -105,6 +105,18 @@ override. Border style is `borders = "sharp"` (default), `"rounded"`, or
 `"none"`; `selection_bg`, `match_fg` and `section` accept hex overrides
 (e.g. `selection_bg = "#313244"`).
 
+Command keys are remappable via a `[keys]` section — each command takes one
+spec string or a list of them. Text editing keys (typing, backspace, cursor
+movement, ctrl-a/e/w/d) are fixed and can't be rebound.
+
+    [keys]
+    quit = "ctrl-q"
+    move_up = ["up", "ctrl-k"]
+
+Mouse is on by default: click to select, double-click to open, wheel
+scrolls (`mouse = false` in config.toml disables it). While enabled, hold
+the shift key for native terminal text selection.
+
 Image previews auto-negotiate the best graphics protocol and fall back to
 colored cells elsewhere (multiplexers included — a terminal merely claiming
 Kitty support isn't trusted, since some ACK the query but never render).

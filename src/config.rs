@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
@@ -48,6 +49,10 @@ pub struct Config {
     pub excludes: Vec<String>,
     pub max_content_filesize: u64,
     pub theme: ThemeConfig,
+    /// Command key overrides: action name -> key specs (see `[keys]`).
+    pub keys: HashMap<String, Vec<String>>,
+    /// Mouse support: click to select, double-click to open, wheel scrolls.
+    pub mouse: bool,
 }
 
 impl Default for Config {
@@ -57,6 +62,8 @@ impl Default for Config {
             excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             max_content_filesize: 2 * 1024 * 1024,
             theme: ThemeConfig::default(),
+            keys: HashMap::new(),
+            mouse: true,
         }
     }
 }
@@ -67,6 +74,16 @@ struct RawConfig {
     excludes: Option<Vec<String>>,
     max_content_filesize: Option<u64>,
     theme: Option<RawTheme>,
+    keys: Option<HashMap<String, KeySpec>>,
+    mouse: Option<bool>,
+}
+
+/// A `[keys]` value: either one spec string or a list of them.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum KeySpec {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(serde::Deserialize)]
@@ -113,6 +130,9 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #         borders: \"sharp\" (default), \"rounded\", or \"none\"
 #         selection_bg / match_fg / section: optional hex overrides,
 #           e.g. selection_bg = \"#313244\"
+# [keys] remaps commands, e.g. quit = \"ctrl-q\", move_up = [\"up\", \"ctrl-k\"]
+#   (text editing keys - typing, backspace, cursor, ctrl-a/e/w/d - are fixed)
+# mouse: click to select, double-click to open, wheel scrolls (true/false)
 ";
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
@@ -149,6 +169,21 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
                 section: t.section,
             })
             .unwrap_or_default(),
+        keys: raw
+            .keys
+            .map(|m| {
+                m.into_iter()
+                    .map(|(name, spec)| {
+                        let specs = match spec {
+                            KeySpec::One(s) => vec![s],
+                            KeySpec::Many(v) => v,
+                        };
+                        (name, specs)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        mouse: raw.mouse.unwrap_or(true),
     })
 }
 
@@ -251,6 +286,37 @@ mod tests {
         assert_eq!(c2.theme.borders, None);
         assert_eq!(c2.theme.selection_bg, None);
         assert_eq!(c2.theme.accent, None);
+    }
+
+    #[test]
+    fn keys_section_parses_single_and_list_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[keys]\nquit = \"ctrl-q\"\nmove_up = [\"up\", \"ctrl-k\"]\n",
+        )
+        .unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert_eq!(c.keys.get("quit"), Some(&vec!["ctrl-q".to_string()]));
+        assert_eq!(
+            c.keys.get("move_up"),
+            Some(&vec!["up".to_string(), "ctrl-k".to_string()])
+        );
+        // absent [keys] section: empty map
+        let d = Config::default();
+        assert!(d.keys.is_empty());
+    }
+
+    #[test]
+    fn mouse_flag_parses_and_defaults_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "mouse = false\n").unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert!(!c.mouse);
+        // default is on
+        assert!(Config::default().mouse);
     }
 
     #[test]

@@ -6,11 +6,14 @@ use crate::matcher::Highlighter;
 use crate::theme::{BorderKind, Theme};
 use crate::util::human_size;
 use crate::walker::FileMeta;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -71,6 +74,16 @@ pub enum UiMode {
     Pick,
 }
 
+/// One entry of the results list as laid out on screen, for mouse hit
+/// testing. `Row(i)` is an engine result; `Header` and `Fold` are the
+/// decorative rows (launch sections, weaker-matches divider, fold row).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Slot {
+    Header,
+    Fold,
+    Row(usize),
+}
+
 pub struct App {
     pub engine: Engine,
     pub input: String,
@@ -93,6 +106,19 @@ pub struct App {
     pub picked: Option<String>,
     /// Open actions popup: Some(selected entry index).
     pub menu: Option<usize>,
+    /// Command keybindings (configurable via `[keys]` in config.toml).
+    pub keymap: crate::keymap::Keymap,
+    /// Results list scroll state (selection + visual offset); persisted so
+    /// its offset reflects real scroll for mouse hit testing.
+    pub list_state: ListState,
+    /// Display-order hit-test map for the results list: (slot, row height).
+    pub slots: Vec<(Slot, u16)>,
+    /// Inner rect of the results block, or Rect::default() when hidden.
+    pub results_area: Rect,
+    /// Inner rect of the preview block, or Rect::default() when hidden.
+    pub preview_area: Rect,
+    /// Last single click on a result row: (row index, when) for double-click.
+    last_click: Option<(usize, Instant)>,
     pub history: Vec<String>,
     history_pos: Option<usize>,
     history_file: Option<std::path::PathBuf>,
@@ -272,6 +298,12 @@ impl App {
             ui_mode: UiMode::Open,
             picked: None,
             menu: None,
+            keymap: crate::keymap::Keymap::default(),
+            list_state: ListState::default(),
+            slots: Vec::new(),
+            results_area: Rect::default(),
+            preview_area: Rect::default(),
+            last_click: None,
             history: Vec::new(),
             history_pos: None,
             history_file: None,
@@ -435,7 +467,6 @@ impl App {
     /// Returns false when the app should quit.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.message = None;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // the actions popup swallows navigation while open
         if let Some(selected) = self.menu {
             match key.code {
@@ -449,24 +480,75 @@ impl App {
             }
             return true;
         }
-        match (key.code, ctrl) {
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => return false,
-            (KeyCode::Right, _) => {
-                if self.input_cursor < self.input.len() {
-                    self.cursor_right();
-                } else if !self.engine.results().is_empty() {
+        // text editing is fixed and handled before the keymap, so those keys
+        // can never be rebound (see fsearch::keymap::is_editing_key)
+        match key.code {
+            KeyCode::Left => self.cursor_left(),
+            KeyCode::Right if self.input_cursor < self.input.len() => self.cursor_right(),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_start();
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_end();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_word_backward();
+                self.refresh_query();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_forward();
+                self.refresh_query();
+            }
+            KeyCode::Backspace => {
+                self.delete_backward();
+                self.refresh_query();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_char(c);
+                self.refresh_query();
+            }
+            _ => {
+                if let Some(action) = self.keymap.lookup(key.code, key.modifiers)
+                    && !self.run_action(action)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Applies a keymap action; returns false when the app should quit.
+    fn run_action(&mut self, action: crate::keymap::Action) -> bool {
+        match action {
+            crate::keymap::Action::Quit => return false,
+            crate::keymap::Action::Open => return self.activate_selected(),
+            crate::keymap::Action::Menu => {
+                if !self.engine.results().is_empty() {
                     self.menu = Some(0);
                 }
             }
-            (KeyCode::Left, _) => self.cursor_left(),
-            (KeyCode::Char('p'), true) => self.history_step(true),
-            (KeyCode::Char('n'), true) => self.history_step(false),
-            (KeyCode::Char(' '), true) => self.act(actions::quick_look, "quick look"),
-            (KeyCode::Char('r'), true) => {
+            crate::keymap::Action::QuickLook => self.act(actions::quick_look, "quick look"),
+            crate::keymap::Action::CopyPath => self.act(actions::copy, "copied"),
+            crate::keymap::Action::Reveal => self.act(actions::reveal, "revealed"),
+            crate::keymap::Action::ClearQuery => {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.refresh_query();
+            }
+            crate::keymap::Action::RegexToggle => {
                 self.regex_mode = !self.regex_mode;
                 self.refresh_query();
             }
-            (KeyCode::Char('x'), true) => {
+            crate::keymap::Action::HistoryPrev => self.history_step(true),
+            crate::keymap::Action::HistoryNext => self.history_step(false),
+            crate::keymap::Action::MoveUp => self.move_selection(-1),
+            crate::keymap::Action::MoveDown => self.move_selection(1),
+            crate::keymap::Action::PreviewLayout => {
+                self.preview_layout = self.preview_layout.next()
+            }
+            crate::keymap::Action::DensityToggle => self.density = self.density.toggle(),
+            crate::keymap::Action::FoldToggle => {
                 self.show_weak = !self.show_weak;
                 // folding the weaker tail back up clamps onto the last strong row
                 if !self.show_weak {
@@ -476,60 +558,12 @@ impl App {
                     }
                 }
             }
-            (KeyCode::Char('t'), true) => self.density = self.density.toggle(),
-            (KeyCode::Char('u'), true) => {
-                self.input.clear();
-                self.input_cursor = 0;
-                self.refresh_query();
-            }
-            (KeyCode::Char('a'), true) => self.cursor_start(),
-            (KeyCode::Char('e'), true) => self.cursor_end(),
-            (KeyCode::Char('w'), true) => {
-                self.delete_word_backward();
-                self.refresh_query();
-            }
-            (KeyCode::Char('d'), true) => {
-                self.delete_forward();
-                self.refresh_query();
-            }
-            (KeyCode::Char('j'), true) | (KeyCode::Down, _) => self.move_selection(1),
-            (KeyCode::Char('k'), true) | (KeyCode::Up, _) => self.move_selection(-1),
-            (KeyCode::Char('y'), true) => self.act(actions::copy, "copied"),
-            (KeyCode::Char('f'), true) => self.act(actions::reveal, "revealed"),
-            (KeyCode::Tab, _) => self.preview_layout = self.preview_layout.next(),
-            (KeyCode::PageDown, _) => {
-                self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_PAGE);
-            }
-            (KeyCode::PageUp, _) => {
+            crate::keymap::Action::PreviewPageUp => {
                 self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_SCROLL_PAGE);
             }
-            (KeyCode::Enter, _) => match self.ui_mode {
-                UiMode::Open => {
-                    self.push_history();
-                    self.open_selected();
-                }
-                UiMode::Pick => {
-                    let picked = self
-                        .engine
-                        .results()
-                        .get(self.selected)
-                        .map(|row| row.path.clone());
-                    if let Some(path) = picked {
-                        self.push_history();
-                        self.picked = Some(path);
-                        return false;
-                    }
-                }
-            },
-            (KeyCode::Backspace, _) => {
-                self.delete_backward();
-                self.refresh_query();
+            crate::keymap::Action::PreviewPageDown => {
+                self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_PAGE);
             }
-            (KeyCode::Char(c), false) => {
-                self.insert_char(c);
-                self.refresh_query();
-            }
-            _ => {}
         }
         true
     }
@@ -583,6 +617,111 @@ impl App {
             },
             Instant::now(),
         ));
+    }
+
+    /// The Enter behavior, shared by the Enter key and a double-click:
+    /// open the selection (Open mode) or return it and exit (`--pick`).
+    /// Returns false when the app should quit.
+    fn activate_selected(&mut self) -> bool {
+        match self.ui_mode {
+            UiMode::Open => {
+                self.push_history();
+                self.open_selected();
+                true
+            }
+            UiMode::Pick => {
+                let picked = self
+                    .engine
+                    .results()
+                    .get(self.selected)
+                    .map(|row| row.path.clone());
+                if let Some(path) = picked {
+                    self.push_history();
+                    self.picked = Some(path);
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    /// Mouse dispatch. Returns false only to mirror `handle_key`'s quit
+    /// contract (a double-click in `--pick` mode returns the selection).
+    pub fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
+        let point = Position {
+            x: ev.column,
+            y: ev.row,
+        };
+        match ev.kind {
+            MouseEventKind::ScrollDown => {
+                if self.results_area.contains(point) {
+                    self.move_selection(1);
+                } else if self.preview_area.contains(point) {
+                    self.preview_scroll = self.preview_scroll.saturating_add(3);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.results_area.contains(point) {
+                    self.move_selection(-1);
+                } else if self.preview_area.contains(point) {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // any left click closes the actions popup
+                if self.menu.is_some() {
+                    self.menu = None;
+                    return true;
+                }
+                if self.results_area.contains(point) {
+                    return self.click_results(ev.row);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Maps a click row inside the results block onto a slot, walking the
+    /// visible slots (from `list_state.offset()`) and accumulating heights.
+    /// Returns false when the click activated a selection in `--pick` mode.
+    fn click_results(&mut self, row: u16) -> bool {
+        let y_rel = row.saturating_sub(self.results_area.y);
+        let mut cursor_y = 0u16;
+        for (slot, h) in self.slots.iter().skip(self.list_state.offset()).copied() {
+            if y_rel < cursor_y + h {
+                return match slot {
+                    Slot::Row(i) => {
+                        let now = Instant::now();
+                        let double = self.last_click.is_some_and(|(prev, at)| {
+                            prev == i && at.elapsed() < Duration::from_millis(450)
+                        });
+                        self.last_click = Some((i, now));
+                        self.selected = i;
+                        if double {
+                            self.activate_selected()
+                        } else {
+                            true
+                        }
+                    }
+                    Slot::Fold => {
+                        self.show_weak = !self.show_weak;
+                        // folding the weaker tail back up clamps onto the last strong row
+                        if !self.show_weak {
+                            let len = self.visible_len();
+                            if self.selected >= len && len > 0 {
+                                self.selected = len - 1;
+                            }
+                        }
+                        true
+                    }
+                    Slot::Header => true,
+                };
+            }
+            cursor_y += h;
+        }
+        true
     }
 
     fn act(&mut self, f: impl Fn(&str) -> std::io::Result<()>, verb: &str) {
@@ -740,8 +879,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_results(frame, app, cols[0]);
             draw_preview(frame, app, cols[1]);
         }
-        PreviewLayout::Full => draw_preview(frame, app, body),
-        PreviewLayout::Hidden => draw_results(frame, app, body),
+        PreviewLayout::Full => {
+            app.results_area = Rect::default();
+            draw_preview(frame, app, body);
+        }
+        PreviewLayout::Hidden => {
+            app.preview_area = Rect::default();
+            draw_results(frame, app, body);
+        }
     }
 
     draw_status(frame, app, status_area);
@@ -1252,6 +1397,14 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let sectioned = app.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
     let mut display_items = items;
     let mut display_selected = app.selected;
+    // slot map mirrors the final display list 1:1 for mouse hit testing:
+    // result rows are 2 lines in Comfy density, 1 in Compact (content rows
+    // are 2 lines in comfy too); headers and the fold row are 1 line each.
+    let row_height: u16 = match app.density {
+        Density::Comfy => 2,
+        Density::Compact => 1,
+    };
+    let mut slots: Vec<(Slot, u16)> = (0..visible).map(|i| (Slot::Row(i), row_height)).collect();
     if sectioned {
         let header = |label: &str| {
             ListItem::new(Span::styled(
@@ -1260,14 +1413,19 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             ))
         };
         let mut with_headers = Vec::with_capacity(display_items.len() + 2);
+        let mut with_slots = Vec::with_capacity(slots.len() + 2);
         with_headers.push(header("RECENT OPENS"));
+        with_slots.push((Slot::Header, 1));
         for (i, item) in display_items.into_iter().enumerate() {
             if i == opened {
                 with_headers.push(header("RECENTLY MODIFIED"));
+                with_slots.push((Slot::Header, 1));
             }
             with_headers.push(item);
+            with_slots.push(slots[i]);
         }
         display_items = with_headers;
+        slots = with_slots;
         display_selected += if app.selected < opened { 1 } else { 2 };
     }
     // The weaker-match fold: a one-line dim fold after the last strong row
@@ -1283,6 +1441,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                         "─ WEAKER MATCHES ─",
                         Style::default().fg(app.theme.section.unwrap_or(app.theme.dim)),
                     )));
+                    slots.insert(i, (Slot::Header, 1));
                 }
                 out.push(item);
             }
@@ -1297,15 +1456,18 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(app.theme.dim),
             )));
             display_items = out;
+            slots.push((Slot::Fold, 1));
         }
     }
     app.highlighter = highlighter;
+    let block = themed_block("results", &app.theme);
+    app.results_area = block.inner(area);
     let list = List::new(display_items)
-        .block(themed_block("results", &app.theme))
+        .block(block)
         .highlight_style(selection_style(&app.theme));
-    let mut state = ListState::default();
-    state.select(Some(display_selected));
-    frame.render_stateful_widget(list, area, &mut state);
+    app.list_state.select(Some(display_selected));
+    frame.render_stateful_widget(list, area, &mut app.list_state);
+    app.slots = slots;
 }
 
 /// `path` with a home-directory prefix shortened to `~`; unchanged otherwise.
@@ -1370,6 +1532,7 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     app.load_preview();
     let block = themed_block("preview", &app.theme);
     let inner = block.inner(area);
+    app.preview_area = inner;
     frame.render_widget(block, area);
     // 2-line header: dim parent path + bold filename, then a dim
     // kind · size · age line (with pixel dims for images, line count for text)
@@ -1666,8 +1829,11 @@ fn open_tty() -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open("/dev/tty")
 }
 
-fn restore_terminal() {
+fn restore_terminal(mouse: bool) {
     if let Ok(mut tty) = open_tty() {
+        if mouse {
+            let _ = execute!(tty, DisableMouseCapture);
+        }
         let _ = execute!(tty, LeaveAlternateScreen);
     }
     let _ = disable_raw_mode();
@@ -1680,19 +1846,26 @@ pub fn run(
     ui_mode: UiMode,
     initial_query: &str,
     theme: Theme,
+    keymap: crate::keymap::Keymap,
+    mouse: bool,
 ) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
     let mut tty = open_tty()?;
     enable_raw_mode()?;
-    execute!(tty, EnterAlternateScreen)?;
+    if mouse {
+        execute!(tty, EnterAlternateScreen, EnableMouseCapture)?;
+    } else {
+        execute!(tty, EnterAlternateScreen)?;
+    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        restore_terminal(mouse);
         default_hook(info);
     }));
     let mut terminal = Terminal::new(CrosstermBackend::new(tty))?;
     let mut app = App::new(engine);
+    app.keymap = keymap;
     app.appearance = traits.appearance;
     app.picker = picker;
     app.ui_mode = ui_mode;
@@ -1716,18 +1889,27 @@ pub fn run(
         }
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => {
-                if let Ok(Event::Key(key)) = event::read()
-                    && key.is_press()
-                    && !app.handle_key(key)
-                {
-                    break Ok(());
+                match event::read() {
+                    Ok(Event::Key(key)) if key.is_press() => {
+                        if !app.handle_key(key) {
+                            break Ok(());
+                        }
+                    }
+                    // only ever fires when mouse capture is on
+                    Ok(Event::Mouse(m)) => {
+                        if !app.handle_mouse(m) {
+                            break Ok(());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => break Err(e.into()),
                 }
             }
             Ok(false) => {}
             Err(e) => break Err(e.into()),
         }
     };
-    restore_terminal();
+    restore_terminal(mouse);
     let _ = std::panic::take_hook(); // drop the restoring hook
     result.map(|_| app.picked)
 }
@@ -1748,6 +1930,8 @@ mod tests {
             excludes: vec![],
             max_content_filesize: 1024,
             theme: Default::default(),
+            keys: Default::default(),
+            mouse: true,
         };
         let engine = Engine::new(
             config,
@@ -2145,6 +2329,111 @@ mod tests {
         assert_eq!(app.preview_scroll, 0); // saturates at zero
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.preview_scroll, 0);
+    }
+
+    fn test_row(path: &str) -> crate::engine::ResultRow {
+        crate::engine::ResultRow {
+            path: path.into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: None,
+            score: None,
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_state() -> App {
+        let mut app = test_app();
+        app.engine
+            .inject_results_for_test(vec![test_row("/a"), test_row("/b"), test_row("/c")]);
+        app.results_area = Rect::new(0, 3, 40, 20);
+        app.preview_area = Rect::new(40, 3, 40, 20);
+        // comfy heights: rows at y 0-1, 2-3, 4-5
+        app.slots = vec![(Slot::Row(0), 2), (Slot::Row(1), 2), (Slot::Row(2), 2)];
+        app.list_state = ListState::default();
+        app
+    }
+
+    #[test]
+    fn mouse_wheel_in_results_moves_selection() {
+        let mut app = mouse_state();
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        assert_eq!(app.selected, 1);
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_in_preview_scrolls_preview() {
+        let mut app = mouse_state();
+        app.preview_scroll = 5;
+        // columns 40..80 land in the preview pane
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 60,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(down));
+        assert_eq!(app.preview_scroll, 8);
+        let up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 60,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(up));
+        assert_eq!(app.preview_scroll, 5);
+    }
+
+    #[test]
+    fn click_selects_row_without_opening() {
+        let mut app = mouse_state();
+        // row index 1 spans absolute y 5-6 (results_area.y = 3, y_rel 2-3)
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6)));
+        assert_eq!(app.selected, 1);
+        assert!(app.message.is_none(), "single click must not open");
+        assert!(app.picked.is_none());
+    }
+
+    #[test]
+    fn click_on_fold_row_toggles_show_weak() {
+        let mut app = mouse_state();
+        app.slots = vec![(Slot::Row(0), 2), (Slot::Fold, 1), (Slot::Row(1), 2)];
+        // the fold row sits at y_rel 2 (absolute y 5)
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5)));
+        assert!(app.show_weak, "fold click should reveal weaker matches");
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5)));
+        assert!(!app.show_weak, "second fold click folds back");
+    }
+
+    #[test]
+    fn click_while_menu_open_closes_menu() {
+        let mut app = mouse_state();
+        app.menu = Some(2);
+        // a click outside the results area closes the actions popup
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1)));
+        assert_eq!(app.menu, None);
+    }
+
+    #[test]
+    fn double_click_opens_selection() {
+        let mut app = mouse_state();
+        app.ui_mode = UiMode::Pick;
+        // first click selects, second click (within 450 ms) activates
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6)));
+        assert!(app.picked.is_none());
+        assert!(!app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6)));
+        assert_eq!(app.picked.as_deref(), Some("/b"));
     }
 
     #[test]
