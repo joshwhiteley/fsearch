@@ -44,15 +44,36 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     if let Ok(text) = std::fs::read_to_string(&cached) {
         return Ok(text);
     }
-    let text = extract(path)?;
+    // failures are cached too, so a PDF that crashes or defeats the parser
+    // is attempted once — not re-parsed (and re-panicked) on every search
+    let cached_err = cache_dir.join(format!("{key}.err"));
+    if let Ok(msg) = std::fs::read_to_string(&cached_err) {
+        return Err(msg);
+    }
+    let result = extract(path);
     let _ = std::fs::create_dir_all(cache_dir);
+    let (target, body) = match &result {
+        Ok(text) => (&cached, text.as_str()),
+        Err(e) => (&cached_err, e.as_str()),
+    };
     // write to a pid-unique temp then rename, so two concurrent instances
     // never observe a half-written cache entry
     let tmp = cache_dir.join(format!(".{key}.{}.tmp", std::process::id()));
-    let _ = std::fs::write(&tmp, &text);
-    let _ = std::fs::rename(&tmp, &cached);
+    let _ = std::fs::write(&tmp, body);
+    let _ = std::fs::rename(&tmp, target);
     evict_oldest(cache_dir);
-    Ok(text)
+    result
+}
+
+thread_local! {
+    static IN_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while [`extract`] is running its panic-guarded parser on this
+/// thread. Panic hooks check it so caught pdf-extract panics stay silent
+/// instead of spraying over the UI (or tearing the terminal down).
+pub fn in_extract_guard() -> bool {
+    IN_GUARD.with(|g| g.get())
 }
 
 /// Keeps the cache from growing without bound: on a miss, removes the oldest
@@ -84,13 +105,24 @@ fn evict_oldest(cache_dir: &Path) {
 /// pdf-extract is known to panic on malformed files; contain that.
 fn extract(path: &str) -> Result<String, String> {
     let path = path.to_string();
-    std::panic::catch_unwind(move || pdf_extract::extract_text(&path).map_err(|e| e.to_string()))
-        .unwrap_or_else(|_| Err("pdf parser crashed on this file".to_string()))
+    IN_GUARD.with(|g| g.set(true));
+    let result = std::panic::catch_unwind(move || {
+        pdf_extract::extract_text(&path).map_err(|e| e.to_string())
+    });
+    IN_GUARD.with(|g| g.set(false));
+    result.unwrap_or_else(|_| Err("pdf parser crashed on this file".to_string()))
 }
 
 /// A minimal single-page PDF containing `text`, for tests.
 #[doc(hidden)]
 pub fn minimal_pdf(text: &str) -> Vec<u8> {
+    build_pdf(
+        text,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    )
+}
+
+fn build_pdf(text: &str, font: &str) -> Vec<u8> {
     let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -102,7 +134,7 @@ pub fn minimal_pdf(text: &str) -> Vec<u8> {
             "<< /Length {} >>\nstream\n{stream}\nendstream",
             stream.len()
         ),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        font.to_string(),
     ];
     let mut out = String::from("%PDF-1.4\n");
     let mut offsets = Vec::new();
@@ -148,6 +180,54 @@ mod tests {
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         let again = extract_cached(file.to_str().unwrap(), &cache).unwrap();
         assert_eq!(again, text);
+    }
+
+    #[test]
+    fn symbol_encoding_pdf_is_an_error_not_a_panic() {
+        // pdf-extract 0.12 panics on fonts declaring /SymbolEncoding;
+        // the guard must turn that into an Err
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("weird.pdf");
+        std::fs::write(
+            &file,
+            build_pdf(
+                "hello",
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol \
+                 /Encoding /SymbolEncoding >>",
+            ),
+        )
+        .unwrap();
+        let cache = dir.path().join("cache");
+        assert!(extract_cached(file.to_str().unwrap(), &cache).is_err());
+        assert!(!in_extract_guard(), "guard flag must reset after the call");
+    }
+
+    #[test]
+    fn extraction_failures_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bad.pdf");
+        std::fs::write(&file, b"%PDF-1.4 not really").unwrap();
+        let cache = dir.path().join("cache");
+        let first = extract_cached(file.to_str().unwrap(), &cache).unwrap_err();
+        // exactly one cache entry, and it is the failure marker
+        let names: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].ends_with(".err"), "got {names:?}");
+        // the second call is served from the marker, not re-parsed: plant a
+        // sentinel in the cache file and see it come back
+        assert_eq!(
+            extract_cached(file.to_str().unwrap(), &cache).unwrap_err(),
+            first
+        );
+        std::fs::write(cache.join(&names[0]), "sentinel").unwrap();
+        assert_eq!(
+            extract_cached(file.to_str().unwrap(), &cache).unwrap_err(),
+            "sentinel"
+        );
     }
 
     #[test]

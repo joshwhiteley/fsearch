@@ -3,6 +3,15 @@ use fsearch::{config, engine::Engine, index, tui, walker};
 use std::time::Instant;
 
 fn main() {
+    // pdf-extract panics on exotic PDFs; those panics are caught at the
+    // call site — keep the default hook from printing them as crashes
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if fsearch::pdf::in_extract_guard() {
+            return;
+        }
+        default_hook(info);
+    }));
     match cli::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
         Command::Run => run_ui(tui::UiMode::Open, ""),
         Command::Help => print!("{}", cli::HELP),

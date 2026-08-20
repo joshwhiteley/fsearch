@@ -786,9 +786,18 @@ pub fn run(
     } else {
         execute!(tty, EnterAlternateScreen)?;
     }
+    // Restore the terminal only for a real crash on the UI thread. Worker
+    // threads contain their own panics (a guarded pdf-extract panic is
+    // suppressed entirely), and yanking the alternate screen out from under
+    // a still-running UI is far worse than a garbled message.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal(mouse);
+        if crate::pdf::in_extract_guard() {
+            return;
+        }
+        if std::thread::current().name() == Some("main") {
+            restore_terminal(mouse);
+        }
         default_hook(info);
     }));
     let mut terminal = Terminal::new(CrosstermBackend::new(tty))?;
