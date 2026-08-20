@@ -123,17 +123,20 @@ pub(super) fn score_bar(s: f32) -> (usize, String) {
 /// Right-aligned score readout for a semantic row: a styled 5-cell bar plus
 /// the percent, returning its cell width and the spans to render.
 pub(super) fn score_readout(s: f32, accent: Color, dim: Style) -> (usize, Vec<Span<'static>>) {
-    let (filled, bar) = score_bar(s);
-    let (fill, rest) = bar.split_at(filled);
+    // build the two segments directly: the bar glyphs are 3 bytes each, so
+    // splitting the joined string at the fill COUNT would land mid-char
+    let (filled, _) = score_bar(s);
+    let fill = "\u{25b0}".repeat(filled);
+    let rest = "\u{25b1}".repeat(5 - filled);
     let pct = format!(" {:.0}%", s * 100.0);
     let mut spans: Vec<Span<'static>> = Vec::new();
     if !fill.is_empty() {
-        spans.push(Span::styled(fill.to_string(), Style::default().fg(accent)));
+        spans.push(Span::styled(fill, Style::default().fg(accent)));
     }
     if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_string(), dim));
+        spans.push(Span::styled(rest, dim));
     }
-    let width = bar.chars().count() + pct.chars().count();
+    let width = 5 + pct.chars().count();
     spans.push(Span::styled(pct, dim));
     (width, spans)
 }

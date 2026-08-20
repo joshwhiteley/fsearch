@@ -682,3 +682,40 @@ fn score_bar_fill_counts_round() {
     // every bar is exactly 5 cells
     assert_eq!(score_bar(0.35).1.chars().count(), 5);
 }
+
+#[test]
+fn score_readout_never_splits_mid_char() {
+    // regression: split_at(filled) used a char count as a byte index and
+    // panicked for every partial fill (the bar glyphs are 3 bytes each)
+    for s in [0.0f32, 0.1, 0.2, 0.4, 0.5, 0.7, 0.87, 0.99, 1.0] {
+        let (width, spans) = score_readout(s, Color::Cyan, Style::default());
+        let text: String = spans.iter().map(|sp| sp.content.as_ref()).collect();
+        let bar: String = text.chars().take(5).collect();
+        assert_eq!(bar.chars().count(), 5, "bar for {s}");
+        assert!(bar.chars().all(|c| c == '\u{25b0}' || c == '\u{25b1}'));
+        assert_eq!(width, text.chars().count(), "width for {s}");
+    }
+}
+
+#[test]
+fn semantic_scored_rows_render_without_panicking() {
+    use crate::engine::ResultRow;
+    let mut app = test_app();
+    // 0.4 -> filled = 2, the exact crash case from the field report
+    app.engine.inject_results_for_test(vec![ResultRow {
+        path: "/docs/essay.md".into(),
+        line_number: Some(3),
+        line: Some("patience compounds".into()),
+        recent_open: false,
+        meta: None,
+        score: Some(0.4),
+    }]);
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("essay.md"));
+    assert!(text.contains("40%"));
+    // compact density hits the same readout on the single-line path
+    app.density = Density::Compact;
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+}
