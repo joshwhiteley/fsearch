@@ -1,5 +1,6 @@
 use crate::filters::Filters;
 use crate::index::PathStore;
+use crate::quiet::Quiet;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
@@ -41,6 +42,7 @@ pub fn search(
         limit,
         &HashMap::new(),
         &Filters::default(),
+        &Quiet::new(Vec::new()),
     )
 }
 
@@ -52,12 +54,17 @@ pub fn search_boosted(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
+    quiet: &Quiet,
 ) -> Result<Ranked, String> {
+    // a `/` in the query, a path: filter, or dir: means the user is
+    // navigating paths on purpose — quiet demotion switches off
+    let path_intent = query.contains('/') || !filters.path_terms.is_empty() || filters.dirs_only;
+    let demote = (!quiet.is_empty() && !path_intent).then_some(quiet);
     if query.is_empty() {
-        return Ok(head_with_boosts(store, limit, boosts, filters));
+        return Ok(head_with_boosts(store, limit, boosts, filters, demote));
     }
     match mode {
-        FilenameMode::Fuzzy => Ok(fuzzy(store, query, limit, boosts, filters)),
+        FilenameMode::Fuzzy => Ok(fuzzy(store, query, limit, boosts, filters, demote)),
         FilenameMode::Regex => regex_filter(store, query, limit, boosts, filters),
     }
 }
@@ -73,30 +80,48 @@ fn head_with_boosts(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
+    demote: Option<&Quiet>,
 ) -> Ranked {
-    let indices = if boosts.is_empty() {
-        (0..store.len())
-            .filter(|&i| passes(store, i, filters))
-            .take(limit)
-            .collect()
-    } else {
+    // frecency-boosted entries first (opening something is an explicit
+    // signal, quiet or not), then plain entries newest-first; quiet paths
+    // sink into a trailing block behind the weaker-matches fold, which
+    // keeps log/state churn off the launch screen
+    let mut out: Vec<usize> = Vec::new();
+    let mut in_boosted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if !boosts.is_empty() {
         let mut boosted: Vec<(u32, usize)> = (0..store.len())
             .filter(|&i| passes(store, i, filters))
             .filter_map(|i| boosts.get(store.get(i)).map(|&b| (b, i)))
             .collect();
         boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
-        let mut out: Vec<usize> = boosted.iter().map(|&(_, i)| i).collect();
-        let in_boosted: std::collections::HashSet<usize> = out.iter().copied().collect();
-        out.extend(
-            (0..store.len())
-                .filter(|&i| !in_boosted.contains(&i) && passes(store, i, filters))
-                .take(limit),
-        );
-        out.truncate(limit);
-        out
-    };
-    let strong = indices.len();
-    Ranked { indices, strong }
+        out.extend(boosted.iter().map(|&(_, i)| i));
+        in_boosted.extend(out.iter().copied());
+    }
+    let mut normal: Vec<usize> = Vec::new();
+    let mut quiet_tail: Vec<usize> = Vec::new();
+    for i in 0..store.len() {
+        if normal.len() >= limit {
+            break;
+        }
+        if in_boosted.contains(&i) || !passes(store, i, filters) {
+            continue;
+        }
+        if demote.is_some_and(|q| q.is_quiet(store.get(i))) {
+            if quiet_tail.len() < limit {
+                quiet_tail.push(i);
+            }
+        } else {
+            normal.push(i);
+        }
+    }
+    out.extend(normal);
+    let strong = out.len().min(limit);
+    out.extend(quiet_tail);
+    out.truncate(limit);
+    Ranked {
+        indices: out,
+        strong,
+    }
 }
 
 fn apply_boost_order(hits: &mut [usize], store: &PathStore, boosts: &HashMap<String, u32>) {
@@ -150,6 +175,7 @@ fn fuzzy(
     limit: usize,
     boosts: &HashMap<String, u32>,
     filters: &Filters,
+    demote: Option<&Quiet>,
 ) -> Ranked {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut scored: Vec<(u32, usize)> = (0..store.len())
@@ -178,7 +204,14 @@ fn fuzzy(
                             .score(Utf32Str::new(name, &mut buf), &mut matcher)
                             .unwrap_or(0);
                         let boost = boosts.get(path).copied().unwrap_or(0);
-                        acc.push((score + fname_bonus + boost, i));
+                        let mut total = score + fname_bonus + boost;
+                        // quiet paths score at 2/5: even with a filename
+                        // match they land under the best/2 floor whenever a
+                        // non-quiet candidate exists, i.e. behind the fold
+                        if demote.is_some_and(|q| q.is_quiet(path)) {
+                            total = total * 2 / 5;
+                        }
+                        acc.push((total, i));
                     }
                 }
                 (matcher, buf, acc)
@@ -194,11 +227,31 @@ fn fuzzy(
     // floor self-regulates: when a real filename match exists, scattered
     // path-only matches fall below it and disappear; when nothing matches the
     // filename, all candidates score within range of each other and survive.
-    let mut strong = 0;
-    if let Some(&(best, _)) = scored.first() {
-        let floor = best / 2;
-        strong = scored.partition_point(|&(s, _)| s >= floor);
-        strong = strong.max(MIN_KEEP.min(scored.len()));
+    let floor_strong = |scored: &[(u32, usize)]| {
+        let mut s = 0;
+        if let Some(&(best, _)) = scored.first() {
+            let floor = best / 2;
+            s = scored.partition_point(|&(v, _)| v >= floor);
+            s = s.max(MIN_KEEP.min(scored.len()));
+        }
+        s
+    };
+    // Quiet paths fold behind the weak-match row whenever a louder,
+    // non-quiet match exists — regardless of MIN_KEEP. This keeps log and
+    // app-internal churn out of the default view while staying reachable
+    // via ctrl-x. Path-intent queries (demote = None) skip this entirely.
+    let mut strong;
+    if let Some(q) = demote {
+        // stable partition: non-quiet first, score order preserved within
+        scored.sort_by_key(|&(_, i)| q.is_quiet(store.get(i)));
+        let nq = scored.partition_point(|&(_, i)| !q.is_quiet(store.get(i)));
+        if nq > 0 && nq < scored.len() {
+            strong = floor_strong(&scored[..nq]);
+        } else {
+            strong = floor_strong(&scored);
+        }
+    } else {
+        strong = floor_strong(&scored);
     }
     scored.truncate(limit);
     strong = strong.min(scored.len());
@@ -324,6 +377,7 @@ mod tests {
             10,
             &boosts,
             &Filters::default(),
+            &Quiet::new(Vec::new()),
         )
         .unwrap();
         assert_eq!(r.indices[0], 1);
@@ -335,6 +389,7 @@ mod tests {
             10,
             &boosts,
             &Filters::default(),
+            &Quiet::new(Vec::new()),
         )
         .unwrap();
         assert_eq!(r.indices, vec![1, 0]);
@@ -346,6 +401,7 @@ mod tests {
             10,
             &boosts,
             &Filters::default(),
+            &Quiet::new(Vec::new()),
         )
         .unwrap();
         assert_eq!(r.indices, vec![1, 0]);
@@ -357,18 +413,136 @@ mod tests {
         let (f, _) = crate::filters::parse("ext:pdf path:docs x", 0);
         let none = HashMap::new();
         // empty query honors filters
-        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
+        let r = search_boosted(
+            &p,
+            "",
+            FilenameMode::Fuzzy,
+            10,
+            &none,
+            &f,
+            &Quiet::new(Vec::new()),
+        )
+        .unwrap();
         assert_eq!(r.indices, vec![0]);
         // fuzzy honors filters
-        let r = search_boosted(&p, "a", FilenameMode::Fuzzy, 10, &none, &f).unwrap();
+        let r = search_boosted(
+            &p,
+            "a",
+            FilenameMode::Fuzzy,
+            10,
+            &none,
+            &f,
+            &Quiet::new(Vec::new()),
+        )
+        .unwrap();
         assert_eq!(r.indices, vec![0]);
         // dirs only with dir:
         let (fd, _) = crate::filters::parse("dir: x", 0);
-        let r = search_boosted(&p, "", FilenameMode::Fuzzy, 10, &none, &fd).unwrap();
+        let r = search_boosted(
+            &p,
+            "",
+            FilenameMode::Fuzzy,
+            10,
+            &none,
+            &fd,
+            &Quiet::new(Vec::new()),
+        )
+        .unwrap();
         assert_eq!(r.indices, vec![2]);
         // default (no filters) excludes dirs
         let r = search(&p, "", FilenameMode::Fuzzy, 10).unwrap();
         assert_eq!(r.indices, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn quiet_paths_fold_behind_strong_matches() {
+        let p = paths(&[
+            "/Users/j/Documents/cisco-notes.md",
+            "/Users/j/.cisco/vpn/log/UIHistory.txt",
+            "/Users/j/Library/Application Support/Cisco/state.json",
+        ]);
+        let q = Quiet::default();
+        let r = search_boosted(
+            &p,
+            "cisco",
+            FilenameMode::Fuzzy,
+            10,
+            &HashMap::new(),
+            &Filters::default(),
+            &q,
+        )
+        .unwrap();
+        // the real document is strong; the log/state churn sits behind the fold
+        assert_eq!(r.indices[0], 0);
+        assert_eq!(r.strong, 1, "quiet matches must fall below the floor");
+        assert_eq!(r.indices.len(), 3, "still reachable via ctrl-x");
+    }
+
+    #[test]
+    fn slash_in_query_disables_quiet_demotion() {
+        let p = paths(&[
+            "/Users/j/Documents/cisco-notes.md",
+            "/Users/j/.cisco/vpn/log/UIHistory.txt",
+        ]);
+        let q = Quiet::default();
+        let r = search_boosted(
+            &p,
+            "cisco/",
+            FilenameMode::Fuzzy,
+            10,
+            &HashMap::new(),
+            &Filters::default(),
+            &q,
+        )
+        .unwrap();
+        // path intent: the hidden-dir hit competes on equal terms
+        assert_eq!(r.strong, r.indices.len());
+        assert!(r.indices.contains(&1));
+    }
+
+    #[test]
+    fn all_quiet_matches_stay_visible() {
+        let p = paths(&[
+            "/Users/j/.config/nvim/init.lua",
+            "/Users/j/.config/nvim/lazy-lock.json",
+        ]);
+        let q = Quiet::default();
+        let r = search_boosted(
+            &p,
+            "nvim",
+            FilenameMode::Fuzzy,
+            10,
+            &HashMap::new(),
+            &Filters::default(),
+            &q,
+        )
+        .unwrap();
+        // demotion is relative: with no louder candidate, nothing folds
+        assert_eq!(r.strong, 2);
+    }
+
+    #[test]
+    fn launch_screen_head_sinks_quiet_churn() {
+        let p = paths(&[
+            "/Users/j/Library/Biome/sessions/heartbeat", // newest, junk
+            "/Users/j/.cisco/vpn/log/UIHistory.txt",
+            "/Users/j/Documents/report.md",
+            "/Users/j/Desktop/photo.png",
+        ]);
+        let q = Quiet::default();
+        let r = search_boosted(
+            &p,
+            "",
+            FilenameMode::Fuzzy,
+            10,
+            &HashMap::new(),
+            &Filters::default(),
+            &q,
+        )
+        .unwrap();
+        assert_eq!(&r.indices[..2], &[2, 3], "real files first");
+        assert_eq!(r.strong, 2);
+        assert_eq!(r.indices.len(), 4, "churn folded, not hidden");
     }
 
     #[test]

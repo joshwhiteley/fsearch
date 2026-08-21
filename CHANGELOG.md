@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 — 2026-08-21
+
+- Smart noise filtering: app-internal and hidden-directory paths (logs,
+  `~/Library/` state, dotfile churn) are demoted behind the weaker-matches
+  fold and hidden from the launch screen — `ctrl-x` reveals them, and a
+  `/` in a query or a `path:` filter searches them at full rank.
+  Configurable via `quiet = [...]` (empty list disables)
+- `slate` theme preset: higher-contrast dark theme with a selection tint
+  instead of reverse video
+- .app bundles preview their directory contents instead of "(unreadable)"
+
 ## 0.7.0 — 2026-08-20
 
 - Filter mode: `git ls-files | fsearch` (or `… | fsearch --filter`)

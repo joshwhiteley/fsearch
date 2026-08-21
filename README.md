@@ -43,6 +43,10 @@ Run `fsearch` and start typing.
 - `= 2*(3+4)` — inline calculator; enter copies the result
 - apps are indexed too (macOS): type `safari`, hit enter, Safari launches
   (`index_apps = false` turns this off)
+- noisy paths are demoted automatically: app-internal state (`~/Library/…`)
+  and hidden-directory churn (logs, dotfiles) sit behind the weaker-matches
+  fold and stay off the launch screen. `ctrl-x` reveals them, and typing a
+  `/` in a query (or `path:`) searches them at full rank
 - `enter` opens · `→` opens an actions menu (reveal, copy, quick look,
   move to trash) · `ctrl-space` Quick Look · `ctrl-y` copies the path ·
   `ctrl-p`/`ctrl-n` recall query history ·
@@ -110,8 +114,11 @@ Box…) are skipped by default; remove them from `excludes` to index them.
 `fsearch --reindex` rebuilds the index after changes.
 
 Themes: add a `[theme]` section with `preset = "catppuccin"` (also
-`gruvbox`, `nord`, `tokyonight`) and an optional `accent = "#7aa2f7"`
-override. Border style is `borders = "sharp"` (default), `"rounded"`, or
+`gruvbox`, `nord`, `tokyonight`, and the higher-contrast `slate`) and an
+optional `accent = "#7aa2f7"` override.
+
+`quiet = ["/Library/", "/."]` lists path substrings demoted in ranking —
+set `quiet = []` to disable smart filtering entirely. Border style is `borders = "sharp"` (default), `"rounded"`, or
 `"none"`; `selection_bg`, `match_fg` and `section` accept hex overrides
 (e.g. `selection_bg = "#313244"`).
 

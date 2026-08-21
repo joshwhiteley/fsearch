@@ -53,6 +53,8 @@ pub struct Config {
     pub keys: HashMap<String, Vec<String>>,
     /// Mouse support: click to select, double-click to open, wheel scrolls.
     pub mouse: bool,
+    /// Substring patterns demoted below the fold and off the launch screen.
+    pub quiet: Vec<String>,
     /// Include /Applications app bundles in the index (macOS).
     pub index_apps: bool,
 }
@@ -66,6 +68,10 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             keys: HashMap::new(),
             mouse: true,
+            quiet: crate::quiet::DEFAULT_QUIET
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             index_apps: true,
         }
     }
@@ -79,6 +85,7 @@ struct RawConfig {
     theme: Option<RawTheme>,
     keys: Option<HashMap<String, KeySpec>>,
     mouse: Option<bool>,
+    quiet: Option<Vec<String>>,
     index_apps: Option<bool>,
 }
 
@@ -137,6 +144,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # [keys] remaps commands, e.g. quit = \"ctrl-q\", move_up = [\"up\", \"ctrl-k\"]
 #   (text editing keys - typing, backspace, cursor, ctrl-a/e/w/d - are fixed)
 # index_apps: include /Applications app bundles in the index (macOS)
+# quiet: substrings demoted in ranking (app internals); set [] to disable
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
 ";
 
@@ -189,6 +197,7 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
             })
             .unwrap_or_default(),
         mouse: raw.mouse.unwrap_or(true),
+        quiet: raw.quiet.unwrap_or_else(|| d.quiet.clone()),
         index_apps: raw.index_apps.unwrap_or(true),
     })
 }

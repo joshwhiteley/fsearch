@@ -123,6 +123,7 @@ struct FilenameJob {
     store: Arc<PathStore>,
     boosts: Arc<HashMap<String, u32>>,
     filters: Filters,
+    quiet: Arc<crate::quiet::Quiet>,
 }
 
 pub struct Engine {
@@ -145,6 +146,7 @@ pub struct Engine {
     sem_tx: Option<Sender<SemJob>>,
     frecency: Frecency,
     boosts: Arc<HashMap<String, u32>>,
+    quiet: Arc<crate::quiet::Quiet>,
     filter: bool,
 }
 
@@ -303,6 +305,7 @@ fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
                 FILENAME_LIMIT,
                 &job.boosts,
                 &job.filters,
+                &job.quiet,
             ) {
                 Ok(r) => (r.indices, r.strong, None),
                 Err(e) => (Vec::new(), 0, Some(format!("invalid pattern: {e}"))),
@@ -328,6 +331,7 @@ impl Engine {
             .parent()
             .map(|p| p.join("pdftext"))
             .unwrap_or_else(crate::pdf::default_cache_dir);
+        let quiet_patterns = config.quiet.clone();
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
 
@@ -421,6 +425,7 @@ impl Engine {
             sem_tx: None,
             frecency,
             boosts,
+            quiet: Arc::new(crate::quiet::Quiet::new(quiet_patterns)),
             filter: false,
         }
     }
@@ -471,6 +476,8 @@ impl Engine {
             sem_tx: None,
             frecency,
             boosts,
+            // stdin lines are whatever the pipe says they are — no demotion
+            quiet: Arc::new(crate::quiet::Quiet::new(Vec::new())),
             filter: true,
         }
     }
@@ -703,6 +710,7 @@ impl Engine {
             store: self.store.clone(),
             boosts: self.boosts.clone(),
             filters: self.filters.clone(),
+            quiet: self.quiet.clone(),
         });
     }
 

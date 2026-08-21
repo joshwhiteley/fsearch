@@ -654,7 +654,9 @@ impl App {
         self.preview_for = Some(key);
         self.preview_scroll = 0;
         self.preview_image_dims = None;
-        if row.path.ends_with('/') {
+        // directories (trailing '/') and macOS .app bundles are both
+        // directories without a text preview
+        if row.path.ends_with('/') || row.path.to_ascii_lowercase().ends_with(".app") {
             // cheap; stays on the UI thread
             self.preview = PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
             return;

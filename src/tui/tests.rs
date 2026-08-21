@@ -15,6 +15,7 @@ fn test_app() -> App {
         keys: Default::default(),
         mouse: true,
         index_apps: false,
+        quiet: Vec::new(),
     };
     let engine = Engine::new(
         config,

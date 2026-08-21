@@ -13,6 +13,7 @@ pub mod index;
 pub mod keymap;
 pub mod matcher;
 pub mod pdf;
+pub mod quiet;
 pub mod sem;
 pub mod theme;
 pub mod tui;

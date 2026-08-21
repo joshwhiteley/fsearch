@@ -1,5 +1,9 @@
 # Roadmap
 
+Shipped in v0.8.0:
+
+- Smart noise filtering (quiet paths) and the high-contrast `slate` theme
+
 Shipped in v0.7.0:
 
 - Stdin filter mode (`cmd | fsearch`) + ctrl-r history widget

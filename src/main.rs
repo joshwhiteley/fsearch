@@ -203,6 +203,7 @@ fn print_search(query: &str) {
             500,
             &std::collections::HashMap::new(),
             &query_filters,
+            &fsearch::quiet::Quiet::new(config.quiet.clone()),
         ) {
             Ok(r) => {
                 // scripting keeps the old behavior: print only the strong

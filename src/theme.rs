@@ -143,6 +143,29 @@ const PRESETS: &[(&str, Theme)] = &[
             borders: BorderKind::Sharp,
         },
     ),
+    (
+        // high-contrast dark theme: readable dim text and a selection tint
+        // instead of reverse-video, for terminals where default fg/bg clash
+        "slate",
+        Theme {
+            accent: Color::Rgb(0x7a, 0xa2, 0xf7),
+            dim: Color::Rgb(0xa9, 0xb1, 0xd6),
+            border: Color::Rgb(0x3b, 0x42, 0x61),
+            title: Color::Rgb(0xc0, 0xca, 0xf5),
+            selection_bg: Some(Color::Rgb(0x28, 0x34, 0x57)),
+            match_fg: Some(Color::Rgb(0x7a, 0xa2, 0xf7)),
+            section: Some(Color::Rgb(0xa9, 0xb1, 0xd6)),
+            badges: [
+                Color::Rgb(0x7d, 0xcf, 0xee), // image
+                Color::Rgb(0xbb, 0x9a, 0xf7), // video/audio
+                Color::Rgb(0xe0, 0xaf, 0x68), // doc
+                Color::Rgb(0x9e, 0xce, 0x6a), // code
+                Color::Rgb(0xf7, 0x76, 0x8e), // archive
+                Color::Rgb(0x56, 0x5f, 0x89), // other
+            ],
+            borders: BorderKind::Sharp,
+        },
+    ),
 ];
 
 fn parse_hex(s: &str) -> Option<Color> {
@@ -209,6 +232,14 @@ mod tests {
         );
         assert_eq!(resolve("Nord", None).accent, Color::Rgb(0x88, 0xc0, 0xd0));
         assert_eq!(resolve("no-such-theme", None), resolve("default", None));
+    }
+
+    #[test]
+    fn slate_is_high_contrast() {
+        let t = resolve("slate", None);
+        assert_eq!(t.dim, Color::Rgb(0xa9, 0xb1, 0xd6));
+        assert_eq!(t.selection_bg, Some(Color::Rgb(0x28, 0x34, 0x57)));
+        assert_eq!(t.match_fg, Some(Color::Rgb(0x7a, 0xa2, 0xf7)));
     }
 
     #[test]
