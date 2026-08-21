@@ -1,6 +1,18 @@
 use super::*;
 
-pub(super) const HINTS: &str = "> grep in files \u{b7} ? semantic \u{b7} = calc \u{b7} 'word exact \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
+const QUERY_HINTS: &[(&str, &str)] = &[
+    (">", "grep in files"),
+    ("?", "semantic"),
+    ("=", "calc"),
+    ("'word", "exact"),
+    ("ext:pdf", ""),
+    ("kind:image", ""),
+    ("changed:7d", ""),
+    ("larger:100mb", ""),
+    ("dir:", "folders"),
+    ("ctrl-r", "regex"),
+    ("tab", "preview"),
+];
 
 pub(super) fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
     let mut block = Block::default()
@@ -29,9 +41,98 @@ pub(super) fn selection_style(theme: &Theme) -> Style {
     }
 }
 
+fn contextual_hints(app: &App) -> Vec<(String, String)> {
+    if app.engine.results().get(app.selected).is_none() {
+        return Vec::new();
+    }
+    let open_label = if app.engine.mode() == Mode::Calc {
+        "copy result"
+    } else if app.engine.is_filter() || app.ui_mode == UiMode::Pick {
+        "choose"
+    } else {
+        "open"
+    };
+    let mut actions = vec![(crate::keymap::Action::Open, open_label)];
+    if app.engine.mode() != Mode::Calc {
+        if !app.engine.is_filter() {
+            actions.push((crate::keymap::Action::Reveal, "reveal"));
+        }
+        actions.push((crate::keymap::Action::CopyPath, "copy path"));
+        if !app.engine.is_filter() {
+            actions.push((crate::keymap::Action::QuickLook, "quick look"));
+            actions.push((crate::keymap::Action::Menu, "actions"));
+            actions.push((crate::keymap::Action::PreviewLayout, "preview"));
+        }
+    }
+    actions
+        .into_iter()
+        .filter_map(|(action, label)| {
+            app.keymap
+                .shortcut(action)
+                .map(|shortcut| (shortcut, label.to_string()))
+        })
+        .collect()
+}
+
+fn help_lines(items: &[(String, String)], width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    if items.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let width = width as usize;
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    let mut row = Vec::new();
+    let mut used = 1usize; // left padding
+    for (key, label) in items {
+        let label_width = if label.is_empty() {
+            0
+        } else {
+            1 + label.chars().count()
+        };
+        let item_width = key.chars().count() + label_width;
+        let separator = if row.is_empty() { 0 } else { 3 }; // " · "
+        if !row.is_empty() && used + separator + item_width > width {
+            rows.push(std::mem::take(&mut row));
+            used = 1;
+        }
+        used += (if row.is_empty() { 0 } else { 3 }) + item_width;
+        row.push((key.clone(), label.clone()));
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+
+    let key_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+    rows.into_iter()
+        .map(|row| {
+            let mut spans = vec![Span::styled(" ", dim)];
+            for (index, (key, label)) in row.into_iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled(" · ", dim));
+                }
+                spans.push(Span::styled(key, key_style));
+                if !label.is_empty() {
+                    spans.push(Span::styled(format!(" {label}"), dim));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    // show syntax reminders under the search bar until typing starts
-    let hint_rows = if app.input.is_empty() { 1 } else { 0 };
+    let query_items: Vec<(String, String)> = QUERY_HINTS
+        .iter()
+        .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
+        .collect();
+    let query_help = if app.input.is_empty() {
+        help_lines(&query_items, frame.area().width, &app.theme)
+    } else {
+        Vec::new()
+    };
+    let action_help = help_lines(&contextual_hints(app), frame.area().width, &app.theme);
     // without borders the search bar only needs a title row + the text row
     let input_height = if app.theme.borders == BorderKind::None {
         2
@@ -42,19 +143,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(input_height),
-            Constraint::Length(hint_rows),
+            Constraint::Length(query_help.len() as u16),
             Constraint::Min(1),
+            Constraint::Length(action_help.len() as u16),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
     draw_input(frame, app, outer[0]);
-    if hint_rows > 0 {
-        let hints = Paragraph::new(format!(" {HINTS}")).style(Style::default().fg(app.theme.dim));
-        frame.render_widget(hints, outer[1]);
+    if !query_help.is_empty() {
+        frame.render_widget(Paragraph::new(Text::from(query_help)), outer[1]);
     }
     let body = outer[2];
-    let status_area = outer[3];
+    let actions_area = outer[3];
+    let status_area = outer[4];
 
     // the calculator's single result row has nothing to preview
     let layout = if app.engine.mode() == Mode::Calc {
@@ -81,6 +183,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    if !action_help.is_empty() {
+        frame.render_widget(Paragraph::new(Text::from(action_help)), actions_area);
+    }
     draw_status(frame, app, status_area);
     // floating toast under the menu popup so the menu stays on top
     match &app.message {

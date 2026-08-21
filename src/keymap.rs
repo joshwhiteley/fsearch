@@ -166,9 +166,60 @@ pub struct Keymap {
     bindings: HashMap<(KeyCode, KeyModifiers), Action>,
 }
 
+fn key_label(code: KeyCode, mods: KeyModifiers) -> Option<String> {
+    let base = match code {
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Up => "↑".to_string(),
+        KeyCode::Down => "↓".to_string(),
+        KeyCode::Left => "←".to_string(),
+        KeyCode::Right => "→".to_string(),
+        KeyCode::PageUp => "pgup".to_string(),
+        KeyCode::PageDown => "pgdn".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        _ => return None,
+    };
+    let mut parts = Vec::new();
+    if mods.contains(KeyModifiers::CONTROL) {
+        parts.push("ctrl".to_string());
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        parts.push("alt".to_string());
+    }
+    if mods.contains(KeyModifiers::SHIFT) {
+        parts.push("shift".to_string());
+    }
+    parts.push(base);
+    Some(parts.join("-"))
+}
+
 impl Keymap {
     pub fn lookup(&self, code: KeyCode, mods: KeyModifiers) -> Option<Action> {
         self.bindings.get(&(code, mods)).copied()
+    }
+
+    /// Shortest configured key label for an action, for contextual UI help.
+    pub fn shortcut(&self, action: Action) -> Option<String> {
+        let mut labels: Vec<String> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound)| **bound == action)
+            .filter_map(|(&(code, mods), _)| key_label(code, mods))
+            .collect();
+        labels.sort_by(|a, b| {
+            a.chars()
+                .count()
+                .cmp(&b.chars().count())
+                .then_with(|| a.cmp(b))
+        });
+        labels.into_iter().next()
     }
 
     /// Builds a keymap from config overrides (action name -> key specs).
@@ -285,6 +336,23 @@ mod tests {
         check("pgdn", Action::PreviewPageDown);
         // keys never bound by default
         assert_eq!(km.lookup(KeyCode::Char('q'), KeyModifiers::CONTROL), None);
+    }
+
+    #[test]
+    fn shortcut_labels_use_the_shortest_configured_binding() {
+        let defaults = Keymap::default();
+        assert_eq!(defaults.shortcut(Action::Open).as_deref(), Some("enter"));
+        assert_eq!(defaults.shortcut(Action::Menu).as_deref(), Some("→"));
+        assert_eq!(
+            defaults.shortcut(Action::CopyPath).as_deref(),
+            Some("ctrl-y")
+        );
+        assert_eq!(defaults.shortcut(Action::Quit).as_deref(), Some("esc"));
+
+        let mut overrides = HashMap::new();
+        overrides.insert("copy_path".to_string(), vec!["alt-y".to_string()]);
+        let custom = Keymap::from_config(&overrides);
+        assert_eq!(custom.shortcut(Action::CopyPath).as_deref(), Some("alt-y"));
     }
 
     #[test]

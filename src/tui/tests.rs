@@ -74,12 +74,43 @@ fn renders_input_and_status() {
 #[test]
 fn hints_show_only_while_input_is_empty() {
     let mut app = test_app();
-    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
-    assert!(buffer_text(&terminal).contains("grep in files"));
+    let text = buffer_text(&terminal);
+    assert!(text.contains("grep in files"));
+    assert!(text.contains("larger:100mb"));
+    assert!(text.contains("tab preview"));
     app.input = "x".to_string();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert!(!buffer_text(&terminal).contains("grep in files"));
+}
+
+#[test]
+fn selected_file_shows_wrapped_contextual_shortcuts() {
+    use crate::engine::ResultRow;
+
+    let mut app = test_app();
+    app.engine.inject_results_for_test(vec![ResultRow {
+        path: "/tmp/report.pdf".to_string(),
+        line_number: None,
+        line: None,
+        recent_open: false,
+        meta: None,
+        score: None,
+    }]);
+    let mut terminal = Terminal::new(TestBackend::new(52, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    for expected in [
+        "enter open",
+        "ctrl-f reveal",
+        "ctrl-y copy path",
+        "ctrl-space quick look",
+        "→ actions",
+        "tab preview",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+    }
 }
 
 #[test]
@@ -694,9 +725,9 @@ fn preview_position_indicator_overflows_short_pane() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
-    // body = 17 inner rows minus 2 header rows = 15; content gets 14,
-    // the bottom row shows 1–14 / 100
-    assert!(text.contains("1–14 / 100"), "position indicator missing");
+    // Wrapped query and contextual help leave 12 preview-body rows;
+    // content gets 11 and the bottom row shows its position.
+    assert!(text.contains("1–11 / 100"), "position indicator missing");
 }
 
 #[test]

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Search hints now wrap instead of clipping; highlighted results show the
+  configured shortcuts for open, reveal, copy path, Quick Look, actions, and
+  preview
 - DOCX and XLSX text extraction for content search, semantic indexing,
   snippets, and previews; extraction is bounded and cached
 - Semantic vectors now use f16 on disk and a read-only mmap at query time,

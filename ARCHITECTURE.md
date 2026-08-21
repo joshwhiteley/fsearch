@@ -44,7 +44,7 @@ src/
     mod.rs     App state, event loop, terminal probe
     rows.rs    result row rendering
     preview.rs preview worker + pane
-    chrome.rs  input, status, gauge, toasts, menu
+    chrome.rs  input, wrapped help, status, gauge, toasts, menu
     tests.rs   TUI test suite
 ```
 
