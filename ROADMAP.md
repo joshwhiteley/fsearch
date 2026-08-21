@@ -1,5 +1,11 @@
 # Roadmap
 
+On main after v0.8.0:
+
+- DOCX/XLSX content search, semantic indexing, and previews
+- f16 + mmap semantic vector storage
+- Loader mutation tests and a PTY smoke test in CI
+
 Shipped in v0.8.0:
 
 - Smart noise filtering (quiet paths) and the high-contrast `slate` theme
@@ -44,9 +50,7 @@ Shipped in v0.2.0:
 
 Planned:
 
-- Homebrew tap publishing (`brew install joshwhiteley/tap/fsearch`)
 - crates.io release
-- Office document text extraction (docx, xlsx)
 - Optional persistent full-text index for instant content search
 
 Ideas welcome — open an issue.

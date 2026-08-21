@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- DOCX and XLSX text extraction for content search, semantic indexing,
+  snippets, and previews; extraction is bounded and cached
+- Semantic vectors now use f16 on disk and a read-only mmap at query time,
+  cutting store size roughly in half and avoiding a vector copy on load;
+  existing semantic indexes rebuild once
+- Corrupt path and semantic stores are covered by deterministic mutation
+  tests; CI now drives the real TUI through a PTY
+- Fixed live-index bursts that could rank an older, same-second file ahead
+  of the newly created file
+
 ## 0.8.0 — 2026-08-21
 
 - Smart noise filtering: app-internal and hidden-directory paths (logs,

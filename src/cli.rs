@@ -24,7 +24,7 @@ usage:
   fsearch --reindex    rebuild the file index now
   fsearch --index-semantic
                        build/refresh the semantic index for ? queries
-                       (notes, docs, pdfs; embeds changed files only)
+                       (text, PDF and Office docs; changed files only)
   fsearch --big [N]    largest N files in the index (default 20)
   fsearch -p QUERY     print matches to stdout (no ui); \"> pattern\"
                        searches file contents
@@ -40,7 +40,7 @@ query syntax:
   ctrl-r               toggle regex match on the full path
   'word                exact substring (^word prefix, word$ suffix,
                        !word excludes)
-  > pattern            regex search inside file contents
+  > pattern            regex search inside files (PDF/DOCX/XLSX included)
   = 2*(3+4)            inline calculator (enter copies the result)
   ? words              search documents by meaning (semantic; run
                        fsearch --index-semantic first)

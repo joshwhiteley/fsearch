@@ -17,11 +17,18 @@ re-scanning, no staleness. Works on macOS and Linux.
 
 ## Install
 
+macOS and Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/joshwhiteley/fsearch/releases/latest/download/fsearch-installer.sh | sh
+```
+
+From a source checkout:
+
 ```sh
 cargo install --path .
 ```
-
-Homebrew and prebuilt binaries land with the first tagged release.
 
 ## Use
 
@@ -31,10 +38,9 @@ Run `fsearch` and start typing.
 - `ctrl-r` — regex on the full path
 - `'word` — exact substring; also `^word` prefix, `word$` suffix, `!word` excludes
 - `> pattern` — regex search inside files, streamed as `path:line`;
-  PDFs are searched through their extracted text (cached, so repeats are
-  instant)
-- `? growing tomatoes` — semantic search: notes, docs and PDFs ranked by
-  meaning, not exact words (an optional build feature — see below)
+  PDF, DOCX and XLSX text is extracted and cached
+- `? growing tomatoes` — semantic search: notes, PDFs and Office documents
+  ranked by meaning, not exact words (an optional build feature — see below)
 - `ext:pdf`, `path:term` — narrow any search (content search included,
   so `> ext:md TODO` greps only markdown)
 - `kind:image` (also video, audio, doc, code, archive), `changed:7d`,
@@ -76,16 +82,15 @@ index in milliseconds and refresh it in the background.
 
 ## Speed
 
-Measured on an Apple-silicon MacBook over a real home directory of
-**1.69 million files** (`tests/perf_test.rs` and hyperfine; your numbers
-will vary):
+Measured on an Apple-silicon MacBook (`tests/perf_test.rs`, hyperfine,
+and a real 1.22M-entry home index; your numbers will vary):
 
 | operation | time |
 |---|---|
-| fuzzy match, 1M paths (per keystroke) | ~15 ms |
-| regex match, 1M paths (per keystroke) | ~11 ms |
-| full re-index of 1.69M files | ~10–14 s |
-| one-shot `fsearch -p query` (loads index, searches, prints) | ~250 ms |
+| fuzzy match, 1M paths (per keystroke) | ~26 ms |
+| regex match, 1M paths (per keystroke) | ~12 ms |
+| full re-index of 1.22M entries | ~8.7 s |
+| one-shot `fsearch -p query` | ~220 ms |
 
 Honest comparison: `mdfind` (Spotlight) answers one-shot queries in ~17 ms
 because its daemon already holds an index in RAM — when it has one. On the
@@ -117,10 +122,10 @@ Themes: add a `[theme]` section with `preset = "catppuccin"` (also
 `gruvbox`, `nord`, `tokyonight`, and the higher-contrast `slate`) and an
 optional `accent = "#7aa2f7"` override.
 
-`quiet = ["/Library/", "/."]` lists path substrings demoted in ranking —
-set `quiet = []` to disable smart filtering entirely. Border style is `borders = "sharp"` (default), `"rounded"`, or
-`"none"`; `selection_bg`, `match_fg` and `section` accept hex overrides
-(e.g. `selection_bg = "#313244"`).
+`quiet = ["/Library/", "/."]` lists path substrings demoted in ranking;
+set `quiet = []` to disable smart filtering. Border style is
+`borders = "sharp"` (default), `"rounded"`, or `"none"`.
+`selection_bg`, `match_fg` and `section` accept hex overrides.
 
 Command keys are remappable via a `[keys]` section — each command takes one
 spec string or a list of them. Text editing keys (typing, backspace, cursor
@@ -160,8 +165,9 @@ fsearch --index-semantic   # one-time; re-runs embed only changed files
 ```
 
 The ~90 MB model downloads on the first index. Markdown, text, HTML,
-LaTeX and PDFs are indexed; the vector store lives next to the file
-index and queries answer in milliseconds.
+LaTeX, PDF, DOCX and XLSX files are indexed. Vectors are stored as f16 and
+memory-mapped on load, so the semantic store uses roughly half the previous
+disk and memory footprint. Queries still answer in milliseconds.
 
 ## How it works
 

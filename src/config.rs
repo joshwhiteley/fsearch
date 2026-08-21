@@ -136,7 +136,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #   cloud drives are excluded by default; delete \"Library/Mobile Documents\"
 #   (iCloud) or \"Library/CloudStorage\" (Box, Dropbox, ...) to index them
 # max_content_filesize: content search skips files larger than this (bytes)
-# [theme] preset: default, catppuccin, gruvbox, nord, tokyonight
+# [theme] preset: default, catppuccin, gruvbox, nord, slate, tokyonight
 #         accent: optional hex override, e.g. \"#7aa2f7\"
 #         borders: \"sharp\" (default), \"rounded\", or \"none\"
 #         selection_bg / match_fg / section: optional hex overrides,

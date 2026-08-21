@@ -28,7 +28,7 @@ src/
   index.rs     versioned binary cache of the path list
   matcher.rs   filename matching: nucleo fuzzy/regex, ranking, quiet demotion
   content.rs   streaming parallel grep (ripgrep's grep-* crates)
-  sem.rs       semantic index: chunking, embeddings, f16 vector store
+  sem.rs       semantic index: chunking, embeddings, f16 + mmap store
   calc.rs      the `= expr` evaluator (recursive descent, no deps)
   quiet.rs     "quiet path" demotion patterns
   frecency.rs  open history → ranking boosts
@@ -58,13 +58,12 @@ recency ranking free everywhere: an empty query shows the head of the list
 (most recently modified files), regex results come back in index order
 (newest first), fuzzy score ties break toward lower indices (newer files),
 and content search walks candidates roughly newest-first as it streams.
-No per-query sorting or timestamp storage is needed at search time — the
-cache file doesn't even contain mtimes.
+No per-query timestamp lookup or recency sort is needed; mtime and size live
+beside each cached path for filters and result metadata.
 
-**Snapshots, not locks.** The path list lives in an `Arc<Vec<String>>`.
+**Snapshots, not locks.** The path list lives in an `Arc<PathStore>`.
 The indexer publishes complete replacement snapshots; searches clone the
-`Arc` (cheap) and run against an immutable list. There is no shared mutable
-state between the walker, the search worker, and the UI.
+`Arc` and run against an immutable arena-backed store.
 
 **Generation counters instead of cancellation trees.** Every query bump
 increments a generation. Workers tag their results with the generation they
@@ -84,8 +83,12 @@ each touched path makes replayed events idempotent. Without this ordering
 there's an unfixable race between "walk finished" and "stream started".
 
 **Frecency lives beside the index, not in it.** Opens append to a small
-history file; at search time they become per-path score boosts — tie-breaks
-in fuzzy mode, front-floats in recency-ordered lists.
+history file; at search time they become per-path score boosts.
+
+**Semantic vectors are f16 and memory-mapped.** Index builds quantize each
+embedding once. Loads parse document metadata but map the vector tail
+read-only, avoiding a large allocation and copy. Store format changes are
+safe because the semantic index is rebuildable.
 
 **The terminal is probed once, before raw mode.** Background color (for
 light/dark preview themes) and the graphics protocol (Kitty/iTerm2/halfblock
@@ -97,7 +100,7 @@ would silently eat all keyboard input (found the hard way, in a PTY test).
 ## The engine's threads
 
 ```
-UI thread (tui.rs)                 engine.tick() drains msg_rx every frame
+UI thread (tui/)                   engine.tick() drains msg_rx every frame
   │ set_query(input)
   ▼
 Engine ──── job_tx ────▶ search worker (latest job wins) ── msg_tx ──▶ results
@@ -120,8 +123,8 @@ All communication is `std::sync::mpsc`; the UI never blocks on a search.
   recency order.
 - **Content** (`> pattern`): ripgrep's engine, binary/oversize-skipped,
   streamed. PDFs, docx and xlsx are searched through cached extracted text.
-- **Semantic** (`? query`): brute-force cosine over chunk embeddings,
-  documents scored in parallel; unchanged files reuse their vectors.
+- **Semantic** (`? query`): brute-force cosine over f16 chunk embeddings,
+  scored in parallel from a read-only mmap; unchanged files reuse vectors.
 - **Calc** (`= expr`): evaluated synchronously; enter copies the result.
 - **Apps**: .app bundles are indexed and launch via `open` on macOS.
 - **Filter mode**: piped stdin lines run through fuzzy/regex and print the
@@ -142,8 +145,8 @@ Preview loading runs on a worker thread so large files never block the UI.
 - Unit tests live inside each module and cover the pure logic (parsing,
   ranking, cache format, exclude globs, color conversion).
 - `tests/engine_test.rs` runs the real engine headlessly against temp
-  directory trees — index build, all three search modes, cache reuse,
-  mtime ordering, invalid patterns.
+  directory trees — index build, filename/content/semantic search, cache
+  reuse, mtime ordering, invalid patterns.
 - `tests/cli_test.rs` executes the actual binary (`--version`, `--help`,
   `--config`, `--reindex`, `-p`) and asserts stdout/exit codes.
 - `tests/perf_test.rs` (ignored by default) asserts the 1M-path latency
