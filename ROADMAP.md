@@ -1,5 +1,10 @@
 # Roadmap
 
+Shipped in v0.7.0:
+
+- Stdin filter mode (`cmd | fsearch`) + ctrl-r history widget
+- App launching and `= expr` calculator
+
 Shipped in v0.6.0:
 
 - Rich result rows + density toggle, precision ranking with a

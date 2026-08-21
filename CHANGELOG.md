@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 — 2026-08-20
+
+- Filter mode: `git ls-files | fsearch` (or `… | fsearch --filter`)
+  fuzzy-filters piped stdin lines in the full TUI and prints the
+  selection — plus a ctrl-r shell-history widget in the zsh/bash
+  integration
+- App launching (macOS): /Applications bundles are indexed — type
+  `safari`, hit enter, Safari opens; `kind:app` narrows to apps and
+  `index_apps = false` opts out
+- `= 2*(3+4)` inline calculator; enter copies the result
+- Split the tui into focused modules
+- Fixed: a panicking PDF (exotic encodings) no longer wrecks the
+  terminal during content search, and extraction failures are cached
+  so broken PDFs are attempted once, not per keystroke
+- Fixed: semantic score bars sliced a UTF-8 char boundary and crashed
+
 ## 0.6.0 — 2026-08-19
 
 - Rich result rows: colored kind badges, bold filenames, dim parent
