@@ -5,8 +5,12 @@
 - DOCX and XLSX text extraction for content search, semantic indexing,
   snippets, and previews; extraction is bounded and cached
 - Semantic vectors now use f16 on disk and a read-only mmap at query time,
-  cutting store size roughly in half and avoiding a vector copy on load;
-  existing semantic indexes rebuild once
+  cutting store size roughly in half. The first `--index-semantic` run
+  migrates an existing store without re-embedding; run it again when you want
+  to add new or changed documents
+- Semantic indexing caps inference batches and samples across very large
+  documents, preventing giant PDFs and spreadsheets from creating multi-GB
+  model batches
 - Corrupt path and semantic stores are covered by deterministic mutation
   tests; CI now drives the real TUI through a PTY
 

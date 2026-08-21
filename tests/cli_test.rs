@@ -211,6 +211,51 @@ fn big_lists_largest_files_first() {
 }
 
 #[test]
+fn semantic_v1_migrates_without_loading_an_embedder() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let store_dir = cache.join("fsearch");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let store_path = store_dir.join("semantic.bin");
+
+    let mut bytes = Vec::from(*b"FSEM\x01\0\0\0");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    let path = b"/docs/legacy.md";
+    bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(path);
+    bytes.extend_from_slice(&7i64.to_le_bytes());
+    bytes.extend_from_slice(&20u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    for value in [1.0f32, 0.0, 0.0, 0.0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(&store_path, bytes).unwrap();
+
+    let out = fsearch(
+        &["--index-semantic"],
+        &[("XDG_CACHE_HOME", cache.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("migrated to f16"), "got: {stdout}");
+    assert!(stdout.contains("run fsearch --index-semantic again"));
+    assert_eq!(&std::fs::read(&store_path).unwrap()[..8], b"FSEM\x02\0\0\0");
+    assert!(
+        !fsearch::sem::SemStore::load(&store_path)
+            .unwrap()
+            .needs_migration()
+    );
+}
+
+#[test]
 fn semantic_index_and_query_with_fake_embedder() {
     let dir = tempfile::tempdir().unwrap();
     let tree = dir.path().join("tree");

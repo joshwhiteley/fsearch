@@ -320,6 +320,24 @@ fn edit_config() {
 /// in the file index is chunked and embedded, reusing vectors for files
 /// that haven't changed since the last run.
 fn index_semantic() {
+    let out_path = fsearch::sem::default_store_path();
+    let prior = fsearch::sem::SemStore::load(&out_path);
+    if let Some(legacy) = prior.as_ref().filter(|store| store.needs_migration()) {
+        let start = Instant::now();
+        if let Err(e) = legacy.save(&out_path) {
+            eprintln!("fsearch: migrating {}: {e}", out_path.display());
+            std::process::exit(1);
+        }
+        println!(
+            "semantic index migrated to f16: {} documents, {} chunks in {:.1}s",
+            legacy.docs.len(),
+            legacy.chunk_count(),
+            start.elapsed().as_secs_f32()
+        );
+        println!("run fsearch --index-semantic again to add new or changed documents");
+        return;
+    }
+
     let config = load_config();
     let store = load_index(&config);
     let mut embedder = match fsearch::sem::make_embedder() {
@@ -344,8 +362,6 @@ fn index_semantic() {
             )
         })
         .collect();
-    let out_path = fsearch::sem::default_store_path();
-    let prior = fsearch::sem::SemStore::load(&out_path);
     let pdf_cache = fsearch::pdf::default_cache_dir();
     let office_cache = fsearch::office::default_cache_dir();
     let start = Instant::now();

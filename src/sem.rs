@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const LEGACY_STORE_MAGIC: &[u8; 8] = b"FSEM\x01\0\0\0";
 const STORE_MAGIC: &[u8; 8] = b"FSEM\x02\0\0\0";
 const HEADER_BYTES: usize = 28;
 const MAX_DOCS: usize = 4_000_000;
@@ -22,6 +23,8 @@ const MAX_PATH_BYTES: usize = 1024 * 1024;
 
 pub const CHUNK_CHARS: usize = 1000;
 pub const CHUNK_OVERLAP: usize = 200;
+const MAX_CHUNKS_PER_DOC: usize = 256;
+const EMBED_BATCH_CHUNKS: usize = 64;
 
 /// Text-bearing extensions worth embedding (PDFs and Office files go through
 /// their extraction caches).
@@ -210,6 +213,28 @@ pub fn chunk_text(text: &str, target: usize, overlap: usize) -> Vec<Chunk> {
     chunks
 }
 
+/// Bound work for very large PDFs and spreadsheets while sampling across the
+/// whole document rather than indexing only its beginning.
+fn sample_chunks(chunks: Vec<Chunk>) -> Vec<Chunk> {
+    if chunks.len() <= MAX_CHUNKS_PER_DOC {
+        return chunks;
+    }
+    let last = chunks.len() - 1;
+    let mut sampled = Vec::with_capacity(MAX_CHUNKS_PER_DOC);
+    let mut target = 0usize;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        if index != target {
+            continue;
+        }
+        sampled.push(chunk);
+        if sampled.len() == MAX_CHUNKS_PER_DOC {
+            break;
+        }
+        target = sampled.len().saturating_mul(last) / (MAX_CHUNKS_PER_DOC - 1);
+    }
+    sampled
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocEntry {
     pub path: String,
@@ -219,12 +244,28 @@ pub struct DocEntry {
     pub chunk_count: u32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum VectorFormat {
+    F16,
+    F32,
+}
+
+impl VectorFormat {
+    fn bytes(self) -> usize {
+        match self {
+            Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
 enum VectorStorage {
     Owned(Vec<u16>),
     Mapped {
         mmap: Mmap,
         vector_offset: usize,
         vector_count: usize,
+        format: VectorFormat,
     },
 }
 
@@ -236,33 +277,74 @@ impl VectorStorage {
         }
     }
 
-    fn bits_at(&self, index: usize) -> Option<u16> {
+    fn f32_at(&self, index: usize) -> Option<f32> {
+        match self {
+            Self::Owned(bits) => bits
+                .get(index)
+                .copied()
+                .map(f16::from_bits)
+                .map(f16::to_f32),
+            Self::Mapped {
+                mmap,
+                vector_offset,
+                vector_count,
+                format,
+            } if index < *vector_count => {
+                let offset = vector_offset.checked_add(index.checked_mul(format.bytes())?)?;
+                let bytes = mmap.get(offset..offset.checked_add(format.bytes())?)?;
+                Some(match format {
+                    VectorFormat::F16 => {
+                        f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+                    }
+                    VectorFormat::F32 => f32::from_le_bytes(bytes.try_into().ok()?),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn f16_bits_at(&self, index: usize) -> Option<u16> {
         match self {
             Self::Owned(bits) => bits.get(index).copied(),
             Self::Mapped {
                 mmap,
                 vector_offset,
                 vector_count,
+                format,
             } if index < *vector_count => {
-                let offset = vector_offset.checked_add(index.checked_mul(2)?)?;
-                let bytes = mmap.get(offset..offset.checked_add(2)?)?;
-                Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+                let offset = vector_offset.checked_add(index.checked_mul(format.bytes())?)?;
+                let bytes = mmap.get(offset..offset.checked_add(format.bytes())?)?;
+                Some(match format {
+                    VectorFormat::F16 => u16::from_le_bytes([bytes[0], bytes[1]]),
+                    VectorFormat::F32 => {
+                        f16::from_f32(f32::from_le_bytes(bytes.try_into().ok()?)).to_bits()
+                    }
+                })
             }
             _ => None,
         }
     }
 
-    fn write_le<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    /// Always writes the current v2 representation, including when the source
+    /// mapping is a legacy f32 store being migrated.
+    fn write_f16_le<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        const BATCH_VALUES: usize = 16 * 1024;
         match self {
             Self::Owned(bits) => {
-                for bits in bits {
-                    writer.write_all(&bits.to_le_bytes())?;
+                let mut bytes = Vec::with_capacity(BATCH_VALUES * 2);
+                for batch in bits.chunks(BATCH_VALUES) {
+                    bytes.clear();
+                    for bits in batch {
+                        bytes.extend_from_slice(&bits.to_le_bytes());
+                    }
+                    writer.write_all(&bytes)?;
                 }
             }
             Self::Mapped {
                 mmap,
                 vector_offset,
                 vector_count,
+                format: VectorFormat::F16,
             } => {
                 let bytes = vector_count
                     .checked_mul(2)
@@ -276,13 +358,34 @@ impl VectorStorage {
                     })?;
                 writer.write_all(bytes)?;
             }
+            Self::Mapped {
+                vector_count,
+                format: VectorFormat::F32,
+                ..
+            } => {
+                let mut bytes = Vec::with_capacity(BATCH_VALUES * 2);
+                for start in (0..*vector_count).step_by(BATCH_VALUES) {
+                    bytes.clear();
+                    let end = start.saturating_add(BATCH_VALUES).min(*vector_count);
+                    for index in start..end {
+                        let bits = self.f16_bits_at(index).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid mapped semantic vector range",
+                            )
+                        })?;
+                        bytes.extend_from_slice(&bits.to_le_bytes());
+                    }
+                    writer.write_all(&bytes)?;
+                }
+            }
         }
         Ok(())
     }
 }
 
-/// The persisted semantic index. Builders own f16 bits; loaded stores retain a
-/// read-only mapping of the vector tail instead of allocating another copy.
+/// The persisted semantic index. Builders own v2 f16 bits; loaded stores
+/// retain a read-only mapping of either the v2 f16 or legacy v1 f32 tail.
 pub struct SemStore {
     pub dim: u32,
     pub docs: Vec<DocEntry>,
@@ -308,6 +411,16 @@ impl SemStore {
 
     pub fn chunk_count(&self) -> usize {
         self.chunk_lines.len()
+    }
+
+    pub fn needs_migration(&self) -> bool {
+        matches!(
+            &self.vectors,
+            VectorStorage::Mapped {
+                format: VectorFormat::F32,
+                ..
+            }
+        )
     }
 
     pub fn push_doc(&mut self, path: &str, mtime: i64, size: u64, chunks: &[(u32, Vec<f32>)]) {
@@ -354,7 +467,7 @@ impl SemStore {
             let source_chunk = entry.chunk_start as usize + c;
             let start = source_chunk * dim;
             for component in 0..dim {
-                vectors.push(prior.vectors.bits_at(start + component).unwrap());
+                vectors.push(prior.vectors.f16_bits_at(start + component).unwrap());
             }
         }
         self.docs.push(DocEntry {
@@ -370,7 +483,7 @@ impl SemStore {
         if let VectorStorage::Mapped { vector_count, .. } = &self.vectors {
             let mut bits = Vec::with_capacity(*vector_count);
             for i in 0..*vector_count {
-                if let Some(value) = self.vectors.bits_at(i) {
+                if let Some(value) = self.vectors.f16_bits_at(i) {
                     bits.push(value);
                 } else {
                     break;
@@ -384,8 +497,13 @@ impl SemStore {
         }
     }
 
+    fn vector_f32_at(&self, index: usize) -> Option<f32> {
+        self.vectors.f32_at(index)
+    }
+
+    #[cfg(test)]
     fn vector_bits_at(&self, index: usize) -> Option<u16> {
-        self.vectors.bits_at(index)
+        self.vectors.f16_bits_at(index)
     }
 
     /// Best-chunk-per-document cosine ranking, highest first. Each
@@ -410,7 +528,7 @@ impl SemStore {
                     let base = ci.checked_mul(dim)?;
                     let mut score = 0.0;
                     for (component, query) in qvec.iter().enumerate() {
-                        let value = f16::from_bits(self.vector_bits_at(base + component)?).to_f32();
+                        let value = self.vector_f32_at(base + component)?;
                         score += value * query;
                     }
                     if score.is_finite() && best.is_none_or(|(s, _)| score > s) {
@@ -453,7 +571,7 @@ impl SemStore {
             for line in &self.chunk_lines {
                 w.write_all(&line.to_le_bytes())?;
             }
-            self.vectors.write_le(&mut w)?;
+            self.vectors.write_f16_le(&mut w)?;
             w.flush()?;
         }
         std::fs::rename(&tmp, path)
@@ -527,12 +645,17 @@ impl SemStore {
         // writer publishes new stores with rename, so it never overwrites this
         // mapped inode in place.
         let mmap = unsafe { MmapOptions::new().map(&file).ok()? };
-        Self::from_mmap(mmap)
+        let format = match mmap.get(..8)? {
+            magic if magic == LEGACY_STORE_MAGIC => VectorFormat::F32,
+            magic if magic == STORE_MAGIC => VectorFormat::F16,
+            _ => return None,
+        };
+        Self::from_mmap(mmap, format)
     }
 
-    fn from_mmap(mmap: Mmap) -> Option<SemStore> {
+    fn from_mmap(mmap: Mmap, format: VectorFormat) -> Option<SemStore> {
         let data = &mmap[..];
-        if data.len() < HEADER_BYTES || data.get(..8)? != STORE_MAGIC {
+        if data.len() < HEADER_BYTES {
             return None;
         }
         let dim = u32::from_le_bytes(data.get(8..12)?.try_into().ok()?);
@@ -547,7 +670,7 @@ impl SemStore {
         }
         let lines_bytes = nchunks.checked_mul(4)?;
         let vector_count = nchunks.checked_mul(dim as usize)?;
-        let vectors_bytes = vector_count.checked_mul(2)?;
+        let vectors_bytes = vector_count.checked_mul(format.bytes())?;
         let tail_bytes = lines_bytes.checked_add(vectors_bytes)?;
         let docs_end = data.len().checked_sub(tail_bytes)?;
         if docs_end < HEADER_BYTES {
@@ -612,6 +735,7 @@ impl SemStore {
                 mmap,
                 vector_offset,
                 vector_count,
+                format,
             },
         })
     }
@@ -684,13 +808,17 @@ pub fn build(
             .iter()
             .flat_map(|(_, _, _, chunks)| chunks.iter().map(|c| c.text.clone()))
             .collect();
-        let all_vecs = embedder.embed(&all_texts)?;
-        if all_vecs.len() != all_texts.len()
-            || all_vecs
-                .iter()
-                .any(|vector| vector.len() != store.dim as usize)
-        {
-            return Err("embedder returned vectors with the wrong shape".to_string());
+        let mut all_vecs = Vec::with_capacity(all_texts.len());
+        for texts in all_texts.chunks(EMBED_BATCH_CHUNKS) {
+            let mut vectors = embedder.embed(texts)?;
+            if vectors.len() != texts.len()
+                || vectors
+                    .iter()
+                    .any(|vector| vector.len() != store.dim as usize)
+            {
+                return Err("embedder returned vectors with the wrong shape".to_string());
+            }
+            all_vecs.append(&mut vectors);
         }
         let mut vecs = all_vecs.into_iter();
         for (path, mtime, size, chunks) in pending.drain(..) {
@@ -719,7 +847,7 @@ pub fn build(
             stats.skipped += 1;
             continue;
         };
-        let chunks = chunk_text(&text, CHUNK_CHARS, CHUNK_OVERLAP);
+        let chunks = sample_chunks(chunk_text(&text, CHUNK_CHARS, CHUNK_OVERLAP));
         if chunks.is_empty() {
             stats.skipped += 1;
             continue;
@@ -738,6 +866,61 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NeverEmbed {
+        dim: usize,
+        calls: usize,
+    }
+
+    struct RecordingEmbed {
+        dim: usize,
+        calls: usize,
+        max_batch: usize,
+    }
+
+    impl Embedder for RecordingEmbed {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.calls += 1;
+            self.max_batch = self.max_batch.max(texts.len());
+            Ok(vec![vec![0.0; self.dim]; texts.len()])
+        }
+    }
+
+    impl Embedder for NeverEmbed {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.calls += 1;
+            panic!("legacy migration unexpectedly embedded a document");
+        }
+    }
+
+    fn write_v1_fixture(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LEGACY_STORE_MAGIC);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        let name = b"/docs/legacy.md";
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&7i64.to_le_bytes());
+        bytes.extend_from_slice(&20u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        for value in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
 
     #[test]
     fn chunking_covers_text_and_tracks_lines() {
@@ -789,6 +972,41 @@ mod tests {
     }
 
     #[test]
+    fn large_documents_are_sampled_and_embeddings_are_batched() {
+        let chunks = (0..1000)
+            .map(|line| Chunk {
+                text: format!("chunk {line}"),
+                line_start: line + 1,
+            })
+            .collect();
+        let sampled = sample_chunks(chunks);
+        assert_eq!(sampled.len(), MAX_CHUNKS_PER_DOC);
+        assert_eq!(sampled.first().unwrap().line_start, 1);
+        assert_eq!(sampled.last().unwrap().line_start, 1000);
+
+        let text = "semantic words ".repeat(8_000);
+        let expected = chunk_text(&text, CHUNK_CHARS, CHUNK_OVERLAP).len();
+        assert!(expected > EMBED_BATCH_CHUNKS && expected < MAX_CHUNKS_PER_DOC);
+        let mut embedder = RecordingEmbed {
+            dim: 8,
+            calls: 0,
+            max_batch: 0,
+        };
+        let mut read = |_: &str| Some(text.clone());
+        let (store, _) = build(
+            &[("/large.txt".to_string(), 1, text.len() as u64)],
+            None,
+            &mut embedder,
+            &mut read,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(store.chunk_count(), expected);
+        assert!(embedder.calls > 1);
+        assert!(embedder.max_batch <= EMBED_BATCH_CHUNKS);
+    }
+
+    #[test]
     fn hash_embedder_scores_shared_vocabulary_higher() {
         let mut e = HashEmbedder { dim: 64 };
         let vs = e
@@ -825,6 +1043,79 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(loaded.docs[hits[0].doc].path, "/docs/money.md");
         assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn legacy_v1_loads_reuses_and_migrates_to_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.bin");
+        write_v1_fixture(&legacy_path);
+        let legacy = SemStore::load(&legacy_path).unwrap();
+        assert!(legacy.needs_migration());
+        assert!(matches!(
+            &legacy.vectors,
+            VectorStorage::Mapped {
+                format: VectorFormat::F32,
+                ..
+            }
+        ));
+        let hit = legacy.query(&[0.0, 1.0, 0.0, 0.0], 1);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].line_start, 4);
+        assert!((hit[0].score - 1.0).abs() < f32::EPSILON);
+
+        let files = vec![("/docs/legacy.md".to_string(), 7, 20u64)];
+        let mut embedder = NeverEmbed { dim: 4, calls: 0 };
+        let mut reads = 0usize;
+        let mut read = |_: &str| -> Option<String> {
+            reads += 1;
+            panic!("legacy migration reread a document");
+        };
+        let (migrated, stats) = build(
+            &files,
+            Some(&legacy),
+            &mut embedder,
+            &mut read,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            stats,
+            BuildStats {
+                embedded: 0,
+                reused: 1,
+                skipped: 0
+            }
+        );
+        assert_eq!(embedder.calls, 0);
+        assert_eq!(reads, 0);
+        assert_eq!(
+            migrated.vector_bits_at(0),
+            Some(f16::from_f32(1.0).to_bits())
+        );
+        assert_eq!(
+            migrated.vector_bits_at(5),
+            Some(f16::from_f32(1.0).to_bits())
+        );
+
+        let direct_v2_path = dir.path().join("direct-migrated.bin");
+        legacy.save(&direct_v2_path).unwrap();
+        assert_eq!(&std::fs::read(&direct_v2_path).unwrap()[..8], STORE_MAGIC);
+
+        let v2_path = dir.path().join("migrated.bin");
+        migrated.save(&v2_path).unwrap();
+        let saved = std::fs::read(&v2_path).unwrap();
+        assert_eq!(&saved[..8], STORE_MAGIC);
+        let v2 = SemStore::load(&v2_path).unwrap();
+        assert!(!v2.needs_migration());
+        assert!(matches!(
+            &v2.vectors,
+            VectorStorage::Mapped {
+                format: VectorFormat::F16,
+                ..
+            }
+        ));
+        assert_eq!(v2.query(&[0.0, 1.0, 0.0, 0.0], 1)[0].line_start, 4);
     }
 
     #[test]
@@ -894,7 +1185,7 @@ mod tests {
         store.push_doc("/a", 1, 2, &[(1, vec![1.0, 0.0])]);
         store.save(&file).unwrap();
         let mut bytes = std::fs::read(&file).unwrap();
-        // v1 must rebuild rather than be interpreted as f16 data.
+        // A v1 header with a v2-width vector tail must be rejected.
         bytes[4] = 1;
         std::fs::write(&file, &bytes).unwrap();
         assert!(SemStore::load(&file).is_none());

@@ -85,10 +85,10 @@ there's an unfixable race between "walk finished" and "stream started".
 **Frecency lives beside the index, not in it.** Opens append to a small
 history file; at search time they become per-path score boosts.
 
-**Semantic vectors are f16 and memory-mapped.** Index builds quantize each
-embedding once. Loads parse document metadata but map the vector tail
-read-only, avoiding a large allocation and copy. Store format changes are
-safe because the semantic index is rebuildable.
+**Semantic vectors are f16 and memory-mapped.** Loads parse document metadata
+but map the vector tail read-only. Legacy f32 stores migrate without
+re-embedding. Embedding calls are capped at 64 chunks, and very large
+documents are sampled across at most 256 chunks.
 
 **The terminal is probed once, before raw mode.** Background color (for
 light/dark preview themes) and the graphics protocol (Kitty/iTerm2/halfblock

@@ -167,7 +167,11 @@ fsearch --index-semantic   # one-time; re-runs embed only changed files
 The ~90 MB model downloads on the first index. Markdown, text, HTML,
 LaTeX, PDF, DOCX and XLSX files are indexed. Vectors are stored as f16 and
 memory-mapped on load, so the semantic store uses roughly half the previous
-disk and memory footprint. Queries still answer in milliseconds.
+disk and memory footprint. The first `--index-semantic` run migrates an
+existing store without re-embedding; run it again later to add new or changed
+documents. Very large documents are sampled across their full text to keep
+indexing bounded.
+Queries still answer in milliseconds.
 
 ## How it works
 
