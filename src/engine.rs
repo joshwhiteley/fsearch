@@ -217,11 +217,6 @@ fn watch_loop(
         let mut fronts: Vec<(String, FileMeta)> = Vec::new();
         let mut gone: std::collections::HashSet<String> = HashSet::new();
         let mut gone_dir_prefixes: Vec<String> = Vec::new();
-        // A create often reports both the new file and its parent directory.
-        // Process direct file events first so a directory rewalk cannot put an
-        // older, same-second file ahead of the one that triggered the event.
-        let mut touched: Vec<_> = touched.into_iter().collect();
-        touched.sort_unstable_by_key(|path| !path.is_file());
         let push_front = |fronts: &mut Vec<(String, FileMeta)>,
                           gone: &mut HashSet<String>,
                           entry: (String, FileMeta)| {

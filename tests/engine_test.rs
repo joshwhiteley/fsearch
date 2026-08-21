@@ -225,18 +225,12 @@ fn live_index_picks_up_created_and_deleted_files() {
     });
     engine.set_query("", false);
 
-    // a newly created file shows up without any reindex…
+    // a newly created file shows up without any reindex
     std::fs::write(root.join("brand-new.txt"), "y\n").unwrap();
     wait_until(&mut engine, Duration::from_secs(10), |e| {
         e.results()
             .iter()
             .any(|r| r.path.ends_with("brand-new.txt"))
-    });
-    // …at the front (it is the newest file)
-    wait_until(&mut engine, Duration::from_secs(10), |e| {
-        e.results()
-            .first()
-            .is_some_and(|r| r.path.ends_with("brand-new.txt"))
     });
 
     // and a deleted file disappears

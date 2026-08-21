@@ -9,8 +9,6 @@
   existing semantic indexes rebuild once
 - Corrupt path and semantic stores are covered by deterministic mutation
   tests; CI now drives the real TUI through a PTY
-- Fixed live-index bursts that could rank an older, same-second file ahead
-  of the newly created file
 
 ## 0.8.0 — 2026-08-21
 
