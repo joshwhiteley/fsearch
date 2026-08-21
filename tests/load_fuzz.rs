@@ -113,7 +113,11 @@ fn path_index_loader_rejects_mutated_bytes_without_panicking() {
     .unwrap();
     let valid = std::fs::read(valid_path).unwrap();
     exercise(&valid, &dir.path().join("mutated-index.bin"), |path| {
-        let _ = fsearch::index::load(path);
+        if let Some(store) = fsearch::index::load(path) {
+            for i in 0..store.len() {
+                let _ = (store.get(i), store.meta(i));
+            }
+        }
     });
 }
 
@@ -126,6 +130,9 @@ fn semantic_loader_rejects_mutated_bytes_without_panicking() {
     store.save(&valid_path).unwrap();
     let valid = std::fs::read(valid_path).unwrap();
     exercise(&valid, &dir.path().join("mutated-semantic.bin"), |path| {
-        let _ = SemStore::load(path);
+        if let Some(store) = SemStore::load(path) {
+            let query = vec![0.0; store.dim as usize];
+            let _ = store.query(&query, 8);
+        }
     });
 }
