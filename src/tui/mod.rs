@@ -408,13 +408,21 @@ impl App {
             crate::keymap::Action::Quit => return false,
             crate::keymap::Action::Open => return self.activate_selected(),
             crate::keymap::Action::Menu => {
-                if !self.engine.results().is_empty() {
+                if !self.engine.is_filter() && !self.engine.results().is_empty() {
                     self.menu = Some(0);
                 }
             }
-            crate::keymap::Action::QuickLook => self.act(actions::quick_look, "quick look"),
+            crate::keymap::Action::QuickLook => {
+                if !self.engine.is_filter() {
+                    self.act(actions::quick_look, "quick look");
+                }
+            }
             crate::keymap::Action::CopyPath => self.act(actions::copy, "copied"),
-            crate::keymap::Action::Reveal => self.act(actions::reveal, "revealed"),
+            crate::keymap::Action::Reveal => {
+                if !self.engine.is_filter() {
+                    self.act(actions::reveal, "revealed");
+                }
+            }
             crate::keymap::Action::ClearQuery => {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -807,6 +815,11 @@ pub fn run(
     app.picker = picker;
     app.ui_mode = ui_mode;
     app.theme = theme;
+    if app.engine.is_filter() {
+        // filter rows are arbitrary lines, not real files: start with the
+        // preview hidden (Tab still cycles, previews of real files work)
+        app.preview_layout = PreviewLayout::Hidden;
+    }
     let queries_path = crate::frecency::default_queries_path();
     app.history = crate::frecency::load_queries(&queries_path);
     app.history_file = Some(queries_path);

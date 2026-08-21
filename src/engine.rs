@@ -142,6 +142,7 @@ pub struct Engine {
     sem_tx: Option<Sender<SemJob>>,
     frecency: Frecency,
     boosts: Arc<HashMap<String, u32>>,
+    filter: bool,
 }
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -284,6 +285,40 @@ fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The single filename search worker: always process only the newest job.
+fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
+    let worker_tx = tx;
+    std::thread::spawn(move || {
+        while let Ok(mut job) = job_rx.recv() {
+            while let Ok(newer) = job_rx.try_recv() {
+                job = newer;
+            }
+            let (indices, strong, error) = match matcher::search_boosted(
+                &job.store,
+                &job.query,
+                job.mode,
+                FILENAME_LIMIT,
+                &job.boosts,
+                &job.filters,
+            ) {
+                Ok(r) => (r.indices, r.strong, None),
+                Err(e) => (Vec::new(), 0, Some(format!("invalid pattern: {e}"))),
+            };
+            if worker_tx
+                .send(Msg::FilenameResults {
+                    generation: job.generation,
+                    indices,
+                    strong,
+                    error,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+}
+
 impl Engine {
     pub fn new(config: Config, cache_path: PathBuf, history_path: PathBuf) -> Engine {
         let pdf_cache = cache_path
@@ -294,36 +329,7 @@ impl Engine {
         let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
 
         // filename search worker: always process only the newest job
-        let worker_tx = msg_tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(mut job) = job_rx.recv() {
-                while let Ok(newer) = job_rx.try_recv() {
-                    job = newer;
-                }
-                let (indices, strong, error) = match matcher::search_boosted(
-                    &job.store,
-                    &job.query,
-                    job.mode,
-                    FILENAME_LIMIT,
-                    &job.boosts,
-                    &job.filters,
-                ) {
-                    Ok(r) => (r.indices, r.strong, None),
-                    Err(e) => (Vec::new(), 0, Some(format!("invalid pattern: {e}"))),
-                };
-                if worker_tx
-                    .send(Msg::FilenameResults {
-                        generation: job.generation,
-                        indices,
-                        strong,
-                        error,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
+        spawn_search_worker(job_rx, msg_tx.clone());
 
         // indexer: cached paths first, then a fresh walk, then save
         let indexer_tx = msg_tx.clone();
@@ -410,7 +416,63 @@ impl Engine {
             sem_tx: None,
             frecency,
             boosts,
+            filter: false,
         }
+    }
+
+    /// A filter-mode engine over arbitrary stdin lines: same matcher, no
+    /// indexer, watcher, content or semantic machinery.
+    pub fn from_lines(lines: Vec<String>) -> Engine {
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+        let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
+        spawn_search_worker(job_rx, msg_tx.clone());
+        // entries in INPUT order (no recency sort): each line is a "path"
+        let entries: Vec<(String, FileMeta)> = lines
+            .into_iter()
+            .map(|l| (l, FileMeta::default()))
+            .collect();
+        let store = Arc::new(PathStore::from_entries(&entries));
+        // publish the store so the first tick populates results immediately
+        let _ = msg_tx.send(Msg::IndexSnapshot {
+            store: store.clone(),
+            indexing: false,
+        });
+        // no history for filter mode: an empty boost map, never persisted
+        // (record_open is never called here)
+        let frecency = Frecency::load(std::path::PathBuf::from(
+            "/nonexistent-fsearch-filter-history",
+        ));
+        let boosts = Arc::new(frecency.boosts(unix_now()));
+        Engine {
+            msg_rx,
+            msg_tx,
+            job_tx,
+            store,
+            results: Vec::new(),
+            status: EngineStatus {
+                indexing: false,
+                ..Default::default()
+            },
+            mode: Mode::Fuzzy,
+            generation: 0,
+            query: String::new(),
+            strong: 0,
+            max_content_filesize: 0,
+            pdf_cache: PathBuf::new(),
+            filters: Filters::default(),
+            pending_content: None,
+            content_cancel: None,
+            pending_semantic: None,
+            sem_tx: None,
+            frecency,
+            boosts,
+            filter: true,
+        }
+    }
+
+    /// True when the engine filters piped stdin lines (`--filter`).
+    pub fn is_filter(&self) -> bool {
+        self.filter
     }
 
     /// Records that `path` was opened, boosting it in future rankings.
@@ -420,6 +482,26 @@ impl Engine {
     }
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
+        if self.filter {
+            // filter mode: no `>`/`?`/prefix parsing — those are ordinary
+            // text; only the regex toggle and the ext:/path: filters apply
+            let mode = if regex_mode { Mode::Regex } else { Mode::Fuzzy };
+            let (query_filters, pattern) = filters::parse(input, unix_now());
+            let query = if query_filters.is_empty() {
+                input.to_string()
+            } else {
+                pattern
+            };
+            self.filters = query_filters;
+            self.generation += 1;
+            self.mode = mode;
+            self.query = query.clone();
+            self.status.error = None;
+            self.pending_content = None;
+            self.pending_semantic = None;
+            self.dispatch_filename();
+            return;
+        }
         let (mode, query) = parse_query(input, regex_mode);
         let (query_filters, pattern) = filters::parse(&query, unix_now());
         // rejoin preserves regex/content patterns without filter tokens
@@ -861,5 +943,69 @@ mod tests {
         );
         // out-of-range line yields None
         assert_eq!(snippet_line(p, 99, cache), None);
+    }
+
+    fn wait_for(engine: &mut Engine, pred: impl Fn(&Engine) -> bool) {
+        for _ in 0..200 {
+            engine.tick();
+            if pred(engine) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn from_lines_keeps_input_order_for_empty_query() {
+        let lines = vec![
+            "git commit -m fix/thing".to_string(),
+            "cargo build --release".to_string(),
+            "alpha beta".to_string(),
+        ];
+        let mut engine = Engine::from_lines(lines);
+        assert!(engine.is_filter());
+        wait_for(&mut engine, |e| e.results().len() >= 3);
+        let paths: Vec<&str> = engine.results().iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "git commit -m fix/thing",
+                "cargo build --release",
+                "alpha beta"
+            ]
+        );
+    }
+
+    #[test]
+    fn from_lines_fuzzy_query_narrows_and_ranks() {
+        let lines = vec![
+            "cargo build".to_string(),
+            "cargo test".to_string(),
+            "git commit fix".to_string(),
+            "alpha".to_string(),
+        ];
+        let mut engine = Engine::from_lines(lines);
+        wait_for(&mut engine, |e| e.results().len() >= 4);
+        engine.set_query("cargo", false);
+        // wait until the new-generation fuzzy results replace the empty-query
+        // snapshot (all remaining matches mention cargo)
+        wait_for(&mut engine, |e| {
+            !e.results().is_empty() && e.results().iter().all(|r| r.path.contains("cargo"))
+        });
+        let paths: Vec<&str> = engine.results().iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["cargo build", "cargo test"]);
+        assert!(!paths.contains(&"alpha"));
+        assert!(!paths.contains(&"git commit fix"));
+    }
+
+    #[test]
+    fn filter_mode_skips_prefix_parsing() {
+        let mut engine = Engine::from_lines(vec!["hello".to_string()]);
+        // a leading `>` is ordinary text, not content mode
+        engine.set_query("> x", false);
+        assert_eq!(engine.mode(), Mode::Fuzzy);
+        // the regex toggle still works
+        engine.set_query("? y", true);
+        assert_eq!(engine.mode(), Mode::Regex);
     }
 }

@@ -9,6 +9,9 @@ homepage = "https://github.com/joshwhiteley/fsearch"
 
 [dependencies]
 anyhow = "1"
+# same crossterm ratatui uses; the use-dev-tty feature makes events read
+# from /dev/tty so `cmd | fsearch --filter` gets a working interactive UI
+crossterm = { version = "0.29", features = ["use-dev-tty", "events"] }
 dirs = "6"
 fastembed = { version = "5.17.4", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
 globset = "0.4"
