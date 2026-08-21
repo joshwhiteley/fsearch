@@ -1,6 +1,6 @@
 # Demo recording for the README. Regenerate with:
-#   vhs demo.tape
-# (expects the demo tree + env described in the tape to exist; see repo docs)
+#   ./docs/demo-setup.sh && vhs demo.tape
+# (the setup script builds /tmp/fsearch-demo and pre-indexes it)
 Output demo.gif
 
 Set FontSize 18
@@ -9,9 +9,9 @@ Set Height 800
 Set TypingSpeed 90ms
 Set Padding 12
 
-Env HOME "/private/tmp/claude-501/-Users-josh-file-search/bc474d2a-dc9c-497e-9bd8-7c38ff2e664e/scratchpad/demo/home"
-Env XDG_CONFIG_HOME "/private/tmp/claude-501/-Users-josh-file-search/bc474d2a-dc9c-497e-9bd8-7c38ff2e664e/scratchpad/demo/xdg"
-Env XDG_CACHE_HOME "/private/tmp/claude-501/-Users-josh-file-search/bc474d2a-dc9c-497e-9bd8-7c38ff2e664e/scratchpad/demo/cache"
+Env HOME "/tmp/fsearch-demo/home"
+Env XDG_CONFIG_HOME "/tmp/fsearch-demo/xdg"
+Env XDG_CACHE_HOME "/tmp/fsearch-demo/cache"
 # vhs's recorder answers capability queries but renders none of the
 # graphics protocols; halfblock cells record faithfully
 Env FSEARCH_IMAGES "halfblocks"
@@ -21,7 +21,7 @@ Type "fsearch" Enter
 Sleep 2s
 Show
 
-# fuzzy filename search with match highlighting
+# fuzzy filename search — rich rows, badges, match highlighting
 Type "invoice"
 Sleep 2.5s
 
@@ -37,11 +37,17 @@ Sleep 500ms
 Type "logo"
 Sleep 3s
 
-# regex search inside file contents
+# regex search inside file contents — matched line under each hit
 Ctrl+U
 Sleep 500ms
 Type "> overdue"
 Sleep 3.5s
+
+# inline calculator
+Ctrl+U
+Sleep 500ms
+Type "= 4200*2 + 11850"
+Sleep 2.5s
 
 Escape
 Sleep 1s
