@@ -9,6 +9,7 @@ pub enum Command {
     Doctor,
     Print(String),
     Pick(String),
+    Filter(String),
     Big(usize),
     Unknown(String),
 }
@@ -29,6 +30,7 @@ usage:
                        searches file contents
   fsearch --pick [Q]   interactive ui, but enter prints the selection to
                        stdout instead of opening it (for scripts/pipes)
+  fsearch --filter [Q] fuzzy-filter stdin lines and print the selection
   fsearch --doctor     print what the terminal probe detected
   fsearch --help       show this help
   fsearch --version    print the version
@@ -96,6 +98,11 @@ pub fn parse(args: &[String]) -> Command {
         && first == "--pick"
     {
         return Command::Pick(args[1..].join(" "));
+    }
+    if let Some(first) = args.first()
+        && first == "--filter"
+    {
+        return Command::Filter(args[1..].join(" "));
     }
     if let Some(first) = args.first()
         && first == "--big"
@@ -190,6 +197,15 @@ mod tests {
         assert_eq!(
             parse_strs(&["--pick", "dir:"]),
             Command::Pick("dir:".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_takes_an_optional_initial_query() {
+        assert_eq!(parse_strs(&["--filter"]), Command::Filter(String::new()));
+        assert_eq!(
+            parse_strs(&["--filter", "dir:"]),
+            Command::Filter("dir:".to_string())
         );
     }
 

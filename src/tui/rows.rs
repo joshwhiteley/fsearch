@@ -186,6 +186,21 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .take(app.visible_len())
         .map(|r| {
+            if app.engine.is_filter() {
+                // filter mode: one plain line per row — the raw line text
+                // with fuzzy-match highlights; no home shortening, badge,
+                // name/parent split, or size/age columns
+                let positions: Vec<u32> = match highlighter.as_mut() {
+                    Some(hl) => hl.positions(&r.path),
+                    None => Vec::new(),
+                };
+                return ListItem::new(Line::from(spans_with_styles(
+                    &r.path,
+                    &positions,
+                    Style::default(),
+                    accent,
+                )));
+            }
             let (shown, trimmed_chars) = match &home {
                 Some(h) if r.path.starts_with(h.as_str()) => {
                     (format!("~{}", &r.path[h.len()..]), h.chars().count())
@@ -370,10 +385,15 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut display_selected = app.selected;
     // slot map mirrors the final display list 1:1 for mouse hit testing:
     // result rows are 2 lines in Comfy density, 1 in Compact (content rows
-    // are 2 lines in comfy too); headers and the fold row are 1 line each.
-    let row_height: u16 = match app.density {
-        Density::Comfy => 2,
-        Density::Compact => 1,
+    // are 2 lines in comfy too); filter rows are always 1 line. headers and
+    // the fold row are 1 line each.
+    let row_height: u16 = if app.engine.is_filter() {
+        1
+    } else {
+        match app.density {
+            Density::Comfy => 2,
+            Density::Compact => 1,
+        }
     };
     let mut slots: Vec<(Slot, u16)> = (0..visible).map(|i| (Slot::Row(i), row_height)).collect();
     if sectioned {

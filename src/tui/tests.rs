@@ -25,6 +25,29 @@ fn test_app() -> App {
     App::new(engine)
 }
 
+fn test_filter_app() -> App {
+    let mut app = App::new(Engine::from_lines(vec![
+        "git commit -m fix/thing".into(),
+        "cargo build --release".into(),
+        "alpha beta".into(),
+    ]));
+    app.ui_mode = UiMode::Pick;
+    app.preview_layout = PreviewLayout::Hidden;
+    app
+}
+
+/// Ticks the engine until `pred` holds or we time out, so filter tests can
+/// wait for the background filename worker to populate results.
+fn tick_until(app: &mut App, pred: impl Fn(&App) -> bool) {
+    for _ in 0..200 {
+        app.engine.tick();
+        if pred(app) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
     terminal
         .backend()
@@ -254,6 +277,36 @@ fn comfy_rows_render_name_badge_size_and_parent() {
     assert!(text.contains("MD"), "badge missing");
     assert!(text.contains("2.0 KB"), "size missing");
     assert!(text.contains("/a/b"), "parent missing");
+}
+
+#[test]
+fn filter_rows_render_raw_lines_verbatim() {
+    let mut app = test_filter_app();
+    tick_until(&mut app, |a| a.engine.results().len() >= 3);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    // the full raw line appears; no badge/name split split out an extension
+    assert!(text.contains("git commit -m fix/thing"));
+    assert!(text.contains("cargo build --release"));
+    assert!(!text.contains("THING"), "line was split by a badge");
+}
+
+#[test]
+fn filter_mode_right_does_not_open_menu() {
+    let mut app = test_filter_app();
+    app.input = "x".to_string();
+    app.input_cursor = app.input.len(); // cursor at end: Right = Menu action
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(app.menu, None, "menu must not open in filter mode");
+}
+
+#[test]
+fn filter_input_title_says_filter() {
+    let mut app = test_filter_app();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("fsearch [filter]"));
 }
 
 #[test]

@@ -171,11 +171,15 @@ pub(super) fn query_spans(input: &str, accent: Color) -> Vec<Span<'static>> {
 }
 
 pub(super) fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    let mode = match (app.engine.mode(), app.regex_mode) {
-        (Mode::Content, _) => "content",
-        (Mode::Semantic, _) => "semantic",
-        (_, true) => "regex",
-        _ => "fuzzy",
+    let mode = if app.engine.is_filter() {
+        if app.regex_mode { "regex" } else { "filter" }
+    } else {
+        match (app.engine.mode(), app.regex_mode) {
+            (Mode::Content, _) => "content",
+            (Mode::Semantic, _) => "semantic",
+            (_, true) => "regex",
+            _ => "fuzzy",
+        }
     };
     let block = themed_block(&format!("fsearch [{mode}]"), &app.theme);
     // the cursor sits in the block's inner rect, so borderless mode (which

@@ -1,5 +1,6 @@
 use fsearch::cli::{self, Command};
 use fsearch::{config, engine::Engine, index, tui, walker};
+use std::io::{BufRead, IsTerminal};
 use std::time::Instant;
 
 fn main() {
@@ -13,7 +14,14 @@ fn main() {
         default_hook(info);
     }));
     match cli::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        Command::Run => run_ui(tui::UiMode::Open, ""),
+        Command::Run => {
+            if !std::io::stdin().is_terminal() {
+                // piped stdin: drop into filter mode automatically
+                run_filter("")
+            } else {
+                run_ui(tui::UiMode::Open, "")
+            }
+        }
         Command::Help => print!("{}", cli::HELP),
         Command::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Command::Config => edit_config(),
@@ -22,6 +30,7 @@ fn main() {
         Command::Doctor => doctor(),
         Command::Print(query) => print_search(&query),
         Command::Pick(initial) => run_ui(tui::UiMode::Pick, &initial),
+        Command::Filter(initial) => run_filter(&initial),
         Command::Big(n) => biggest(n),
         Command::Unknown(arg) => {
             eprintln!("fsearch: unexpected argument {arg:?}\n");
@@ -211,6 +220,45 @@ fn print_search(query: &str) {
     };
     if !matched {
         std::process::exit(1);
+    }
+}
+
+/// Piped-stdin filter mode: launch the pick UI over arbitrary lines and
+/// print the chosen line to stdout (exit 1 when nothing is chosen).
+fn run_filter(initial_query: &str) {
+    if std::io::stdin().is_terminal() {
+        eprintln!(
+            "fsearch: --filter reads lines from stdin (try: git ls-files | fsearch --filter)"
+        );
+        std::process::exit(2);
+    }
+    let lines: Vec<String> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .take(500_000)
+        .collect();
+    let config = load_config();
+    // build the keymap and mouse flag before the engine consumes the config
+    let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
+    let mouse = config.mouse;
+    let theme = fsearch::theme::resolve_config(&config.theme);
+    let engine = Engine::from_lines(lines);
+    match tui::run(
+        engine,
+        tui::UiMode::Pick,
+        initial_query,
+        theme,
+        keymap,
+        mouse,
+    ) {
+        Ok(Some(picked)) => println!("{picked}"),
+        Ok(None) => std::process::exit(1), // nothing chosen: signal like grep
+        Err(e) => {
+            eprintln!("fsearch: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
