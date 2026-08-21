@@ -105,6 +105,9 @@ struct SemJob {
 fn snippet_line(path: &str, line: u64, pdf_cache: &std::path::Path) -> Option<String> {
     let text = if crate::pdf::is_pdf_path(path) {
         crate::pdf::extract_cached(path, pdf_cache).ok()
+    } else if crate::office::is_office_path(path) {
+        let office_cache = crate::office::cache_dir_for(pdf_cache);
+        crate::office::extract_cached(path, &office_cache).ok()
     } else {
         std::fs::read_to_string(path).ok()
     }?;

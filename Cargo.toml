@@ -22,6 +22,7 @@ image = "0.25"
 notify = "8"
 nucleo-matcher = "0.3"
 pdf-extract = "0.12.0"
+quick-xml = "0.41"
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["image-defaults", "crossterm"] }
 rayon = "1"
@@ -32,6 +33,7 @@ syntect = "5"
 terminal-colorsaurus = "1"
 toml = "1"
 two-face = "0.5"
+zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [features]
 # Sharper cell-art image previews for terminals without a graphics protocol.

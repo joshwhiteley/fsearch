@@ -4,11 +4,11 @@ use std::io::{BufRead, IsTerminal};
 use std::time::Instant;
 
 fn main() {
-    // pdf-extract panics on exotic PDFs; those panics are caught at the
-    // call site — keep the default hook from printing them as crashes
+    // The PDF and Office parsers are panic-guarded at their call sites; keep
+    // the default hook from printing contained parser failures as crashes
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if fsearch::pdf::in_extract_guard() {
+        if fsearch::pdf::in_extract_guard() || fsearch::office::in_extract_guard() {
             return;
         }
         default_hook(info);
@@ -347,10 +347,13 @@ fn index_semantic() {
     let out_path = fsearch::sem::default_store_path();
     let prior = fsearch::sem::SemStore::load(&out_path);
     let pdf_cache = fsearch::pdf::default_cache_dir();
+    let office_cache = fsearch::office::default_cache_dir();
     let start = Instant::now();
     let mut read = |path: &str| -> Option<String> {
-        if path.to_ascii_lowercase().ends_with(".pdf") {
+        if fsearch::pdf::is_pdf_path(path) {
             fsearch::pdf::extract_cached(path, &pdf_cache).ok()
+        } else if fsearch::office::is_office_path(path) {
+            fsearch::office::extract_cached(path, &office_cache).ok()
         } else {
             std::fs::read_to_string(path).ok()
         }

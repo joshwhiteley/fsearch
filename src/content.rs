@@ -1,4 +1,4 @@
-use crate::pdf;
+use crate::{office, pdf};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
@@ -31,14 +31,16 @@ pub fn search<'a>(
         .build(pattern)
         .map_err(|e| e.to_string())?;
 
+    let office_cache = office::cache_dir_for(pdf_cache);
     indices.par_iter().for_each(|&i| {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
         let path = resolve(i);
         let is_pdf = pdf::is_pdf_path(path);
+        let is_office = office::is_office_path(path);
         match std::fs::metadata(path) {
-            Ok(m) if m.is_file() && (is_pdf || m.len() <= max_filesize) => {}
+            Ok(m) if m.is_file() && (is_pdf || is_office || m.len() <= max_filesize) => {}
             _ => return,
         }
         let mut searcher = SearcherBuilder::new()
@@ -68,6 +70,12 @@ pub fn search<'a>(
                 return;
             };
             let _ = searcher.search_slice(&matcher, text.as_bytes(), UTF8(&mut on_line));
+        } else if is_office {
+            // DOCX/XLSX are ZIP containers, so search their cached XML text.
+            let Ok(text) = office::extract_cached(path, &office_cache) else {
+                return;
+            };
+            let _ = searcher.search_slice(&matcher, text.as_bytes(), UTF8(&mut on_line));
         } else {
             let _ = searcher.search_path(&matcher, path, UTF8(&mut on_line));
         }
@@ -78,8 +86,11 @@ pub fn search<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     fn run(
         dir: &std::path::Path,
@@ -170,6 +181,40 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("doc.pdf"));
         assert!(hits[0].line.contains("Needle"));
+    }
+
+    #[test]
+    fn office_text_is_searched() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("word/document.xml", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            br#"<w:document xmlns:w="x"><w:body><w:p><w:t>annual Needle report</w:t></w:p></w:body></w:document>"#,
+        )
+        .unwrap();
+        let docx = zip.finish().unwrap().into_inner();
+        let mut xlsx = ZipWriter::new(Cursor::new(Vec::new()));
+        xlsx.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+            .unwrap();
+        xlsx.write_all(
+            br#"<worksheet xmlns="x"><sheetData><row><c t="inlineStr"><is><t>Needle in cells</t></is></c></row></sheetData></worksheet>"#,
+        )
+        .unwrap();
+        let xlsx = xlsx.finish().unwrap().into_inner();
+        let dir = tempfile::tempdir().unwrap();
+        let hits = run(
+            dir.path(),
+            &[
+                ("doc.docx", docx.as_slice()),
+                ("sheet.xlsx", xlsx.as_slice()),
+            ],
+            "needle",
+            1,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.line_number == 1));
+        assert!(hits.iter().all(|hit| hit.line.contains("Needle")));
     }
 
     #[test]

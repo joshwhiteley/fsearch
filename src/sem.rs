@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 pub const CHUNK_CHARS: usize = 1000;
 pub const CHUNK_OVERLAP: usize = 200;
 
-/// Text-bearing extensions worth embedding (PDFs go through the existing
-/// extraction cache).
+/// Text-bearing extensions worth embedding (PDFs and Office files go through
+/// their extraction caches).
 pub const SEMANTIC_EXTS: &[&str] = &[
-    "md", "txt", "org", "rst", "tex", "html", "htm", "markdown", "pdf",
+    "md", "txt", "org", "rst", "tex", "html", "htm", "markdown", "pdf", "docx", "xlsx",
 ];
 
 pub fn is_semantic_path(path: &str) -> bool {
@@ -593,6 +593,8 @@ mod tests {
     fn semantic_paths_recognized() {
         assert!(is_semantic_path("/a/notes.md"));
         assert!(is_semantic_path("/a/paper.PDF"));
+        assert!(is_semantic_path("/a/report.DOCX"));
+        assert!(is_semantic_path("/a/budget.xlsx"));
         assert!(!is_semantic_path("/a/binary.dat"));
         assert!(!is_semantic_path("/a/code.rs"));
     }

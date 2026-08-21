@@ -12,6 +12,7 @@ pub mod images;
 pub mod index;
 pub mod keymap;
 pub mod matcher;
+pub mod office;
 pub mod pdf;
 pub mod quiet;
 pub mod sem;

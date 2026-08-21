@@ -73,6 +73,36 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
             Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(pdf: {e})"))]),
         };
     }
+    if crate::office::is_office_path(&req.path) {
+        return match crate::office::extract_cached(&req.path, &crate::office::default_cache_dir()) {
+            Ok(text) => match req.line_number {
+                Some(n) => {
+                    let start = (n as usize).saturating_sub(6);
+                    let gutter = Style::default().fg(req.gutter);
+                    PreviewPayload::Lines(
+                        text.lines()
+                            .enumerate()
+                            .skip(start)
+                            .take(40)
+                            .map(|(i, line)| {
+                                Line::from(vec![
+                                    Span::styled(format!("{:>5} ", i + 1), gutter),
+                                    Span::raw(line.to_string()),
+                                ])
+                            })
+                            .collect(),
+                    )
+                }
+                None => PreviewPayload::Lines(
+                    text.lines()
+                        .take(100)
+                        .map(|line| Line::from(line.to_string()))
+                        .collect(),
+                ),
+            },
+            Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(office: {e})"))]),
+        };
+    }
     if images::is_image_path(&req.path) {
         return match images::load(&req.path, images::MAX_IMAGE_BYTES) {
             Ok(img) => PreviewPayload::Image(img),
@@ -299,5 +329,43 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             frame.render_widget(Paragraph::new(lines.clone()), body);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn office_text_is_available_to_preview() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("word/document.xml", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            br#"<w:document xmlns:w="x"><w:body><w:p><w:t>Preview Needle</w:t></w:p></w:body></w:document>"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.docx");
+        std::fs::write(&path, zip.finish().unwrap().into_inner()).unwrap();
+        let payload = preview_payload(&PreviewRequest {
+            generation: 0,
+            path: path.to_string_lossy().into_owned(),
+            line_number: None,
+            appearance: Appearance::Dark,
+            gutter: Color::Gray,
+        });
+        let PreviewPayload::Lines(lines) = payload else {
+            panic!("office preview should be text");
+        };
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.contains("Preview Needle"))
+        );
     }
 }
