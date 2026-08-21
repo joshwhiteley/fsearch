@@ -24,10 +24,13 @@ pub enum Mode {
     Regex,
     Content,
     Semantic,
+    Calc,
 }
 
 pub fn parse_query(input: &str, regex_mode: bool) -> (Mode, String) {
-    if let Some(rest) = input.strip_prefix('>') {
+    if let Some(rest) = input.strip_prefix('=') {
+        (Mode::Calc, rest.trim().to_string())
+    } else if let Some(rest) = input.strip_prefix('>') {
         (Mode::Content, rest.trim_start().to_string())
     } else if let Some(rest) = input.strip_prefix('?') {
         (Mode::Semantic, rest.trim_start().to_string())
@@ -236,7 +239,7 @@ fn watch_loop(
                 push_front(&mut fronts, &mut gone, (s, meta));
             } else if path.is_dir() {
                 // a directory appeared or changed: index its files
-                let (entries, _) = walker::collect_sorted(&[path], excludes);
+                let (entries, _) = walker::collect_sorted(&[path], excludes, false);
                 for entry in entries {
                     push_front(&mut fronts, &mut gone, entry);
                 }
@@ -357,8 +360,10 @@ impl Engine {
             let (path_tx, path_rx) = mpsc::channel::<(String, FileMeta)>();
             let roots = config.roots.clone();
             let walk_excludes = excludes.clone();
-            let walk_thread =
-                std::thread::spawn(move || walker::walk(&roots, &walk_excludes, &path_tx));
+            let index_apps = config.index_apps;
+            let walk_thread = std::thread::spawn(move || {
+                walker::walk(&roots, &walk_excludes, index_apps, &path_tx)
+            });
             // the index is ordered newest-first, so head-of-list results,
             // regex hits (index order) and fuzzy score ties all favor recency
             let mut fresh: Vec<(String, FileMeta)> = Vec::new();
@@ -503,6 +508,30 @@ impl Engine {
             return;
         }
         let (mode, query) = parse_query(input, regex_mode);
+        if mode == Mode::Calc {
+            // the calculator is synchronous and takes the raw expression —
+            // no filter tokens, no worker round-trip
+            self.generation += 1;
+            self.mode = mode;
+            self.query = query.clone();
+            self.status.error = None;
+            self.cancel_content();
+            self.pending_content = None;
+            self.pending_semantic = None;
+            self.results = match (query.is_empty(), crate::calc::eval(&query)) {
+                (false, Some(v)) => vec![ResultRow {
+                    path: crate::calc::format_result(v),
+                    line_number: None,
+                    line: Some(format!("{query} =")),
+                    recent_open: false,
+                    meta: None,
+                    score: None,
+                }],
+                _ => Vec::new(),
+            };
+            self.status.matches = self.results.len();
+            return;
+        }
         let (query_filters, pattern) = filters::parse(&query, unix_now());
         // rejoin preserves regex/content patterns without filter tokens
         let query = if query_filters.is_empty() {
@@ -533,7 +562,7 @@ impl Engine {
                     self.pending_semantic = Some((query, Instant::now()));
                 }
             }
-            Mode::Fuzzy | Mode::Regex => {
+            Mode::Fuzzy | Mode::Regex | Mode::Calc => {
                 self.pending_content = None;
                 self.pending_semantic = None;
                 self.dispatch_filename();
@@ -916,6 +945,17 @@ mod tests {
     #[test]
     fn parse_bare_gt_is_empty_content() {
         assert_eq!(parse_query(">", false), (Mode::Content, String::new()));
+    }
+
+    #[test]
+    fn parse_equals_prefix_is_calc() {
+        assert_eq!(
+            parse_query("= 2*(3+4)", false),
+            (Mode::Calc, "2*(3+4)".to_string())
+        );
+        // regex toggle does not override calc mode
+        assert_eq!(parse_query("=1+1", true), (Mode::Calc, "1+1".to_string()));
+        assert_eq!(parse_query("=", false), (Mode::Calc, String::new()));
     }
 
     #[test]

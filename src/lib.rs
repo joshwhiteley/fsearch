@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod calc;
 pub mod cellart;
 pub mod cli;
 pub mod config;

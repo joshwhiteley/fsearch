@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const HINTS: &str = "> grep in files \u{b7} ? semantic \u{b7} 'word exact \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
+pub(super) const HINTS: &str = "> grep in files \u{b7} ? semantic \u{b7} = calc \u{b7} 'word exact \u{b7} ext:pdf \u{b7} kind:image \u{b7} changed:7d \u{b7} larger:100mb \u{b7} dir: folders \u{b7} ctrl-r regex \u{b7} tab zoom preview";
 
 pub(super) fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
     let mut block = Block::default()
@@ -56,7 +56,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let body = outer[2];
     let status_area = outer[3];
 
-    match app.preview_layout {
+    // the calculator's single result row has nothing to preview
+    let layout = if app.engine.mode() == Mode::Calc {
+        PreviewLayout::Hidden
+    } else {
+        app.preview_layout
+    };
+    match layout {
         PreviewLayout::Side => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -177,6 +183,7 @@ pub(super) fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         match (app.engine.mode(), app.regex_mode) {
             (Mode::Content, _) => "content",
             (Mode::Semantic, _) => "semantic",
+            (Mode::Calc, _) => "calc",
             (_, true) => "regex",
             _ => "fuzzy",
         }

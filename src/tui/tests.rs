@@ -14,6 +14,7 @@ fn test_app() -> App {
         theme: Default::default(),
         keys: Default::default(),
         mouse: true,
+        index_apps: false,
     };
     let engine = Engine::new(
         config,
@@ -771,4 +772,25 @@ fn semantic_scored_rows_render_without_panicking() {
     // compact density hits the same readout on the single-line path
     app.density = Density::Compact;
     terminal.draw(|f| draw(f, &mut app)).unwrap();
+}
+
+#[test]
+fn calc_mode_renders_expression_and_result() {
+    let mut app = test_app();
+    app.input = "= 2*(3+4)".to_string();
+    app.input_cursor = app.input.len();
+    app.engine.set_query(&app.input, false);
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("calc"), "mode label");
+    assert!(text.contains("2*(3+4) ="), "expression");
+    assert!(text.contains("14"), "result");
+    // an unfinished expression shows no rows and no error
+    app.input = "= 2*".to_string();
+    app.input_cursor = app.input.len();
+    app.engine.set_query(&app.input, false);
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert_eq!(app.engine.results().len(), 0);
+    assert!(app.engine.status().error.is_none());
 }

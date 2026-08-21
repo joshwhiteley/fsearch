@@ -84,7 +84,10 @@ fn reindex_builds_the_cache() {
     std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
     std::fs::write(
         xdg.join("fsearch").join("config.toml"),
-        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+        format!(
+            "roots = [{:?}]\nindex_apps = false\n",
+            tree.to_str().unwrap()
+        ),
     )
     .unwrap();
 
@@ -114,7 +117,10 @@ fn print_mode_lists_matches_and_content_hits() {
     std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
     std::fs::write(
         xdg.join("fsearch").join("config.toml"),
-        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+        format!(
+            "roots = [{:?}]\nindex_apps = false\n",
+            tree.to_str().unwrap()
+        ),
     )
     .unwrap();
     let env: &[(&str, &str)] = &[
@@ -155,7 +161,10 @@ fn print_mode_honors_filters() {
     std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
     std::fs::write(
         xdg.join("fsearch").join("config.toml"),
-        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+        format!(
+            "roots = [{:?}]\nindex_apps = false\n",
+            tree.to_str().unwrap()
+        ),
     )
     .unwrap();
     let env: &[(&str, &str)] = &[
@@ -182,7 +191,10 @@ fn big_lists_largest_files_first() {
     std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
     std::fs::write(
         xdg.join("fsearch").join("config.toml"),
-        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+        format!(
+            "roots = [{:?}]\nindex_apps = false\n",
+            tree.to_str().unwrap()
+        ),
     )
     .unwrap();
     let env: &[(&str, &str)] = &[
@@ -219,7 +231,10 @@ fn semantic_index_and_query_with_fake_embedder() {
     std::fs::create_dir_all(xdg.join("fsearch")).unwrap();
     std::fs::write(
         xdg.join("fsearch").join("config.toml"),
-        format!("roots = [{:?}]\n", tree.to_str().unwrap()),
+        format!(
+            "roots = [{:?}]\nindex_apps = false\n",
+            tree.to_str().unwrap()
+        ),
     )
     .unwrap();
     let env: &[(&str, &str)] = &[
