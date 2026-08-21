@@ -499,6 +499,17 @@ impl App {
             return;
         };
         let path = row.path.clone();
+        // the calculator's "path" is the result — enter copies it
+        if self.engine.mode() == Mode::Calc {
+            self.message = Some((
+                match actions::copy(&path) {
+                    Ok(()) => format!("copied: {path}"),
+                    Err(e) => format!("error: {e}"),
+                },
+                Instant::now(),
+            ));
+            return;
+        }
         self.message = Some((
             match actions::open(&path) {
                 Ok(()) => {

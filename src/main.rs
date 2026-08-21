@@ -82,7 +82,7 @@ fn load_index(config: &config::Config) -> fsearch::index::PathStore {
             eprintln!("fsearch: invalid exclude pattern: {e:#}");
             std::process::exit(1);
         });
-        let (entries, _) = walker::collect_sorted(&config.roots, &excludes);
+        let (entries, _) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
         let _ = index::save(&entries, &cache);
         fsearch::index::PathStore::from_entries(&entries)
     })
@@ -403,7 +403,7 @@ fn reindex() {
         }
     };
     let start = Instant::now();
-    let (entries, stats) = walker::collect_sorted(&config.roots, &excludes);
+    let (entries, stats) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
     let cache = index::default_cache_path();
     if let Err(e) = index::save(&entries, &cache) {
         eprintln!("fsearch: writing {}: {e}", cache.display());

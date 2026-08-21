@@ -38,6 +38,7 @@ const KINDS: &[(&str, &[&str])] = &[
             "swift", "kt", "lua", "sql", "html", "css", "toml", "yaml", "yml", "json",
         ],
     ),
+    ("app", &["app"]),
     (
         "archive",
         &["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg"],
@@ -291,6 +292,7 @@ mod tests {
         assert_eq!(kind_for_ext("PNG"), Some("image"));
         assert_eq!(kind_for_ext("rs"), Some("code"));
         assert_eq!(kind_for_ext("pdf"), Some("doc"));
+        assert_eq!(kind_for_ext("app"), Some("app"));
         assert_eq!(kind_for_ext("zzz"), None);
         assert_eq!(kind_for_ext(""), None);
     }

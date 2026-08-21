@@ -41,6 +41,7 @@ query syntax:
   'word                exact substring (^word prefix, word$ suffix,
                        !word excludes)
   > pattern            regex search inside file contents
+  = 2*(3+4)            inline calculator (enter copies the result)
   ? words              search documents by meaning (semantic; run
                        fsearch --index-semantic first)
   ext:pdf path:term    narrow any search by extension or path

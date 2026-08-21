@@ -25,6 +25,7 @@ fn config_for(root: &std::path::Path) -> Config {
         theme: Default::default(),
         keys: Default::default(),
         mouse: true,
+        index_apps: false,
     }
 }
 

@@ -40,10 +40,17 @@ Run `fsearch` and start typing.
 - `kind:image` (also video, audio, doc, code, archive), `changed:7d`,
   `larger:100mb` / `smaller:` — metadata filters that compose with any query
 - `dir:` — search folders instead of files (preview lists their contents)
+- `= 2*(3+4)` — inline calculator; enter copies the result
+- apps are indexed too (macOS): type `safari`, hit enter, Safari launches
+  (`index_apps = false` turns this off)
 - `enter` opens · `→` opens an actions menu (reveal, copy, quick look,
   move to trash) · `ctrl-space` Quick Look · `ctrl-y` copies the path ·
   `ctrl-p`/`ctrl-n` recall query history ·
   `tab` cycles the preview (side → full-window → hidden) · `esc` quits
+
+Piped input flips fsearch into an fzf-style filter: `git ls-files |
+fsearch` (or `… | fsearch --filter`) fuzzy-filters the lines and prints
+your selection.
 
 Scripting: `fsearch --big` lists the largest files in the index (a quick
 "what's eating my disk"), and `fsearch -p QUERY` prints matches to stdout
@@ -58,6 +65,7 @@ Source `shell/fsearch.zsh` (or `.bash`) from your rc file to get:
 
 - **Ctrl-T** — pick a file and insert its path at the cursor
 - **`fcd`** — fuzzy-pick a directory and `cd` into it
+- **Ctrl-R** — filter your shell history through fsearch
 
 The first run indexes your home folder; later launches load the cached
 index in milliseconds and refresh it in the background.
@@ -84,11 +92,13 @@ index is yours: predictable, inspectable, rebuildable with `--reindex`.
 
 ## When to use something else
 
-- **fzf / television** — you want to fuzzy-filter arbitrary lists (git
-  files, history, stdin) with deep shell integration. fsearch only does
-  files-on-disk, by design.
-- **Spotlight / Alfred / Raycast** — you want app launching, calculators,
-  and OS integration. fsearch only searches files, in a terminal.
+- **fzf / television** — arbitrary-list filtering is covered
+  (`git ls-files | fsearch`, the ctrl-r history widget), but fzf still
+  has the deeper plugin ecosystem and preview scripting.
+- **Spotlight / Alfred / Raycast** — fsearch launches apps (type the
+  name, hit enter) and evaluates `= 7*831`, but Spotlight and Raycast
+  still own OS-level integrations: contacts, clipboard history,
+  workflows, extensions.
 - **ripgrep** — you're grepping a single project tree. fsearch's content
   search is for "somewhere in my home directory".
 

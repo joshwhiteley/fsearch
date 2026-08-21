@@ -75,6 +75,7 @@ pub(super) fn badge_for(path: &str, badges: [Color; 6], accent: Color) -> (Strin
         Some("doc") => badges[2],
         Some("code") => badges[3],
         Some("archive") => badges[4],
+        Some("app") => accent,
         _ => badges[5],
     };
     (label, color)
@@ -186,6 +187,19 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .take(app.visible_len())
         .map(|r| {
+            if app.engine.mode() == crate::engine::Mode::Calc {
+                // the calculator's single row: dim "expr =" then the
+                // result in bold accent
+                let mut spans = Vec::new();
+                if let Some(expr) = &r.line {
+                    spans.push(Span::styled(format!("{expr} "), dim));
+                }
+                spans.push(Span::styled(
+                    r.path.clone(),
+                    accent.add_modifier(Modifier::BOLD),
+                ));
+                return ListItem::new(Line::from(spans));
+            }
             if app.engine.is_filter() {
                 // filter mode: one plain line per row — the raw line text
                 // with fuzzy-match highlights; no home shortening, badge,

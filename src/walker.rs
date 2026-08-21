@@ -31,13 +31,70 @@ pub fn mtime_cmp(a: &(String, FileMeta), b: &(String, FileMeta)) -> std::cmp::Or
     b.1.mtime.cmp(&a.1.mtime).then_with(|| a.0.cmp(&b.0))
 }
 
+/// Emits .app bundles found at depth <= 2 under `dirs` as plain entries
+/// (no trailing slash, real mtime, size 0) so they rank and open like
+/// files — the default excludes never see them and plain queries match.
+fn emit_apps_from(dirs: &[PathBuf], tx: &Sender<(String, FileMeta)>) {
+    let emit = |path: &std::path::Path| {
+        let mtime = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        let _ = tx.send((
+            path.to_string_lossy().into_owned(),
+            FileMeta { mtime, size: 0 },
+        ));
+    };
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "app") {
+                emit(&path);
+            } else if let Ok(sub) = std::fs::read_dir(&path) {
+                // one level deeper catches /Applications/Utilities
+                for s in sub.flatten() {
+                    let sp = s.path();
+                    if s.file_type().is_ok_and(|t| t.is_dir())
+                        && sp.extension().is_some_and(|e| e == "app")
+                    {
+                        emit(&sp);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where app bundles live; empty off macOS.
+fn default_app_dirs() -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let mut dirs = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    dirs
+}
+
 /// Walks the roots and returns all entries (with metadata) newest-first.
 pub fn collect_sorted(
     roots: &[PathBuf],
     excludes: &GlobSet,
+    apps: bool,
 ) -> (Vec<(String, FileMeta)>, WalkStats) {
     let (tx, rx) = std::sync::mpsc::channel();
-    let stats = walk(roots, excludes, &tx);
+    let stats = walk(roots, excludes, apps, &tx);
     drop(tx);
     let mut entries: Vec<(String, FileMeta)> = rx.into_iter().collect();
     entries.sort_unstable_by(mtime_cmp);
@@ -45,7 +102,17 @@ pub fn collect_sorted(
 }
 
 /// Sends `(path, meta)` pairs; times are seconds since the Unix epoch.
-pub fn walk(roots: &[PathBuf], excludes: &GlobSet, tx: &Sender<(String, FileMeta)>) -> WalkStats {
+/// With `apps`, .app bundles from the standard application folders are
+/// appended after the walk.
+pub fn walk(
+    roots: &[PathBuf],
+    excludes: &GlobSet,
+    apps: bool,
+    tx: &Sender<(String, FileMeta)>,
+) -> WalkStats {
+    if apps {
+        emit_apps_from(&default_app_dirs(), tx);
+    }
     let mut roots = roots.iter().filter(|r| r.exists());
     let Some(first) = roots.next() else {
         return WalkStats::default();
@@ -138,12 +205,29 @@ mod tests {
         let ex: Vec<String> = excludes.iter().map(|s| s.to_string()).collect();
         let set = build_exclude_set(&ex).unwrap();
         let (tx, rx) = mpsc::channel();
-        let stats = walk(&[PathBuf::from(root)], &set, &tx);
+        let stats = walk(&[PathBuf::from(root)], &set, false, &tx);
         drop(tx);
         let paths: Vec<String> = rx.into_iter().map(|(p, _)| p).collect();
         let files = paths.iter().filter(|p| !p.ends_with('/')).count();
         assert_eq!(stats.files as usize, files);
         paths
+    }
+
+    #[test]
+    fn app_bundles_emit_without_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Foo.app/Contents")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Utilities/Deep.app")).unwrap();
+        std::fs::write(dir.path().join("note.txt"), "x").unwrap();
+        let (tx, rx) = mpsc::channel();
+        emit_apps_from(&[dir.path().to_path_buf()], &tx);
+        drop(tx);
+        let mut paths: Vec<String> = rx.into_iter().map(|(p, _)| p).collect();
+        paths.sort();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("Foo.app"));
+        assert!(paths[1].ends_with("Utilities/Deep.app"));
+        assert!(paths.iter().all(|p| !p.ends_with('/')));
     }
 
     #[test]
@@ -171,7 +255,7 @@ mod tests {
             f.set_modified(now - age * hour).unwrap();
         }
         let set = build_exclude_set(&[]).unwrap();
-        let (entries, stats) = collect_sorted(&[dir.path().to_path_buf()], &set);
+        let (entries, stats) = collect_sorted(&[dir.path().to_path_buf()], &set, false);
         assert_eq!(stats.files, 2);
         assert!(entries[0].0.ends_with("new.txt"));
         assert!(entries[1].0.ends_with("old.txt"));
@@ -183,7 +267,7 @@ mod tests {
         let dir = tree();
         let set = build_exclude_set(&[]).unwrap();
         let (tx, rx) = mpsc::channel();
-        walk(&[PathBuf::from(dir.path())], &set, &tx);
+        walk(&[PathBuf::from(dir.path())], &set, false, &tx);
         drop(tx);
         let entries: Vec<(String, FileMeta)> = rx.into_iter().collect();
         assert!(!entries.is_empty());
