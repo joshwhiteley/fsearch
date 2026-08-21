@@ -115,25 +115,28 @@ pub fn load(path: &Path) -> Option<PathStore> {
     let metas_at = lens_at.checked_add(count.checked_mul(4)?)?;
     let arena_at = metas_at.checked_add(count.checked_mul(16)?)?;
 
-    let mut spans = Vec::with_capacity(count.min(8_000_000));
-    let mut offset: u32 = 0;
+    // Validate table bounds before allocating from untrusted counts.
     let lens = data.get(lens_at..metas_at)?;
+    let meta_bytes = data.get(metas_at..arena_at)?;
+    let arena = data.get(arena_at..)?;
+
+    let mut spans = Vec::with_capacity(count);
+    let mut offset: u32 = 0;
     for chunk in lens.chunks(4) {
         let len = u32::from_le_bytes(chunk.try_into().ok()?);
         spans.push((offset, len));
         offset = offset.checked_add(len)?;
     }
-    let mut metas = Vec::with_capacity(count.min(8_000_000));
-    let meta_bytes = data.get(metas_at..arena_at)?;
+    if arena.len() != offset as usize {
+        return None; // truncated or padded
+    }
+
+    let mut metas = Vec::with_capacity(count);
     for chunk in meta_bytes.chunks(16) {
         metas.push(FileMeta {
             mtime: i64::from_le_bytes(<[u8; 8]>::try_from(&chunk[..8]).ok()?),
             size: u64::from_le_bytes(<[u8; 8]>::try_from(&chunk[8..]).ok()?),
         });
-    }
-    let arena = data.get(arena_at..)?;
-    if arena.len() != offset as usize {
-        return None; // truncated or padded
     }
     // one linear validation pass; from then on gets are zero-cost
     std::str::from_utf8(arena).ok()?;

@@ -1,0 +1,60 @@
+#!/usr/bin/expect -f
+
+set timeout 20
+if {$argc != 1} {
+    puts stderr "usage: smoke.exp /path/to/fsearch"
+    exit 2
+}
+
+set bin [file normalize [lindex $argv 0]]
+set tmp [exec mktemp -d -t fsearch-smoke]
+set home "$tmp/home"
+set config "$tmp/config/fsearch"
+set cache "$tmp/cache"
+file mkdir $home $config $cache
+
+set note [open "$home/meeting-notes.md" w]
+puts $note "project launch checklist"
+close $note
+
+set cfg [open "$config/config.toml" w]
+puts $cfg "roots = \[\"$home\"\]"
+puts $cfg "excludes = \[\]"
+puts $cfg "index_apps = false"
+puts $cfg "mouse = false"
+puts $cfg "quiet = \[\]"
+close $cfg
+
+log_user 0
+spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache TERM=xterm-256color $bin"
+expect {
+    -re {fsearch} {}
+    timeout {
+        puts stderr "TUI did not start"
+        exit 1
+    }
+}
+
+send -- "meeting"
+expect {
+    -re {meeting-notes\.md} {}
+    timeout {
+        puts stderr "typed query did not produce the indexed file"
+        send -- "\003"
+        exit 1
+    }
+}
+
+send -- "\033"
+expect {
+    eof {}
+    timeout {
+        puts stderr "TUI did not exit after Escape"
+        send -- "\003"
+        exit 1
+    }
+}
+
+set status [wait]
+file delete -force $tmp
+exit [lindex $status 3]

@@ -33,3 +33,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+      - name: PTY smoke test
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --bin fsearch
+          tests/smoke.exp target/debug/fsearch
