@@ -21,23 +21,35 @@ no daemon.
 
 ```
 src/
-  main.rs      CLI entry: dispatches flags (--help/--config/--reindex/-p) or the TUI
+  main.rs      CLI entry: dispatch flags, filter mode, --reindex, -p
   cli.rs       argv parsing + help text (pure, no I/O)
-  config.rs    ~/.config/fsearch/config.toml: roots, excludes, size caps
-  walker.rs    parallel directory walk (ignore crate), exclude globs, mtimes
-  index.rs     versioned binary cache of the path list (atomic save, corrupt-safe load)
-  matcher.rs   per-keystroke filename matching: nucleo fuzzy / regex, + match positions
-  content.rs   streaming parallel grep (ripgrep's grep-searcher/grep-regex crates)
+  config.rs    config.toml: roots, excludes, theme, keymap, quiet, caps
+  walker.rs    parallel walk (ignore crate), excludes, .app bundles, mtimes
+  index.rs     versioned binary cache of the path list
+  matcher.rs   filename matching: nucleo fuzzy/regex, ranking, quiet demotion
+  content.rs   streaming parallel grep (ripgrep's grep-* crates)
+  sem.rs       semantic index: chunking, embeddings, f16 vector store
+  calc.rs      the `= expr` evaluator (recursive descent, no deps)
+  quiet.rs     "quiet path" demotion patterns
+  frecency.rs  open history → ranking boosts
+  keymap.rs    configurable keybindings (spec parser + action table)
+  pdf.rs       PDF text extraction (cached, panic-guarded)
+  office.rs    docx/xlsx text extraction (cached)
   engine.rs    orchestration: threads, generations, debounce, result state
-  highlight.rs syntax highlighting for previews (syntect + two-face)
-  images.rs    image decoding for previews (image crate + resvg for SVG)
-  actions.rs   open / reveal-in-Finder / copy-path
-  tui.rs       ratatui UI: input, results, preview, keybindings
+  highlight.rs syntax highlighting (syntect + two-face)
+  images.rs    image decoding (image crate + resvg)
+  theme.rs     UI color presets + tokens
+  actions.rs   open / reveal / copy / trash
+  tui/
+    mod.rs     App state, event loop, terminal probe
+    rows.rs    result row rendering
+    preview.rs preview worker + pane
+    chrome.rs  input, status, gauge, toasts, menu
+    tests.rs   TUI test suite
 ```
 
-`main.rs` + `tui.rs` are the only modules that talk to a real terminal;
-everything else is a library (`src/lib.rs`) exercised directly by the tests
-in `tests/`.
+`main.rs` + `tui/` talk to a real terminal; everything else is a library
+(`src/lib.rs`) exercised by the tests in `tests/`.
 
 ## Key design decisions
 
@@ -99,26 +111,31 @@ All communication is `std::sync::mpsc`; the UI never blocks on a search.
 
 ## Search behavior
 
-- **Fuzzy** (default): nucleo's path-aware scoring across all paths in
-  parallel (rayon chunks), smart-case, top-500 by score then recency.
+- **Fuzzy** (default): nucleo's path-aware scoring over all paths in
+  parallel, plus a basename re-score so filename matches dominate, a
+  best/2 floor that folds scattered-letter junk behind "weaker matches",
+  and a quiet-path penalty that sinks `~/Library/`-style churn below the
+  fold (path-intent queries skip the penalty).
 - **Regex** (`ctrl-r`): the regex crate against full paths, smart-case,
-  results in recency order.
-- **Content** (`> pattern`): ripgrep's engine over indexed files, skipping
-  binaries (NUL detection) and files over `max_content_filesize`, capped at
-  20 hits per file / 1000 total, streamed into the UI as found. PDFs are
-  greppable too: their text is extracted (pdf-extract behind a panic guard)
-  and cached by path + mtime + size next to the index cache.
-- **Filters** (`ext:`, `path:`, `dir:`): parsed out of any query and applied
-  in every mode — including scoping which files a content search greps.
+  recency order.
+- **Content** (`> pattern`): ripgrep's engine, binary/oversize-skipped,
+  streamed. PDFs, docx and xlsx are searched through cached extracted text.
+- **Semantic** (`? query`): brute-force cosine over chunk embeddings,
+  documents scored in parallel; unchanged files reuse their vectors.
+- **Calc** (`= expr`): evaluated synchronously; enter copies the result.
+- **Apps**: .app bundles are indexed and launch via `open` on macOS.
+- **Filter mode**: piped stdin lines run through fuzzy/regex and print the
+  pick (`--filter`).
+- **Filters** (`ext:`, `path:`, `dir:`, `kind:`, `changed:`, `larger:`):
+  parsed from any query and applied in every mode.
 
 ## Previews
 
-Text files are syntax-highlighted with syntect + two-face themes
-(OneHalfDark/OneHalfLight picked by the terminal's background). The style
-converter implements bat's alpha-channel color convention so ANSI-palette
-themes don't render black-on-black. Images (PNG/JPEG/TIFF/GIF/WebP/BMP, and
-SVG via resvg) render through ratatui-image using the best protocol the
-terminal supports, falling back to colored half-block cells anywhere.
+Text files are syntax-highlighted (syntect + two-face, dark/light by
+terminal background). PDFs, docx and xlsx show extracted text; .app bundles
+show their directory contents. Images (PNG/JPEG/TIFF/GIF/WebP/BMP/SVG)
+render through ratatui-image's best protocol, with a halfblock fallback.
+Preview loading runs on a worker thread so large files never block the UI.
 
 ## Testing strategy
 
@@ -131,6 +148,7 @@ terminal supports, falling back to colored half-block cells anywhere.
   `--config`, `--reindex`, `-p`) and asserts stdout/exit codes.
 - `tests/perf_test.rs` (ignored by default) asserts the 1M-path latency
   budget in release mode.
-- An `expect`-driven PTY smoke script drives the real TUI end to end
-  (typing, previews, image rendering, clean exit); it caught the
-  stdin-eating bug above.
+- `tests/load_fuzz.rs` mutates valid index/semantic stores and feeds
+  arbitrary bytes to the loaders, asserting they never panic.
+- `tests/smoke.exp` drives the real TUI in a PTY (typing, results, clean
+  exit) and runs in CI on macOS.
