@@ -118,17 +118,17 @@ pub fn load(path: &Path) -> Option<PathStore> {
     let mut spans = Vec::with_capacity(count.min(8_000_000));
     let mut offset: u32 = 0;
     let lens = data.get(lens_at..metas_at)?;
-    for chunk in lens.chunks_exact(4) {
+    for chunk in lens.chunks(4) {
         let len = u32::from_le_bytes(chunk.try_into().ok()?);
         spans.push((offset, len));
         offset = offset.checked_add(len)?;
     }
     let mut metas = Vec::with_capacity(count.min(8_000_000));
     let meta_bytes = data.get(metas_at..arena_at)?;
-    for chunk in meta_bytes.chunks_exact(16) {
+    for chunk in meta_bytes.chunks(16) {
         metas.push(FileMeta {
-            mtime: i64::from_le_bytes(chunk[..8].try_into().ok()?),
-            size: u64::from_le_bytes(chunk[8..].try_into().ok()?),
+            mtime: i64::from_le_bytes(<[u8; 8]>::try_from(&chunk[..8]).ok()?),
+            size: u64::from_le_bytes(<[u8; 8]>::try_from(&chunk[8..]).ok()?),
         });
     }
     let arena = data.get(arena_at..)?;

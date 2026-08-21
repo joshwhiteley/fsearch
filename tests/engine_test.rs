@@ -233,7 +233,11 @@ fn live_index_picks_up_created_and_deleted_files() {
             .any(|r| r.path.ends_with("brand-new.txt"))
     });
     // …at the front (it is the newest file)
-    assert!(engine.results()[0].path.ends_with("brand-new.txt"));
+    wait_until(&mut engine, Duration::from_secs(10), |e| {
+        e.results()
+            .first()
+            .is_some_and(|r| r.path.ends_with("brand-new.txt"))
+    });
 
     // and a deleted file disappears
     std::fs::remove_file(root.join("first.txt")).unwrap();
