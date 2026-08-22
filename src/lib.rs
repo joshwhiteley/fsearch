@@ -14,6 +14,7 @@ pub mod keymap;
 pub mod matcher;
 pub mod office;
 pub mod pdf;
+pub mod query;
 pub mod quiet;
 pub mod sem;
 pub mod theme;
