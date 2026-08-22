@@ -2,6 +2,7 @@
 name = "fsearch"
 version = "0.8.0"
 edition = "2024"
+rust-version = "1.87"
 license = "MIT"
 description = "Fast Alfred-style file search for the terminal"
 repository = "https://github.com/joshwhiteley/fsearch"
@@ -19,14 +20,27 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 half = "2"
 ignore = "0.4"
-image = "0.25"
+# codecs match the extension list in src/images.rs; EXR/AVIF et al. are
+# never previewed and cost real compile time (exr, ravif→rav1e)
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "qoi",
+    "rayon",
+    "tiff",
+    "webp",
+] }
 memmap2 = "0.9"
 notify = "8"
 nucleo-matcher = "0.3"
 pdf-extract = "0.12.0"
 quick-xml = "0.41"
 ratatui = "0.30"
-ratatui-image = { version = "11", default-features = false, features = ["image-defaults", "crossterm"] }
+# no image-defaults: it re-enables every image codec behind our back
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 rayon = "1"
 regex = "1"
 resvg = { version = "0.48", default-features = false, features = ["raster-images"] }
