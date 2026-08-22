@@ -78,6 +78,11 @@ enum Msg {
         /// = cached store length), None on a cold start with no cache.
         expected: Option<usize>,
     },
+    /// One-time setup failure (bad excludes glob, unwatchable root). Keeps
+    /// whatever index snapshot is already live and surfaces the reason.
+    IndexError {
+        error: String,
+    },
     FilenameResults {
         generation: u64,
         indices: Vec<usize>,
@@ -160,25 +165,42 @@ fn cache_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Starts watching `roots` and returns the live watcher (keep it alive!)
-/// plus the event stream. Armed *before* the initial walk so that no change
-/// can slip between walk completion and stream start.
-fn start_watcher(
-    roots: &[std::path::PathBuf],
-) -> Option<(
+/// Live watcher plus its event stream (the watcher must stay alive for
+/// events to keep flowing).
+type WatcherStream = (
     notify::RecommendedWatcher,
     Receiver<notify::Result<notify::Event>>,
-)> {
+);
+
+/// Starts watching `roots` and returns the live watcher plus the number of
+/// roots that could not be watched (watcher creation failure counts as all
+/// of them). Armed *before* the initial walk so that no change can slip
+/// between walk completion and stream start.
+fn start_watcher(roots: &[std::path::PathBuf]) -> (Option<WatcherStream>, usize) {
     use notify::Watcher;
     let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
+    let mut watcher = match notify::recommended_watcher(move |res| {
         let _ = event_tx.send(res);
-    })
-    .ok()?;
+    }) {
+        Ok(w) => w,
+        // no watcher at all: every root is effectively unwatched
+        Err(_) => return (None, roots.len()),
+    };
+    let mut failed = 0usize;
     for root in roots {
-        let _ = watcher.watch(root, notify::RecursiveMode::Recursive);
+        if watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .is_err()
+        {
+            failed += 1;
+        }
     }
-    Some((watcher, event_rx))
+    // a watcher that watches nothing is worse than none: it only burns the
+    // event thread; callers surface the failure count instead
+    (
+        (failed < roots.len()).then_some((watcher, event_rx)),
+        failed,
+    )
 }
 
 /// Folds filesystem events into fresh index snapshots, forever. Changed and
@@ -241,10 +263,31 @@ fn watch_loop(
                         .map_or(0, |d| d.as_secs() as i64),
                     size: std_meta.map_or(0, |m| m.len()),
                 };
-                push_front(&mut fronts, &mut gone, (s, meta));
+                push_front(&mut fronts, &mut gone, (s.clone(), meta));
+                // the file may sit where a directory used to be (deleted and
+                // replaced inside one debounce burst): prune the old subtree
+                // so no ghost children survive
+                gone_dir_prefixes.push(format!("{s}/"));
             } else if path.is_dir() {
-                // a directory appeared or changed: index its files
-                let (entries, _) = walker::collect_sorted(&[path], excludes, false);
+                // a directory appeared or changed: replace its prior state —
+                // a recreated dir must not keep stale children — then index
+                // what exists now
+                gone_dir_prefixes.push(format!("{s}/"));
+                gone.insert(s.clone());
+                let (entries, _) =
+                    walker::collect_sorted(std::slice::from_ref(&path), excludes, false);
+                // collect_sorted skips the walk root, so re-add the dir
+                // itself with fresh metadata
+                let std_meta = std::fs::metadata(&path).ok();
+                let meta = FileMeta {
+                    mtime: std_meta
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs() as i64),
+                    size: 0,
+                };
+                push_front(&mut fronts, &mut gone, (format!("{s}/"), meta));
                 for entry in entries {
                     push_front(&mut fronts, &mut gone, entry);
                 }
@@ -353,17 +396,27 @@ impl Engine {
                     indexing: true,
                 });
             }
-            let Ok(excludes) = walker::build_exclude_set(&config.excludes) else {
-                let _ = indexer_tx.send(Msg::IndexSnapshot {
-                    store: Arc::new(PathStore::empty()),
-                    indexing: false,
-                });
-                return;
+            let excludes = match walker::build_exclude_set(&config.excludes) {
+                Ok(set) => set,
+                Err(e) => {
+                    // keep the cached snapshot searchable; just report why
+                    // no fresh walk can happen this session
+                    let _ = indexer_tx.send(Msg::IndexError {
+                        error: format!("invalid exclude pattern: {e}"),
+                    });
+                    return;
+                }
             };
             // arm the watcher before walking: events raised mid-walk sit in
             // the channel and are folded in afterwards (re-stat makes them
             // idempotent), so nothing slips through the startup window
-            let watcher = start_watcher(&config.roots);
+            let (watcher, watch_failures) = start_watcher(&config.roots);
+            if watch_failures > 0 {
+                let noun = if watch_failures == 1 { "root" } else { "roots" };
+                let _ = indexer_tx.send(Msg::IndexError {
+                    error: format!("live updates unavailable for {watch_failures} {noun}"),
+                });
+            }
             let (path_tx, path_rx) = mpsc::channel::<(String, FileMeta)>();
             let roots = config.roots.clone();
             let walk_excludes = excludes.clone();
@@ -606,6 +659,13 @@ impl Engine {
                         self.status.indexed = count;
                     }
                 }
+                Msg::IndexError { error } => {
+                    // one-time setup failure: keep whatever snapshot is live
+                    // (possibly none) and stop the "indexing" spinner
+                    self.status.indexing = false;
+                    self.status.walk = None;
+                    self.status.error = Some(error);
+                }
                 Msg::FilenameResults {
                     generation,
                     indices,
@@ -802,9 +862,10 @@ impl Engine {
     }
 
     /// One worker for the whole session: the embedding model loads once, on
-    /// the first `?` query, and stays warm. The store load is retried until
-    /// it succeeds, so an index built while the UI is open is picked up on
-    /// the next query — no restart needed.
+    /// the first `?` query, and stays warm. The store is reloaded whenever
+    /// its file's mtime changes (checked at most once per second per query),
+    /// so an index built while the UI is open is picked up on the next
+    /// query — no restart needed.
     fn ensure_semantic_worker(&mut self) -> Sender<SemJob> {
         if let Some(tx) = &self.sem_tx {
             return tx.clone();
@@ -813,19 +874,43 @@ impl Engine {
         let (tx, rx) = mpsc::channel::<SemJob>();
         let msg_tx = self.msg_tx.clone();
         std::thread::spawn(move || {
-            let mut embedder: Option<Result<Box<dyn sem::Embedder + Send>, String>> = None;
+            // a successfully built embedder is kept across reloads (model
+            // loading is expensive); creation *failures* are not cached —
+            // the next job retries
+            let mut spare: Option<Box<dyn sem::Embedder + Send>> = None;
             let mut ready: Option<(Box<dyn sem::Embedder + Send>, sem::SemStore)> = None;
+            // mtime of the store file when `ready` was loaded; a different
+            // mtime means another process rebuilt or migrated the index
+            let mut loaded_stamp: Option<std::time::SystemTime> = None;
+            let mut last_check = Instant::now();
             while let Ok(mut job) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
                     job = newer;
                 }
+                // liveness: if the store file changed on disk since it was
+                // loaded (checked at most once per second), drop `ready` so
+                // it is rebuilt below and new/changed docs are picked up
+                // without a restart
+                if ready.is_some() && last_check.elapsed() >= Duration::from_secs(1) {
+                    last_check = Instant::now();
+                    if cache_mtime(&sem::default_store_path()) != loaded_stamp {
+                        ready = None;
+                    }
+                }
                 let mut broken: Option<String> = None;
                 if ready.is_none() {
-                    match embedder.take().unwrap_or_else(sem::make_embedder) {
+                    let embedder = match spare.take() {
+                        Some(e) => Ok(e),
+                        None => sem::make_embedder(),
+                    };
+                    match embedder {
                         Ok(e) => match sem::SemStore::load(&sem::default_store_path()) {
-                            Some(s) if s.dim as usize == e.dim() => ready = Some((e, s)),
+                            Some(s) if s.dim as usize == e.dim() => {
+                                loaded_stamp = cache_mtime(&sem::default_store_path());
+                                ready = Some((e, s));
+                            }
                             Some(_) => {
-                                embedder = Some(Ok(e));
+                                spare = Some(e);
                                 broken = Some(
                                     "semantic index is from another model — \
                                      rerun fsearch --index-semantic"
@@ -833,17 +918,14 @@ impl Engine {
                                 );
                             }
                             None => {
-                                embedder = Some(Ok(e));
+                                spare = Some(e);
                                 broken = Some(
                                     "no semantic index yet — run fsearch --index-semantic"
                                         .to_string(),
                                 );
                             }
                         },
-                        Err(e) => {
-                            broken = Some(e.clone());
-                            embedder = Some(Err(e));
-                        }
+                        Err(e) => broken = Some(e),
                     }
                 }
                 let msg = match (&mut ready, &broken) {
@@ -926,6 +1008,87 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds one debounced event for `path` into `watch_loop` and returns
+    /// the paths of the snapshot it publishes.
+    fn watch_snapshot(
+        current: Vec<(String, FileMeta)>,
+        touched: std::path::PathBuf,
+    ) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        event_tx
+            .send(Ok(
+                notify::Event::new(notify::EventKind::Other).add_path(touched)
+            ))
+            .unwrap();
+        drop(event_tx); // ends the loop after the burst is folded
+        let (index_tx, index_rx) = mpsc::channel();
+        let excludes = globset::GlobSetBuilder::new().build().unwrap();
+        watch_loop(
+            &event_rx,
+            &excludes,
+            &dir.path().join("index.bin"),
+            &index_tx,
+            current,
+        );
+        match index_rx.recv().unwrap() {
+            Msg::IndexSnapshot { store, .. } => store.iter().map(str::to_string).collect(),
+            _ => panic!("expected an index snapshot"),
+        }
+    }
+
+    #[test]
+    fn watch_loop_prunes_children_of_dir_replaced_by_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("thing");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("old-child.txt"), "x").unwrap();
+        let sub_str = sub.to_string_lossy().into_owned();
+        let current = vec![
+            (format!("{sub_str}/"), FileMeta::default()),
+            (format!("{sub_str}/old-child.txt"), FileMeta::default()),
+            (
+                format!("{}", dir.path().join("keeper.txt").display()),
+                FileMeta::default(),
+            ),
+        ];
+        // deleted and replaced by a same-named file inside one burst
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, "now a file").unwrap();
+
+        let paths = watch_snapshot(current, sub);
+        // only the replacement file survives from the old subtree, plus the
+        // untouched sibling
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&sub_str));
+        assert!(paths.contains(&dir.path().join("keeper.txt").to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn watch_loop_recreated_dir_replaces_stale_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("proj");
+        std::fs::create_dir_all(sub.join("old")).unwrap();
+        std::fs::write(sub.join("old/gone.txt"), "x").unwrap();
+        let sub_str = sub.to_string_lossy().into_owned();
+        let current = vec![
+            (format!("{sub_str}/"), FileMeta::default()),
+            (format!("{sub_str}/old/gone.txt"), FileMeta::default()),
+        ];
+        // recreated with different contents inside one burst
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("fresh.txt"), "x").unwrap();
+
+        let paths = watch_snapshot(current, sub.clone());
+        let mut sorted = paths;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![format!("{sub_str}/"), format!("{sub_str}/fresh.txt"),]
+        );
+    }
 
     #[test]
     fn parse_plain_is_fuzzy() {

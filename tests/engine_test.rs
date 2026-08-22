@@ -324,3 +324,59 @@ fn changed_and_size_filters_narrow_results() {
         e.results().len() == 1 && e.results()[0].path.ends_with("fresh-big.bin")
     });
 }
+
+#[test]
+fn invalid_excludes_keep_cached_index_and_report_error() {
+    let tree = make_tree();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = cache_dir.path().join("index.bin");
+    // seed the cache the way a previous session would have
+    let entries = vec![(
+        format!("{}/docs/meeting-notes.md", tree.path().display()),
+        fsearch::walker::FileMeta::default(),
+    )];
+    fsearch::index::save(&entries, &cache).unwrap();
+
+    let mut config = config_for(tree.path());
+    config.excludes = vec!["node_modules[".to_string()]; // invalid glob
+    let mut engine = Engine::new(config, cache, cache_dir.path().join("history"));
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().error.is_some()
+    });
+    assert!(
+        engine
+            .status()
+            .error
+            .unwrap()
+            .contains("invalid exclude pattern")
+    );
+    // the cached snapshot stays searchable instead of being wiped
+    assert_eq!(engine.status().indexed, 1);
+    engine.set_query("notes", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        e.results()
+            .iter()
+            .any(|r| r.path.ends_with("meeting-notes.md"))
+    });
+}
+
+#[test]
+fn unwatchable_root_reports_live_update_failure() {
+    let aux = tempfile::tempdir().unwrap();
+    let config = config_for(std::path::Path::new("/nonexistent-fsearch-root"));
+    let mut engine = Engine::new(
+        config,
+        aux.path().join("index.bin"),
+        aux.path().join("history"),
+    );
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && e.status().error.is_some()
+    });
+    assert!(
+        engine
+            .status()
+            .error
+            .unwrap()
+            .contains("live updates unavailable")
+    );
+}
