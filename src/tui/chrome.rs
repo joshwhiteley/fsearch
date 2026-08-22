@@ -81,6 +81,7 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
             actions.push((crate::keymap::Action::PreviewLayout, "preview"));
         }
     }
+    actions.push((crate::keymap::Action::Help, "help"));
     actions
         .into_iter()
         .filter_map(|(action, label)| {
@@ -97,6 +98,7 @@ fn minimal_hints(app: &App) -> Vec<(String, String)> {
     [
         (crate::keymap::Action::Quit, "quit"),
         (crate::keymap::Action::ClearQuery, "clear"),
+        (crate::keymap::Action::Help, "help"),
     ]
     .into_iter()
     .filter_map(|(action, label)| {
@@ -242,6 +244,125 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.menu.is_some() {
         draw_menu(frame, app, body);
     }
+    // the help overlay renders last so it floats above everything
+    if app.help.open {
+        draw_help(frame, app, screen);
+    }
+}
+
+/// Groups of actions shown in the help overlay, in display order. The
+/// keymap stays the single source of truth for the binding labels.
+const HELP_GROUPS: &[(&str, &[crate::keymap::Action])] = &[
+    (
+        "navigation",
+        &[
+            crate::keymap::Action::MoveUp,
+            crate::keymap::Action::MoveDown,
+            crate::keymap::Action::HistoryPrev,
+            crate::keymap::Action::HistoryNext,
+            crate::keymap::Action::Quit,
+        ],
+    ),
+    (
+        "open & actions",
+        &[
+            crate::keymap::Action::Open,
+            crate::keymap::Action::Menu,
+            crate::keymap::Action::QuickLook,
+            crate::keymap::Action::CopyPath,
+            crate::keymap::Action::Reveal,
+        ],
+    ),
+    (
+        "view",
+        &[
+            crate::keymap::Action::PreviewLayout,
+            crate::keymap::Action::DensityToggle,
+            crate::keymap::Action::FoldToggle,
+            crate::keymap::Action::PreviewPageUp,
+            crate::keymap::Action::PreviewPageDown,
+        ],
+    ),
+    (
+        "query modes",
+        &[
+            crate::keymap::Action::RegexToggle,
+            crate::keymap::Action::ClearQuery,
+            crate::keymap::Action::Help,
+        ],
+    ),
+];
+
+/// Text editing keys are handled before the keymap and can never be bound;
+/// the overlay says so instead of listing them as actions.
+const HELP_EDITING_NOTE: &str = "editing is fixed: typing · backspace · ←/→ · ctrl-a/e/w/d";
+
+/// Content rows of the help overlay: grouped actions, each with every
+/// configured binding joined by commas.
+fn help_overlay_lines(app: &App) -> Vec<Line<'static>> {
+    let heading = Style::default()
+        .fg(app.theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(app.theme.dim);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (title, actions) in HELP_GROUPS {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled((*title).to_string(), heading)));
+        let rows: Vec<(String, String)> = actions
+            .iter()
+            .filter_map(|action| {
+                let labels = app.keymap.labels(*action);
+                (!labels.is_empty()).then(|| ((*action).label().to_string(), labels.join(", ")))
+            })
+            .collect();
+        let label_width = rows.iter().map(|(label, _)| label.chars().count()).max();
+        let Some(label_width) = label_width else {
+            lines.pop(); // nothing bound in this group: drop the heading too
+            continue;
+        };
+        for (label, bindings) in rows {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {label:<label_width$}   ")),
+                Span::styled(bindings, dim),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(HELP_EDITING_NOTE.to_string(), dim)));
+    lines
+}
+
+/// Centered modal overlay with an accent border listing every action and
+/// its configured bindings; records its rect on `app.help` for hit testing.
+pub(super) fn draw_help(frame: &mut Frame, app: &mut App, screen: Rect) {
+    let lines = help_overlay_lines(app);
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (content_w + 4).max(20).min(screen.width.max(1)).max(1);
+    let height = ((lines.len() as u16 + 2).max(3)).min(screen.height.max(1));
+    let area = Rect {
+        x: screen.x + screen.width.saturating_sub(width) / 2,
+        y: screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    app.help.area = area;
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let inner_rows = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_rows) as u16;
+    app.help.scroll = app.help.scroll.min(max_scroll);
+    let accent = Style::default()
+        .fg(app.theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent))
+        .title(Span::styled("help", accent));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .scroll((app.help.scroll, 0));
+    frame.render_widget(paragraph, area);
 }
 
 /// Small actions popup anchored inside the body area; records its screen

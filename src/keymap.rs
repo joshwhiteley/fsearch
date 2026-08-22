@@ -27,6 +27,7 @@ pub enum Action {
     FoldToggle,
     PreviewPageUp,
     PreviewPageDown,
+    Help,
 }
 
 /// Key spec strings for the default bindings (identical to the historical
@@ -49,6 +50,7 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::FoldToggle, &["ctrl-x"]),
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
+    (Action::Help, &["f1", "ctrl-o"]),
 ];
 
 /// Parses a key spec like `"ctrl-y"`, `"CTRL+Y"`, `"alt+shift-x"`, `"f5"`,
@@ -147,6 +149,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "fold_toggle" => Action::FoldToggle,
         "preview_page_up" => Action::PreviewPageUp,
         "preview_page_down" => Action::PreviewPageDown,
+        "help" => Action::Help,
         _ => return None,
     })
 }
@@ -164,6 +167,32 @@ fn parse_specs<S: AsRef<str>>(specs: &[S]) -> Vec<(KeyCode, KeyModifiers)> {
 /// Key -> command map; `lookup` resolves a key event to its action.
 pub struct Keymap {
     bindings: HashMap<(KeyCode, KeyModifiers), Action>,
+}
+
+impl Action {
+    /// Human-readable name shown in the help overlay.
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::Quit => "quit",
+            Action::Open => "open",
+            Action::Menu => "actions menu",
+            Action::QuickLook => "quick look",
+            Action::CopyPath => "copy path",
+            Action::Reveal => "reveal in finder",
+            Action::ClearQuery => "clear query",
+            Action::RegexToggle => "toggle regex",
+            Action::HistoryPrev => "history back",
+            Action::HistoryNext => "history forward",
+            Action::MoveUp => "move up",
+            Action::MoveDown => "move down",
+            Action::PreviewLayout => "preview layout",
+            Action::DensityToggle => "row density",
+            Action::FoldToggle => "fold weak matches",
+            Action::PreviewPageUp => "preview page up",
+            Action::PreviewPageDown => "preview page down",
+            Action::Help => "help",
+        }
+    }
 }
 
 fn key_label(code: KeyCode, mods: KeyModifiers) -> Option<String> {
@@ -205,8 +234,9 @@ impl Keymap {
         self.bindings.get(&(code, mods)).copied()
     }
 
-    /// Shortest configured key label for an action, for contextual UI help.
-    pub fn shortcut(&self, action: Action) -> Option<String> {
+    /// All configured key labels for an action, shortest first. The help
+    /// overlay lists every binding, not just the shortest.
+    pub fn labels(&self, action: Action) -> Vec<String> {
         let mut labels: Vec<String> = self
             .bindings
             .iter()
@@ -219,7 +249,12 @@ impl Keymap {
                 .cmp(&b.chars().count())
                 .then_with(|| a.cmp(b))
         });
-        labels.into_iter().next()
+        labels
+    }
+
+    /// Shortest configured key label for an action, for contextual UI help.
+    pub fn shortcut(&self, action: Action) -> Option<String> {
+        self.labels(action).into_iter().next()
     }
 
     /// Builds a keymap from config overrides (action name -> key specs).
@@ -407,6 +442,26 @@ mod tests {
         assert_eq!(km.lookup(KeyCode::Backspace, KeyModifiers::NONE), None);
         assert_eq!(km.lookup(KeyCode::Char('x'), KeyModifiers::NONE), None);
         assert_eq!(km.lookup(KeyCode::Char('w'), KeyModifiers::CONTROL), None);
+    }
+
+    #[test]
+    fn help_defaults_and_override() {
+        let km = Keymap::default();
+        let (f1, none) = (KeyCode::F(1), KeyModifiers::NONE);
+        let (o, ctrl) = (KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(km.lookup(f1, none), Some(Action::Help));
+        assert_eq!(km.lookup(o, ctrl), Some(Action::Help));
+        assert_eq!(km.shortcut(Action::Help).as_deref(), Some("f1"));
+        // both default bindings show up, shortest first
+        assert_eq!(km.labels(Action::Help), vec!["f1", "ctrl-o"]);
+
+        // a config override replaces the whole list, like any other action
+        let mut overrides = HashMap::new();
+        overrides.insert("help".to_string(), vec!["f2".to_string()]);
+        let custom = Keymap::from_config(&overrides);
+        assert_eq!(custom.lookup(KeyCode::F(2), none), Some(Action::Help));
+        assert_eq!(custom.lookup(f1, none), None);
+        assert_eq!(custom.lookup(o, ctrl), None);
     }
 
     #[test]
