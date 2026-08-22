@@ -1,9 +1,21 @@
-use super::*;
+use super::chrome::{draw, gauge_cells, human_age, query_spans};
+use super::rows::{badge_for, score_bar, score_readout, spans_with_styles};
+use super::{App, Density, PreviewContent, PreviewLayout, Slot, UiMode};
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::theme::BorderKind;
+use crate::util::human_size;
+use crate::walker::FileMeta;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::ListState;
+use std::time::{Duration, Instant};
 
 fn test_app() -> App {
     let dir = tempfile::tempdir().unwrap();
@@ -63,7 +75,7 @@ fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
 #[test]
 fn renders_input_and_status() {
     let mut app = test_app();
-    app.input = "notes".to_string();
+    app.editor.input = "notes".to_string();
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
@@ -80,7 +92,7 @@ fn hints_show_only_while_input_is_empty() {
     assert!(text.contains("grep in files"));
     assert!(text.contains("larger:100mb"));
     assert!(text.contains("tab preview"));
-    app.input = "x".to_string();
+    app.editor.input = "x".to_string();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert!(!buffer_text(&terminal).contains("grep in files"));
 }
@@ -108,8 +120,8 @@ fn short_terminals_drop_query_hints_then_the_footer() {
 fn long_input_scrolls_to_keep_the_cursor_visible() {
     let mut app = test_app();
     // 28 chars against a 22-char visible row (24 cols minus borders)
-    app.input = "abcdefghijklmnopqrstuvwxyz01".to_string();
-    app.input_cursor = app.input.len();
+    app.editor.input = "abcdefghijklmnopqrstuvwxyz01".to_string();
+    app.editor.input_cursor = app.editor.input.len();
     let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
@@ -118,12 +130,12 @@ fn long_input_scrolls_to_keep_the_cursor_visible() {
     // the cursor sits inside the frame, one cell inside the right edge
     let pos = terminal.get_cursor_position().unwrap();
     assert_eq!(pos.x, 22);
-    assert!(app.input_scroll > 0);
+    assert!(app.editor.input_scroll > 0);
     // moving the edit cursor back toward the start scrolls back into view:
     // the window starts exactly at the cursor column
-    app.input_cursor = 2;
+    app.editor.input_cursor = 2;
     terminal.draw(|f| draw(f, &mut app)).unwrap();
-    assert_eq!(app.input_scroll, 2);
+    assert_eq!(app.editor.input_scroll, 2);
     let text = buffer_text(&terminal);
     assert!(text.contains("cdefgh"), "window starts at the cursor");
     assert!(!text.contains("ab"), "chars before the cursor stay clipped");
@@ -183,9 +195,9 @@ fn selected_file_shows_wrapped_contextual_shortcuts() {
 fn typing_updates_input_and_esc_quits() {
     let mut app = test_app();
     assert!(app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
-    assert_eq!(app.input, "a");
+    assert_eq!(app.editor.input, "a");
     assert!(app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
-    assert_eq!(app.input, "");
+    assert_eq!(app.editor.input, "");
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
 }
 
@@ -278,7 +290,7 @@ fn sections_render_on_empty_query_with_recent_opens() {
     assert!(text.contains("RECENT OPENS"));
     assert!(text.contains("RECENTLY MODIFIED"));
     // typing hides the sections
-    app.input = "x".to_string();
+    app.editor.input = "x".to_string();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert!(!buffer_text(&terminal).contains("RECENT OPENS"));
 }
@@ -286,20 +298,20 @@ fn sections_render_on_empty_query_with_recent_opens() {
 #[test]
 fn history_cycles_with_ctrl_p_and_n() {
     let mut app = test_app();
-    app.history = vec!["alpha".to_string(), "beta".to_string()];
+    app.history.entries = vec!["alpha".to_string(), "beta".to_string()];
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "beta");
+    assert_eq!(app.editor.input, "beta");
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "alpha");
+    assert_eq!(app.editor.input, "alpha");
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "beta");
+    assert_eq!(app.editor.input, "beta");
     // stepping past the newest clears back to a blank query
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "");
+    assert_eq!(app.editor.input, "");
     // typing resets the cursor position in history
     app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "beta");
+    assert_eq!(app.editor.input, "beta");
 }
 
 #[test]
@@ -394,8 +406,8 @@ fn filter_rows_render_raw_lines_verbatim() {
 #[test]
 fn filter_mode_right_does_not_open_menu() {
     let mut app = test_filter_app();
-    app.input = "x".to_string();
-    app.input_cursor = app.input.len(); // cursor at end: Right = Menu action
+    app.editor.input = "x".to_string();
+    app.editor.input_cursor = app.editor.input.len(); // cursor at end: Right = Menu action
     app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     assert_eq!(app.menu, None, "menu must not open in filter mode");
 }
@@ -485,84 +497,84 @@ fn ctrl_r_toggles_regex_mode() {
 #[test]
 fn insert_at_cursor_keeps_cursor_after_typed_char() {
     let mut app = test_app();
-    app.input = "ab".to_string();
-    app.input_cursor = 1;
-    app.insert_char('X');
-    assert_eq!(app.input, "aXb");
-    assert_eq!(app.input_cursor, 2);
+    app.editor.input = "ab".to_string();
+    app.editor.input_cursor = 1;
+    app.editor.insert_char('X');
+    assert_eq!(app.editor.input, "aXb");
+    assert_eq!(app.editor.input_cursor, 2);
 }
 
 #[test]
 fn cursor_arrows_move_across_multibyte_chars() {
     let mut app = test_app();
-    app.input = "héllo".to_string(); // 'é' is two bytes
-    app.input_cursor = app.input.len();
+    app.editor.input = "héllo".to_string(); // 'é' is two bytes
+    app.editor.input_cursor = app.editor.input.len();
     // stepping left crosses the two-byte 'é' exactly once
     for expected in [5usize, 4, 3, 1, 0] {
-        app.cursor_left();
-        assert_eq!(app.input_cursor, expected, "left step");
+        app.editor.cursor_left();
+        assert_eq!(app.editor.input_cursor, expected, "left step");
     }
     // stepping right from 0 crosses 'é' in one char-width jump
     for expected in [1usize, 3, 4, 5, 6] {
-        app.cursor_right();
-        assert_eq!(app.input_cursor, expected, "right step");
+        app.editor.cursor_right();
+        assert_eq!(app.editor.input_cursor, expected, "right step");
     }
     // moving left at the start / right at the end is a no-op
-    app.cursor_start();
-    app.cursor_left();
-    assert_eq!(app.input_cursor, 0);
-    app.cursor_end();
-    app.cursor_right();
-    assert_eq!(app.input_cursor, app.input.len());
+    app.editor.cursor_start();
+    app.editor.cursor_left();
+    assert_eq!(app.editor.input_cursor, 0);
+    app.editor.cursor_end();
+    app.editor.cursor_right();
+    assert_eq!(app.editor.input_cursor, app.editor.input.len());
 }
 
 #[test]
 fn ctrl_w_deletes_previous_word() {
     let mut app = test_app();
-    app.input = "needle   haystack".to_string();
-    app.input_cursor = app.input.len();
+    app.editor.input = "needle   haystack".to_string();
+    app.editor.input_cursor = app.editor.input.len();
     app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "needle   ");
-    assert_eq!(app.input_cursor, "needle   ".len());
+    assert_eq!(app.editor.input, "needle   ");
+    assert_eq!(app.editor.input_cursor, "needle   ".len());
     // readline ctrl-w also eats the trailing whitespace
-    app.delete_word_backward();
-    assert_eq!(app.input, "");
-    assert_eq!(app.input_cursor, 0);
+    app.editor.delete_word_backward();
+    assert_eq!(app.editor.input, "");
+    assert_eq!(app.editor.input_cursor, 0);
 }
 
 #[test]
 fn ctrl_d_deletes_char_under_cursor() {
     let mut app = test_app();
-    app.input = "abcd".to_string();
-    app.input_cursor = 1;
+    app.editor.input = "abcd".to_string();
+    app.editor.input_cursor = 1;
     app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-    assert_eq!(app.input, "acd");
-    assert_eq!(app.input_cursor, 1);
+    assert_eq!(app.editor.input, "acd");
+    assert_eq!(app.editor.input_cursor, 1);
 }
 
 #[test]
 fn ctrl_a_e_jump_to_ends() {
     let mut app = test_app();
-    app.input = "fsearch".to_string();
-    app.input_cursor = 3;
+    app.editor.input = "fsearch".to_string();
+    app.editor.input_cursor = 3;
     app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-    assert_eq!(app.input_cursor, 0);
+    assert_eq!(app.editor.input_cursor, 0);
     app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-    assert_eq!(app.input_cursor, app.input.len());
+    assert_eq!(app.editor.input_cursor, app.editor.input.len());
 }
 
 #[test]
 fn page_keys_scroll_preview_text_clamped() {
     let mut app = test_app();
-    app.preview_scroll = 5;
+    app.preview.scroll = 5;
     app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-    assert_eq!(app.preview_scroll, 25);
+    assert_eq!(app.preview.scroll, 25);
     app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-    assert_eq!(app.preview_scroll, 5);
+    assert_eq!(app.preview.scroll, 5);
     app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-    assert_eq!(app.preview_scroll, 0); // saturates at zero
+    assert_eq!(app.preview.scroll, 0); // saturates at zero
     app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-    assert_eq!(app.preview_scroll, 0);
+    assert_eq!(app.preview.scroll, 0);
 }
 
 fn test_row(path: &str) -> crate::engine::ResultRow {
@@ -589,10 +601,10 @@ fn mouse_state() -> App {
     let mut app = test_app();
     app.engine
         .inject_results_for_test(vec![test_row("/a"), test_row("/b"), test_row("/c")]);
-    app.results_area = Rect::new(0, 3, 40, 20);
-    app.preview_area = Rect::new(40, 3, 40, 20);
+    app.hit_test.results_area = Rect::new(0, 3, 40, 20);
+    app.hit_test.preview_area = Rect::new(40, 3, 40, 20);
     // comfy heights: rows at y 0-1, 2-3, 4-5
-    app.slots = vec![(Slot::Row(0), 2), (Slot::Row(1), 2), (Slot::Row(2), 2)];
+    app.hit_test.slots = vec![(Slot::Row(0), 2), (Slot::Row(1), 2), (Slot::Row(2), 2)];
     app.list_state = ListState::default();
     app
 }
@@ -609,7 +621,7 @@ fn mouse_wheel_in_results_moves_selection() {
 #[test]
 fn mouse_wheel_in_preview_scrolls_preview() {
     let mut app = mouse_state();
-    app.preview_scroll = 5;
+    app.preview.scroll = 5;
     // columns 40..80 land in the preview pane
     let down = MouseEvent {
         kind: MouseEventKind::ScrollDown,
@@ -618,7 +630,7 @@ fn mouse_wheel_in_preview_scrolls_preview() {
         modifiers: KeyModifiers::NONE,
     };
     assert!(app.handle_mouse(down));
-    assert_eq!(app.preview_scroll, 8);
+    assert_eq!(app.preview.scroll, 8);
     let up = MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 60,
@@ -626,7 +638,7 @@ fn mouse_wheel_in_preview_scrolls_preview() {
         modifiers: KeyModifiers::NONE,
     };
     assert!(app.handle_mouse(up));
-    assert_eq!(app.preview_scroll, 5);
+    assert_eq!(app.preview.scroll, 5);
 }
 
 #[test]
@@ -642,7 +654,7 @@ fn click_selects_row_without_opening() {
 #[test]
 fn click_on_fold_row_toggles_show_weak() {
     let mut app = mouse_state();
-    app.slots = vec![(Slot::Row(0), 2), (Slot::Fold, 1), (Slot::Row(1), 2)];
+    app.hit_test.slots = vec![(Slot::Row(0), 2), (Slot::Fold, 1), (Slot::Row(1), 2)];
     // the fold row sits at y_rel 2 (absolute y 5)
     assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5)));
     assert!(app.show_weak, "fold click should reveal weaker matches");
@@ -811,8 +823,8 @@ fn preview_header_shows_name_and_line_count() {
     let lines: Vec<Line<'static>> = (1..=100).map(|i| Line::from(format!("line {i}"))).collect();
     // hand the preview pane ready-made content plus the matching cache key
     // so load_preview keeps it instead of replacing it with "loading..."
-    app.preview_for = Some(("/a/b/notes.md".into(), None));
-    app.preview = PreviewContent::Lines(lines);
+    app.preview.for_key = Some(("/a/b/notes.md".into(), None));
+    app.preview.content = PreviewContent::Lines(lines);
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
@@ -836,8 +848,8 @@ fn preview_position_indicator_overflows_short_pane() {
         score: None,
     }]);
     let lines: Vec<Line<'static>> = (1..=100).map(|i| Line::from(format!("line {i}"))).collect();
-    app.preview_for = Some(("/a/b/notes.md".into(), None));
-    app.preview = PreviewContent::Lines(lines);
+    app.preview.for_key = Some(("/a/b/notes.md".into(), None));
+    app.preview.content = PreviewContent::Lines(lines);
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
@@ -925,9 +937,9 @@ fn semantic_scored_rows_render_without_panicking() {
 #[test]
 fn calc_mode_renders_expression_and_result() {
     let mut app = test_app();
-    app.input = "= 2*(3+4)".to_string();
-    app.input_cursor = app.input.len();
-    app.engine.set_query(&app.input, false);
+    app.editor.input = "= 2*(3+4)".to_string();
+    app.editor.input_cursor = app.editor.input.len();
+    app.engine.set_query(&app.editor.input, false);
     let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
@@ -935,9 +947,9 @@ fn calc_mode_renders_expression_and_result() {
     assert!(text.contains("2*(3+4) ="), "expression");
     assert!(text.contains("14"), "result");
     // an unfinished expression shows no rows and no error
-    app.input = "= 2*".to_string();
-    app.input_cursor = app.input.len();
-    app.engine.set_query(&app.input, false);
+    app.editor.input = "= 2*".to_string();
+    app.editor.input_cursor = app.editor.input.len();
+    app.engine.set_query(&app.editor.input, false);
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert_eq!(app.engine.results().len(), 0);
     assert!(app.engine.status().error.is_none());

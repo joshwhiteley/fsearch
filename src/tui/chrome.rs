@@ -1,4 +1,15 @@
-use super::*;
+use super::preview::draw_preview;
+use super::rows::draw_results;
+use super::{App, PreviewLayout, UiMode};
+use crate::engine::Mode;
+use crate::theme::{BorderKind, Theme};
+use crate::util::human_size;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
+use std::time::Duration;
 
 const QUERY_HINTS: &[(&str, &str)] = &[
     (">", "grep in files"),
@@ -151,7 +162,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
         .collect();
     // on short terminals hint rows are dropped before they starve the body
-    let query_help = if app.input.is_empty() && screen.height >= QUERY_HINTS_MIN_HEIGHT {
+    let query_help = if app.editor.input.is_empty() && screen.height >= QUERY_HINTS_MIN_HEIGHT {
         help_lines(&query_items, screen.width, &app.theme)
     } else {
         Vec::new()
@@ -207,11 +218,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_preview(frame, app, cols[1]);
         }
         PreviewLayout::Full => {
-            app.results_area = Rect::default();
+            app.hit_test.results_area = Rect::default();
             draw_preview(frame, app, body);
         }
         PreviewLayout::Hidden => {
-            app.preview_area = Rect::default();
+            app.hit_test.preview_area = Rect::default();
             draw_results(frame, app, body);
         }
     }
@@ -338,25 +349,25 @@ pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     // readline-style horizontal scroll: once the edit cursor would leave
     // the visible row, shift the query left so the cursor stays one cell
     // inside the right edge
-    let cursor_col = app.input[..app.input_cursor].chars().count();
+    let cursor_col = app.editor.input[..app.editor.input_cursor].chars().count();
     let width = inner.width as usize;
     if width == 0 {
-        app.input_scroll = 0;
+        app.editor.input_scroll = 0;
     } else {
-        if app.input_scroll > cursor_col {
-            app.input_scroll = cursor_col;
+        if app.editor.input_scroll > cursor_col {
+            app.editor.input_scroll = cursor_col;
         }
-        if cursor_col >= app.input_scroll + width {
-            app.input_scroll = cursor_col + 1 - width;
+        if cursor_col >= app.editor.input_scroll + width {
+            app.editor.input_scroll = cursor_col + 1 - width;
         }
-        let max_skip = app.input.chars().count().saturating_sub(width);
-        app.input_scroll = app.input_scroll.min(max_skip);
+        let max_skip = app.editor.input.chars().count().saturating_sub(width);
+        app.editor.input_scroll = app.editor.input_scroll.min(max_skip);
     }
-    let input = Paragraph::new(Line::from(query_spans(&app.input, app.theme.accent)))
-        .scroll((0, app.input_scroll as u16))
+    let input = Paragraph::new(Line::from(query_spans(&app.editor.input, app.theme.accent)))
+        .scroll((0, app.editor.input_scroll as u16))
         .block(block);
     frame.render_widget(input, area);
-    let visible_col = (cursor_col - app.input_scroll).min(width.saturating_sub(1));
+    let visible_col = (cursor_col - app.editor.input_scroll).min(width.saturating_sub(1));
     frame.set_cursor_position((inner.x + visible_col as u16, inner.y));
 }
 
@@ -381,22 +392,16 @@ pub(super) fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let dim = Style::default().fg(app.theme.dim);
     let mut spans = vec![Span::raw(format!("{} indexed", s.indexed))];
     spans.push(Span::raw(format!(" · {} matches", s.matches)));
-    // stat the selected path only when the selection changes; the cached
-    // triple is reused while the same row stays selected
-    if let Some(row) = app.engine.results().get(app.selected) {
-        if app.status_path != row.path {
-            app.status_path = row.path.clone();
-            app.status_meta = std::fs::metadata(&row.path)
-                .ok()
-                .map(|meta| (meta.is_file(), meta.len(), meta.modified().ok()));
+    // the stat cache is refreshed by the event loop (refresh_status), never
+    // here: the draw pass stays free of filesystem access
+    if app.engine.results().get(app.selected).is_some()
+        && let Some((is_file, len, modified)) = app.status.meta
+    {
+        if is_file {
+            spans.push(Span::raw(format!(" · {}", human_size(len))));
         }
-        if let Some((is_file, len, modified)) = app.status_meta {
-            if is_file {
-                spans.push(Span::raw(format!(" · {}", human_size(len))));
-            }
-            if let Some(modified) = modified {
-                spans.push(Span::raw(format!(" · {}", human_age(modified))));
-            }
+        if let Some(modified) = modified {
+            spans.push(Span::raw(format!(" · {}", human_age(modified))));
         }
     }
     if s.indexing {

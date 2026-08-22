@@ -1,4 +1,15 @@
-use super::*;
+use super::chrome::{human_age, selection_style, themed_block};
+use super::{App, Density, Slot};
+use crate::engine::Mode;
+use crate::matcher::Highlighter;
+use crate::util::human_size;
+use crate::walker::FileMeta;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{List, ListItem, Paragraph};
+use std::time::{Duration, SystemTime};
 
 pub(super) fn spans_with_styles(
     shown: &str,
@@ -153,29 +164,29 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let dir_color = app.theme.accent;
     // take the cached highlighter out so the results borrow doesn't block
     // rebuilding it; it goes back on App before the frame renders
-    let mut highlighter = std::mem::take(&mut app.highlighter);
-    if matches!(app.engine.mode(), Mode::Fuzzy) && !app.input.is_empty() {
-        if app.highlighter_input != app.input {
-            app.highlighter_input = app.input.clone();
-            highlighter = Some(Highlighter::new(&app.input));
+    let mut highlighter = std::mem::take(&mut app.highlights.fuzzy);
+    if matches!(app.engine.mode(), Mode::Fuzzy) && !app.editor.input.is_empty() {
+        if app.highlights.input != app.editor.input {
+            app.highlights.input = app.editor.input.clone();
+            highlighter = Some(Highlighter::new(&app.editor.input));
         }
     } else {
-        app.highlighter_input.clear();
+        app.highlights.input.clear();
         highlighter = None;
     }
     // same take/rebuild cache for the first-match content highlight
-    let mut content_re = std::mem::take(&mut app.content_highlight);
-    if matches!(app.engine.mode(), Mode::Content) && !app.input.is_empty() {
-        if app.content_highlight_input != app.input {
-            app.content_highlight_input = app.input.clone();
-            let (_, pattern) = crate::engine::parse_query(&app.input, app.regex_mode);
+    let mut content_re = std::mem::take(&mut app.highlights.content);
+    if matches!(app.engine.mode(), Mode::Content) && !app.editor.input.is_empty() {
+        if app.highlights.content_input != app.editor.input {
+            app.highlights.content_input = app.editor.input.clone();
+            let (_, pattern) = crate::engine::parse_query(&app.editor.input, app.regex_mode);
             content_re = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(!pattern.chars().any(char::is_uppercase))
                 .build()
                 .ok();
         }
     } else {
-        app.content_highlight_input.clear();
+        app.highlights.content_input.clear();
         content_re = None;
     }
     let inner_width = area.width.saturating_sub(2) as usize; // minus the borders
@@ -395,7 +406,8 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let has_rows = !rows.is_empty();
     let hidden = rows.len().saturating_sub(visible);
     let opened = rows.iter().take_while(|r| r.recent_open).count();
-    let sectioned = app.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
+    let sectioned =
+        app.editor.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
     let mut display_items = items;
     let mut display_selected = app.selected;
     // slot map mirrors the final display list 1:1 for mouse hit testing:
@@ -465,23 +477,24 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             slots.push((Slot::Fold, 1));
         }
     }
-    app.highlighter = highlighter;
+    app.highlights.fuzzy = highlighter;
     let block = themed_block("results", &app.theme);
-    app.results_area = block.inner(area);
+    app.hit_test.results_area = block.inner(area);
     let list = List::new(display_items)
         .block(block)
         .highlight_style(selection_style(&app.theme));
     app.list_state.select(Some(display_selected));
     frame.render_stateful_widget(list, area, &mut app.list_state);
-    app.slots = slots;
+    app.hit_test.slots = slots;
     // empty state: say so instead of leaving a silent blank pane (the
     // status bar already carries indexing progress)
     if !has_rows && !app.engine.status().indexing && app.engine.mode() != Mode::Calc {
         let text = "(no matches)";
         let width = text.len() as u16;
         let rect = Rect {
-            x: app.results_area.x + app.results_area.width.saturating_sub(width) / 2,
-            y: app.results_area.y + app.results_area.height / 2,
+            x: app.hit_test.results_area.x
+                + app.hit_test.results_area.width.saturating_sub(width) / 2,
+            y: app.hit_test.results_area.y + app.hit_test.results_area.height / 2,
             width,
             height: 1,
         };

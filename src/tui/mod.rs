@@ -1,11 +1,8 @@
 use crate::actions;
 use crate::engine::{Engine, Mode};
 use crate::highlight::{self, Appearance};
-use crate::images;
 use crate::matcher::Highlighter;
-use crate::theme::{BorderKind, Theme};
-use crate::util::human_size;
-use crate::walker::FileMeta;
+use crate::theme::Theme;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -13,16 +10,11 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState,
-};
-use ratatui::{Frame, Terminal, backend::CrosstermBackend, crossterm::execute};
+use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
+use ratatui::widgets::ListState;
+use ratatui::{Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
-use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -84,199 +76,21 @@ pub enum Slot {
     Row(usize),
 }
 
-pub struct App {
-    pub engine: Engine,
+/// Query text editing state: the input string, its byte-offset cursor, and
+/// the horizontal scroll that keeps the cursor visible.
+pub struct Editor {
     pub input: String,
     /// Byte offset of the edit cursor, always on a char boundary.
     pub input_cursor: usize,
-    pub selected: usize,
-    pub regex_mode: bool,
-    pub preview_layout: PreviewLayout,
-    pub density: Density,
-    /// When false and the fuzzy score floor leaves weaker matches, only the
-    /// strong block is shown (weak matches behind the ctrl-x fold row).
-    pub show_weak: bool,
-    /// Floating confirmation toast: (text, when it was raised); auto-expires
-    /// after a couple of seconds and is dismissed by the next keypress.
-    pub message: Option<(String, Instant)>,
-    pub appearance: Appearance,
-    pub picker: Option<Picker>,
-    pub theme: Theme,
-    pub ui_mode: UiMode,
-    pub picked: Option<String>,
-    /// Open actions popup: Some(selected entry index).
-    pub menu: Option<usize>,
-    /// Command keybindings (configurable via `[keys]` in config.toml).
-    pub keymap: crate::keymap::Keymap,
-    /// Results list scroll state (selection + visual offset); persisted so
-    /// its offset reflects real scroll for mouse hit testing.
-    pub list_state: ListState,
-    /// Display-order hit-test map for the results list: (slot, row height).
-    pub slots: Vec<(Slot, u16)>,
-    /// Inner rect of the results block, or Rect::default() when hidden.
-    pub results_area: Rect,
-    /// Inner rect of the preview block, or Rect::default() when hidden.
-    pub preview_area: Rect,
-    /// Last single click on a result row: (row index, when) for double-click.
-    last_click: Option<(usize, Instant)>,
-    pub history: Vec<String>,
-    history_pos: Option<usize>,
-    history_file: Option<std::path::PathBuf>,
-    preview_for: Option<(String, Option<u64>)>,
-    preview: PreviewContent,
-    /// Preview loading runs on a worker thread; these move requests/results.
-    preview_tx: mpsc::Sender<PreviewRequest>,
-    preview_rx: mpsc::Receiver<PreviewResult>,
-    preview_gen: u64,
-    /// Cached fuzzy-match highlighter, rebuilt only when input changes.
-    highlighter_input: String,
-    highlighter: Option<Highlighter>,
-    /// Cached first-match regex for content rows, rebuilt only when input
-    /// changes (same take/rebuild pattern as the highlighter).
-    content_highlight_input: String,
-    content_highlight: Option<regex::Regex>,
-    /// Cached stat of the status line's selected path (is_file, size, mtime).
-    status_path: String,
-    status_meta: Option<(bool, u64, Option<SystemTime>)>,
-    /// Pixel dimensions of the image preview, from the decode on the worker.
-    preview_image_dims: Option<(u32, u32)>,
-    /// First line shown in the text preview; reset on selection change.
-    preview_scroll: usize,
     /// Char offset of the first visible input character; shifts once the
     /// edit cursor would leave the query row.
-    input_scroll: usize,
-    /// Screen rect of the open actions popup, for mouse hit testing;
-    /// Rect::default() while closed.
-    pub menu_area: Rect,
+    pub input_scroll: usize,
 }
 
-impl App {
-    pub fn new(engine: Engine) -> App {
-        let (preview_tx, preview_rx) = mpsc::channel::<PreviewRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
-        // one preview worker for the app's lifetime; exits when the app
-        // (and thus preview_tx) is dropped. Per-request work is panic-guarded:
-        // image decoding, SVG rendering, and syntect highlighting all run in
-        // here, and a dead worker would leave previews stuck on "loading..."
-        std::thread::spawn(move || {
-            while let Ok(req) = preview_rx.recv() {
-                let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    preview_payload(&req)
-                }))
-                .unwrap_or_else(|_| PreviewPayload::Lines(vec![Line::from("(preview failed)")]));
-                if result_tx
-                    .send(PreviewResult {
-                        generation: req.generation,
-                        path: req.path,
-                        line_number: req.line_number,
-                        payload,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
-        App {
-            engine,
-            input: String::new(),
-            input_cursor: 0,
-            selected: 0,
-            regex_mode: false,
-            preview_layout: PreviewLayout::Side,
-            density: Density::Comfy,
-            show_weak: false,
-            message: None,
-            appearance: Appearance::Dark,
-            picker: None,
-            theme: crate::theme::resolve("default", None),
-            ui_mode: UiMode::Open,
-            picked: None,
-            menu: None,
-            keymap: crate::keymap::Keymap::default(),
-            list_state: ListState::default(),
-            slots: Vec::new(),
-            results_area: Rect::default(),
-            preview_area: Rect::default(),
-            last_click: None,
-            history: Vec::new(),
-            history_pos: None,
-            history_file: None,
-            preview_for: None,
-            preview: PreviewContent::Lines(Vec::new()),
-            preview_tx,
-            preview_rx: result_rx,
-            preview_gen: 0,
-            highlighter_input: String::new(),
-            highlighter: None,
-            content_highlight_input: String::new(),
-            content_highlight: None,
-            status_path: String::new(),
-            status_meta: None,
-            preview_image_dims: None,
-            preview_scroll: 0,
-            input_scroll: 0,
-            menu_area: Rect::default(),
-        }
-    }
-
-    const MENU: [&'static str; 5] = [
-        "open",
-        "reveal in finder",
-        "copy path",
-        "quick look",
-        "move to trash",
-    ];
-
-    fn run_menu_action(&mut self, entry: usize) {
-        self.menu = None;
-        match entry {
-            0 => self.open_selected(),
-            1 => self.act(actions::reveal, "revealed"),
-            2 => self.act(actions::copy, "copied"),
-            3 => self.act(actions::quick_look, "quick look"),
-            4 => self.act(actions::trash, "trashed"),
-            _ => {}
-        }
-    }
-
-    fn history_step(&mut self, back: bool) {
-        if self.history.is_empty() {
-            return;
-        }
-        let next = match (self.history_pos, back) {
-            (None, true) => Some(self.history.len() - 1),
-            (None, false) => return,
-            (Some(0), true) => Some(0),
-            (Some(i), true) => Some(i - 1),
-            (Some(i), false) if i + 1 < self.history.len() => Some(i + 1),
-            (Some(_), false) => {
-                // stepped past the newest entry: back to a blank query
-                self.history_pos = None;
-                self.input.clear();
-                self.input_cursor = 0;
-                self.refresh_query();
-                return;
-            }
-        };
-        self.history_pos = next;
-        if let Some(i) = next {
-            self.input = self.history[i].clone();
-            self.input_cursor = self.input.len();
-            self.refresh_query_keep_history();
-        }
-    }
-
-    fn push_history(&mut self) {
-        let q = self.input.trim().to_string();
-        if q.is_empty() {
-            return;
-        }
-        self.history.retain(|prev| prev != &q);
-        self.history.push(q.clone());
-        if let Some(file) = &self.history_file {
-            crate::frecency::append_query(file, &q);
-        }
+impl Editor {
+    fn clear(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
     }
 
     /// Byte offset of the start of the last char in `s[..end]` (0 if none).
@@ -360,6 +174,237 @@ impl App {
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
     }
+}
+
+/// Query history: loaded once at startup, cycled with ctrl-p/ctrl-n, and
+/// appended to the history file on each activation.
+pub struct History {
+    pub entries: Vec<String>,
+    /// Position while stepping through `entries`; None sits "past the
+    /// newest", i.e. on a blank query.
+    pos: Option<usize>,
+    file: Option<std::path::PathBuf>,
+}
+
+/// The preview pipeline: what is shown, for which row, the worker channel,
+/// and per-content display state (scroll, image dimensions).
+pub struct Preview {
+    /// The row the current content was loaded for: (path, line number).
+    pub for_key: Option<(String, Option<u64>)>,
+    pub content: PreviewContent,
+    /// Preview loading runs on a worker thread; these move requests/results.
+    pub tx: mpsc::Sender<PreviewRequest>,
+    pub rx: mpsc::Receiver<PreviewResult>,
+    pub generation: u64,
+    /// First line shown in the text preview; reset on selection change.
+    pub scroll: usize,
+    /// Pixel dimensions of the image preview, from the decode on the worker.
+    pub image_dims: Option<(u32, u32)>,
+}
+
+/// Geometry recorded by the draw pass so mouse events can hit-test rows,
+/// panes, and the fold/header decorations.
+pub struct HitTest {
+    /// Display-order hit-test map for the results list: (slot, row height).
+    pub slots: Vec<(Slot, u16)>,
+    /// Inner rect of the results block, or Rect::default() when hidden.
+    pub results_area: Rect,
+    /// Inner rect of the preview block, or Rect::default() when hidden.
+    pub preview_area: Rect,
+    /// Last single click on a result row: (row index, when) for double-click.
+    last_click: Option<(usize, Instant)>,
+}
+
+/// Cached match highlighters for the results list, rebuilt only when the
+/// input changes (same take/rebuild pattern for both caches).
+pub struct Highlights {
+    pub(crate) input: String,
+    pub(crate) fuzzy: Option<Highlighter>,
+    pub(crate) content_input: String,
+    pub(crate) content: Option<regex::Regex>,
+}
+
+/// Cached stat of the status line's selected path (is_file, size, mtime),
+/// refreshed outside the draw pass.
+pub struct StatusCache {
+    pub path: String,
+    pub meta: Option<(bool, u64, Option<SystemTime>)>,
+}
+
+pub struct App {
+    pub engine: Engine,
+    pub selected: usize,
+    pub regex_mode: bool,
+    pub preview_layout: PreviewLayout,
+    pub density: Density,
+    /// When false and the fuzzy score floor leaves weaker matches, only the
+    /// strong block is shown (weak matches behind the ctrl-x fold row).
+    pub show_weak: bool,
+    /// Floating confirmation toast: (text, when it was raised); auto-expires
+    /// after a couple of seconds and is dismissed by the next keypress.
+    pub message: Option<(String, Instant)>,
+    pub appearance: Appearance,
+    pub picker: Option<Picker>,
+    pub theme: Theme,
+    pub ui_mode: UiMode,
+    pub picked: Option<String>,
+    /// Open actions popup: Some(selected entry index).
+    pub menu: Option<usize>,
+    /// Command keybindings (configurable via `[keys]` in config.toml).
+    pub keymap: crate::keymap::Keymap,
+    /// Results list scroll state (selection + visual offset); persisted so
+    /// its offset reflects real scroll for mouse hit testing.
+    pub list_state: ListState,
+    /// Screen rect of the open actions popup, for mouse hit testing;
+    /// Rect::default() while closed.
+    pub menu_area: Rect,
+    pub editor: Editor,
+    pub history: History,
+    pub preview: Preview,
+    pub hit_test: HitTest,
+    pub highlights: Highlights,
+    pub status: StatusCache,
+}
+
+impl App {
+    pub fn new(engine: Engine) -> App {
+        let (preview_tx, preview_rx) = mpsc::channel::<PreviewRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
+        // one preview worker for the app's lifetime; exits when the app
+        // (and thus preview_tx) is dropped. Per-request work is panic-guarded:
+        // image decoding, SVG rendering, and syntect highlighting all run in
+        // here, and a dead worker would leave previews stuck on "loading..."
+        std::thread::spawn(move || {
+            while let Ok(req) = preview_rx.recv() {
+                let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    preview_payload(&req)
+                }))
+                .unwrap_or_else(|_| PreviewPayload::Lines(vec![Line::from("(preview failed)")]));
+                if result_tx
+                    .send(PreviewResult {
+                        generation: req.generation,
+                        path: req.path,
+                        line_number: req.line_number,
+                        payload,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        App {
+            engine,
+            selected: 0,
+            regex_mode: false,
+            preview_layout: PreviewLayout::Side,
+            density: Density::Comfy,
+            show_weak: false,
+            message: None,
+            appearance: Appearance::Dark,
+            picker: None,
+            theme: crate::theme::resolve("default", None),
+            ui_mode: UiMode::Open,
+            picked: None,
+            menu: None,
+            keymap: crate::keymap::Keymap::default(),
+            list_state: ListState::default(),
+            menu_area: Rect::default(),
+            editor: Editor {
+                input: String::new(),
+                input_cursor: 0,
+                input_scroll: 0,
+            },
+            history: History {
+                entries: Vec::new(),
+                pos: None,
+                file: None,
+            },
+            preview: Preview {
+                for_key: None,
+                content: PreviewContent::Lines(Vec::new()),
+                tx: preview_tx,
+                rx: result_rx,
+                generation: 0,
+                scroll: 0,
+                image_dims: None,
+            },
+            hit_test: HitTest {
+                slots: Vec::new(),
+                results_area: Rect::default(),
+                preview_area: Rect::default(),
+                last_click: None,
+            },
+            highlights: Highlights {
+                input: String::new(),
+                fuzzy: None,
+                content_input: String::new(),
+                content: None,
+            },
+            status: StatusCache {
+                path: String::new(),
+                meta: None,
+            },
+        }
+    }
+
+    const MENU: [&'static str; 5] = [
+        "open",
+        "reveal in finder",
+        "copy path",
+        "quick look",
+        "move to trash",
+    ];
+
+    fn run_menu_action(&mut self, entry: usize) {
+        self.menu = None;
+        match entry {
+            0 => self.open_selected(),
+            1 => self.act(actions::reveal, "revealed"),
+            2 => self.act(actions::copy, "copied"),
+            3 => self.act(actions::quick_look, "quick look"),
+            4 => self.act(actions::trash, "trashed"),
+            _ => {}
+        }
+    }
+
+    fn history_step(&mut self, back: bool) {
+        if self.history.entries.is_empty() {
+            return;
+        }
+        let next = match (self.history.pos, back) {
+            (None, true) => Some(self.history.entries.len() - 1),
+            (None, false) => return,
+            (Some(0), true) => Some(0),
+            (Some(i), true) => Some(i - 1),
+            (Some(i), false) if i + 1 < self.history.entries.len() => Some(i + 1),
+            (Some(_), false) => {
+                // stepped past the newest entry: back to a blank query
+                self.history.pos = None;
+                self.editor.clear();
+                self.refresh_query();
+                return;
+            }
+        };
+        self.history.pos = next;
+        if let Some(i) = next {
+            self.editor.input = self.history.entries[i].clone();
+            self.editor.input_cursor = self.editor.input.len();
+            self.refresh_query_keep_history();
+        }
+    }
+
+    fn push_history(&mut self) {
+        let q = self.editor.input.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.history.entries.retain(|prev| prev != &q);
+        self.history.entries.push(q.clone());
+        if let Some(file) = &self.history.file {
+            crate::frecency::append_query(file, &q);
+        }
+    }
 
     /// Returns false when the app should quit.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -380,28 +425,30 @@ impl App {
         // text editing is fixed and handled before the keymap, so those keys
         // can never be rebound (see fsearch::keymap::is_editing_key)
         match key.code {
-            KeyCode::Left => self.cursor_left(),
-            KeyCode::Right if self.input_cursor < self.input.len() => self.cursor_right(),
+            KeyCode::Left => self.editor.cursor_left(),
+            KeyCode::Right if self.editor.input_cursor < self.editor.input.len() => {
+                self.editor.cursor_right();
+            }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cursor_start();
+                self.editor.cursor_start();
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cursor_end();
+                self.editor.cursor_end();
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.delete_word_backward();
+                self.editor.delete_word_backward();
                 self.refresh_query();
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.delete_forward();
+                self.editor.delete_forward();
                 self.refresh_query();
             }
             KeyCode::Backspace => {
-                self.delete_backward();
+                self.editor.delete_backward();
                 self.refresh_query();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
+                self.editor.insert_char(c);
                 self.refresh_query();
             }
             _ => {
@@ -437,8 +484,7 @@ impl App {
                 }
             }
             crate::keymap::Action::ClearQuery => {
-                self.input.clear();
-                self.input_cursor = 0;
+                self.editor.clear();
                 self.refresh_query();
             }
             crate::keymap::Action::RegexToggle => {
@@ -464,31 +510,31 @@ impl App {
                 }
             }
             crate::keymap::Action::PreviewPageUp => {
-                self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_SCROLL_PAGE);
+                self.preview.scroll = self.preview.scroll.saturating_sub(PREVIEW_SCROLL_PAGE);
             }
             crate::keymap::Action::PreviewPageDown => {
-                self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_PAGE);
+                self.preview.scroll = self.preview.scroll.saturating_add(PREVIEW_SCROLL_PAGE);
             }
         }
         true
     }
 
     fn refresh_query(&mut self) {
-        self.history_pos = None;
+        self.history.pos = None;
         self.refresh_query_keep_history();
     }
 
     fn refresh_query_keep_history(&mut self) {
         self.selected = 0;
         self.show_weak = false;
-        self.engine.set_query(&self.input, self.regex_mode);
+        self.engine.set_query(&self.editor.input, self.regex_mode);
     }
 
     /// Rows currently on screen: the strong block when weaker matches are
     /// folded away, otherwise every result.
     fn visible_len(&self) -> usize {
         if matches!(self.engine.mode(), Mode::Fuzzy)
-            && !self.input.is_empty()
+            && !self.editor.input.is_empty()
             && !self.show_weak
             && self.engine.strong_count() < self.engine.results().len()
         {
@@ -571,17 +617,17 @@ impl App {
         };
         match ev.kind {
             MouseEventKind::ScrollDown => {
-                if self.results_area.contains(point) {
+                if self.hit_test.results_area.contains(point) {
                     self.move_selection(1);
-                } else if self.preview_area.contains(point) {
-                    self.preview_scroll = self.preview_scroll.saturating_add(3);
+                } else if self.hit_test.preview_area.contains(point) {
+                    self.preview.scroll = self.preview.scroll.saturating_add(3);
                 }
             }
             MouseEventKind::ScrollUp => {
-                if self.results_area.contains(point) {
+                if self.hit_test.results_area.contains(point) {
                     self.move_selection(-1);
-                } else if self.preview_area.contains(point) {
-                    self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                } else if self.hit_test.preview_area.contains(point) {
+                    self.preview.scroll = self.preview.scroll.saturating_sub(3);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -598,7 +644,7 @@ impl App {
                     }
                     return true;
                 }
-                if self.results_area.contains(point) {
+                if self.hit_test.results_area.contains(point) {
                     return self.click_results(ev.row);
                 }
             }
@@ -611,17 +657,23 @@ impl App {
     /// visible slots (from `list_state.offset()`) and accumulating heights.
     /// Returns false when the click activated a selection in `--pick` mode.
     fn click_results(&mut self, row: u16) -> bool {
-        let y_rel = row.saturating_sub(self.results_area.y);
+        let y_rel = row.saturating_sub(self.hit_test.results_area.y);
         let mut cursor_y = 0u16;
-        for (slot, h) in self.slots.iter().skip(self.list_state.offset()).copied() {
+        for (slot, h) in self
+            .hit_test
+            .slots
+            .iter()
+            .skip(self.list_state.offset())
+            .copied()
+        {
             if y_rel < cursor_y + h {
                 return match slot {
                     Slot::Row(i) => {
                         let now = Instant::now();
-                        let double = self.last_click.is_some_and(|(prev, at)| {
+                        let double = self.hit_test.last_click.is_some_and(|(prev, at)| {
                             prev == i && at.elapsed() < Duration::from_millis(450)
                         });
-                        self.last_click = Some((i, now));
+                        self.hit_test.last_click = Some((i, now));
                         self.selected = i;
                         if double {
                             self.activate_selected()
@@ -663,32 +715,33 @@ impl App {
 
     fn load_preview(&mut self) {
         let Some(row) = self.engine.results().get(self.selected) else {
-            self.preview_for = None;
-            self.preview = PreviewContent::Lines(vec![Line::from("no selection")]);
-            self.preview_image_dims = None;
+            self.preview.for_key = None;
+            self.preview.content = PreviewContent::Lines(vec![Line::from("no selection")]);
+            self.preview.image_dims = None;
             return;
         };
         let key = (row.path.clone(), row.line_number);
-        if self.preview_for.as_ref() == Some(&key) {
+        if self.preview.for_key.as_ref() == Some(&key) {
             return;
         }
-        self.preview_for = Some(key);
-        self.preview_scroll = 0;
-        self.preview_image_dims = None;
+        self.preview.for_key = Some(key);
+        self.preview.scroll = 0;
+        self.preview.image_dims = None;
         // directories (trailing '/') and macOS .app bundles are both
         // directories without a text preview
         if row.path.ends_with('/') || row.path.to_ascii_lowercase().ends_with(".app") {
             // cheap; stays on the UI thread
-            self.preview = PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
+            self.preview.content =
+                PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
             return;
         }
         // expensive loading (file read, highlight, PDF/image decode) happens
         // on the preview worker; show a placeholder until poll_preview
-        // delivers the result on a later draw
-        self.preview = PreviewContent::Lines(vec![Line::from("loading...")]);
-        self.preview_gen += 1;
-        let _ = self.preview_tx.send(PreviewRequest {
-            generation: self.preview_gen,
+        // delivers the result on a later tick
+        self.preview.content = PreviewContent::Lines(vec![Line::from("loading...")]);
+        self.preview.generation += 1;
+        let _ = self.preview.tx.send(PreviewRequest {
+            generation: self.preview.generation,
             path: row.path.clone(),
             line_number: row.line_number,
             appearance: self.appearance,
@@ -696,24 +749,25 @@ impl App {
         });
     }
 
-    /// Applies preview results that arrived since the last draw. Stale
+    /// Applies preview results that arrived since the last tick. Stale
     /// generations and superseded selections are dropped.
     fn poll_preview(&mut self) {
-        while let Ok(result) = self.preview_rx.try_recv() {
-            if result.generation != self.preview_gen {
+        while let Ok(result) = self.preview.rx.try_recv() {
+            if result.generation != self.preview.generation {
                 continue;
             }
             if !self
-                .preview_for
+                .preview
+                .for_key
                 .as_ref()
                 .is_some_and(|(p, n)| p == &result.path && *n == result.line_number)
             {
                 continue;
             }
-            self.preview = match result.payload {
+            self.preview.content = match result.payload {
                 PreviewPayload::Lines(lines) => PreviewContent::Lines(lines),
                 PreviewPayload::Image(img) => {
-                    self.preview_image_dims = Some((img.width(), img.height()));
+                    self.preview.image_dims = Some((img.width(), img.height()));
                     match &self.picker {
                         Some(picker) => {
                             #[cfg(feature = "chafa")]
@@ -736,6 +790,20 @@ impl App {
                     }
                 }
             };
+        }
+    }
+
+    /// Refreshes the status line's stat cache when the selection changed.
+    /// Runs in the event loop so the draw pass never touches the filesystem.
+    fn refresh_status(&mut self) {
+        let Some(row) = self.engine.results().get(self.selected) else {
+            return;
+        };
+        if self.status.path != row.path {
+            self.status.path = row.path.clone();
+            self.status.meta = std::fs::metadata(&row.path)
+                .ok()
+                .map(|meta| (meta.is_file(), meta.len(), meta.modified().ok()));
         }
     }
 }
@@ -855,15 +923,20 @@ pub fn run(
         app.preview_layout = PreviewLayout::Hidden;
     }
     let queries_path = crate::frecency::default_queries_path();
-    app.history = crate::frecency::load_queries(&queries_path);
-    app.history_file = Some(queries_path);
+    app.history.entries = crate::frecency::load_queries(&queries_path);
+    app.history.file = Some(queries_path);
     if !initial_query.is_empty() {
-        app.input = initial_query.to_string();
-        app.input_cursor = app.input.len();
-        app.engine.set_query(&app.input, app.regex_mode);
+        app.editor.input = initial_query.to_string();
+        app.editor.input_cursor = app.editor.input.len();
+        app.engine.set_query(&app.editor.input, app.regex_mode);
     }
     let result = loop {
         app.engine.tick();
+        // side effects stay out of the draw pass: apply worker results,
+        // issue new preview loads, and stat the selected path here
+        app.poll_preview();
+        app.load_preview();
+        app.refresh_status();
         let len = app.visible_len();
         if app.selected >= len && len > 0 {
             app.selected = len - 1;
@@ -903,5 +976,8 @@ mod preview;
 mod rows;
 #[cfg(test)]
 mod tests;
-#[allow(unused_imports)]
-use self::{chrome::*, preview::*, rows::*};
+use self::chrome::draw;
+use self::preview::{
+    PreviewContent, PreviewPayload, PreviewRequest, PreviewResult, directory_listing,
+    preview_payload,
+};

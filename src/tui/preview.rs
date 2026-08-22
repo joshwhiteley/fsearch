@@ -1,6 +1,19 @@
-use super::*;
+use super::chrome::themed_block;
+use super::rows::{kind_label, path_name, row_age, shorten_home};
+use super::{App, PREVIEW_BYTES};
+use crate::highlight::{self, Appearance};
+use crate::images;
+use crate::util::human_size;
+use crate::walker::FileMeta;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+use std::time::SystemTime;
 
-pub(super) enum PreviewContent {
+pub enum PreviewContent {
     Lines(Vec<Line<'static>>),
     Image(Box<StatefulProtocol>),
     /// Image rendered by fsearch's own chafa pipeline (geometric symbols,
@@ -17,22 +30,22 @@ pub(super) enum PreviewContent {
 /// One preview load job; everything the worker needs (no Picker/ratatui
 /// image types cross the channel — protocol construction stays on the UI
 /// thread).
-pub(super) struct PreviewRequest {
-    pub(super) generation: u64,
-    pub(super) path: String,
-    pub(super) line_number: Option<u64>,
-    pub(super) appearance: Appearance,
-    pub(super) gutter: Color,
+pub struct PreviewRequest {
+    pub generation: u64,
+    pub path: String,
+    pub line_number: Option<u64>,
+    pub appearance: Appearance,
+    pub gutter: Color,
 }
 
-pub(super) struct PreviewResult {
-    pub(super) generation: u64,
-    pub(super) path: String,
-    pub(super) line_number: Option<u64>,
-    pub(super) payload: PreviewPayload,
+pub struct PreviewResult {
+    pub generation: u64,
+    pub path: String,
+    pub line_number: Option<u64>,
+    pub payload: PreviewPayload,
 }
 
-pub(super) enum PreviewPayload {
+pub enum PreviewPayload {
     /// Styled, line-numbered preview lines (text and PDFs).
     Lines(Vec<Line<'static>>),
     /// Decoded image; not yet converted to a ratatui-image protocol.
@@ -194,13 +207,13 @@ pub(super) fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>>
 /// up in the accent, and tokens the real parser consumes as filters (ext:,
 /// kind:, changed:, ...) turn yellow. Concatenating the span contents
 /// reproduces `input` exactly, so the cursor math below stays valid.
-pub(super) fn preview_meta(app: &App) -> Option<FileMeta> {
+fn preview_meta(app: &App) -> Option<FileMeta> {
     let row = app.engine.results().get(app.selected)?;
     if let Some(m) = row.meta {
         return Some(m);
     }
-    if app.status_path == row.path
-        && let Some((_, len, modified)) = app.status_meta
+    if app.status.path == row.path
+        && let Some((_, len, modified)) = app.status.meta
     {
         let mtime = modified
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -211,12 +224,10 @@ pub(super) fn preview_meta(app: &App) -> Option<FileMeta> {
 }
 
 /// Kind label for the preview header: uppercased extension, or DIR / FILE.
-pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
-    app.poll_preview();
-    app.load_preview();
+pub fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = themed_block("preview", &app.theme);
     let inner = block.inner(area);
-    app.preview_area = inner;
+    app.hit_test.preview_area = inner;
     frame.render_widget(block, area);
     // 2-line header: dim parent path + bold filename, then a dim
     // kind · size · age line (with pixel dims for images, line count for text)
@@ -240,8 +251,8 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         let mut meta_line = vec![Span::styled(kind_label(&row.path), dim)];
         // image previews carry their pixels between the kind and the size
-        if !matches!(&app.preview, PreviewContent::Lines(_))
-            && let Some((w, h)) = app.preview_image_dims
+        if !matches!(&app.preview.content, PreviewContent::Lines(_))
+            && let Some((w, h)) = app.preview.image_dims
         {
             meta_line.push(Span::styled(format!(" · {w}×{h}"), dim));
         }
@@ -251,7 +262,7 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                 meta_line.push(Span::styled(format!(" · {age}"), dim));
             }
         }
-        if let PreviewContent::Lines(lines) = &app.preview
+        if let PreviewContent::Lines(lines) = &app.preview.content
             && !lines.is_empty()
         {
             meta_line.push(Span::styled(format!(" · {} lines", lines.len()), dim));
@@ -274,7 +285,7 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         height: inner.height.saturating_sub(2),
     };
     let dim = Style::default().fg(app.theme.dim);
-    match &mut app.preview {
+    match &mut app.preview.content {
         PreviewContent::Lines(lines) => {
             let total = lines.len();
             let visible = body.height as usize;
@@ -282,10 +293,10 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                 // the last body row shows the position line, so the content
                 // gets one row less
                 let content_rows = visible - 1;
-                app.preview_scroll = app.preview_scroll.min(total.saturating_sub(content_rows));
+                app.preview.scroll = app.preview.scroll.min(total.saturating_sub(content_rows));
                 let shown: Vec<Line<'static>> = lines
                     .iter()
-                    .skip(app.preview_scroll)
+                    .skip(app.preview.scroll)
                     .take(content_rows)
                     .cloned()
                     .collect();
@@ -298,8 +309,8 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                         height: content_rows as u16,
                     },
                 );
-                let first = app.preview_scroll + 1;
-                let last = (app.preview_scroll + content_rows).min(total);
+                let first = app.preview.scroll + 1;
+                let last = (app.preview.scroll + content_rows).min(total);
                 let pos = format!("{first}–{last} / {total}");
                 let avail = body.width.saturating_sub(1); // scrollbar column
                 let pad = avail.saturating_sub(pos.chars().count() as u16) as usize;
@@ -315,11 +326,11 @@ pub(super) fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                 );
                 let mut bar_state = ScrollbarState::new(total)
                     .viewport_content_length(content_rows)
-                    .position(app.preview_scroll);
+                    .position(app.preview.scroll);
                 let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight).style(dim);
                 frame.render_stateful_widget(bar, body, &mut bar_state);
             } else {
-                app.preview_scroll = 0;
+                app.preview.scroll = 0;
                 let shown: Vec<Line<'static>> = lines.to_vec();
                 frame.render_widget(Paragraph::new(shown), body);
             }
