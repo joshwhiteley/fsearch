@@ -88,12 +88,6 @@ fn load_index(config: &config::Config) -> fsearch::index::PathStore {
     })
 }
 
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
 /// The N largest files in the index — a quick "what is eating my disk".
 fn biggest(n: usize) {
     let config = load_config();
@@ -114,109 +108,29 @@ fn biggest(n: usize) {
 fn print_search(query: &str) {
     let config = load_config();
     let store = load_index(&config);
-
-    let (query_filters, stripped) = fsearch::filters::parse(query, unix_now());
-    let query = if query_filters.is_empty() {
-        query.to_string()
-    } else {
-        stripped
+    let opts = fsearch::query::Options {
+        max_content_filesize: config.max_content_filesize,
+        quiet: fsearch::quiet::Quiet::new(config.quiet.clone()),
+        pdf_cache: fsearch::pdf::default_cache_dir(),
     };
-    let matched = if let Some(q) = query.strip_prefix('?') {
-        let q = q.trim_start().to_string();
-        let mut embedder = fsearch::sem::make_embedder().unwrap_or_else(|e| {
+    let result = fsearch::query::search(&store, query, &opts, &mut |hit| match hit {
+        fsearch::query::Hit::Path(path) => println!("{path}"),
+        fsearch::query::Hit::Line {
+            path,
+            line_number,
+            line,
+        } => println!("{path}:{line_number}:{line}"),
+        fsearch::query::Hit::Semantic {
+            path,
+            line_start,
+            score,
+        } => println!("{path}:{line_start}:{score:.2}"),
+    });
+    let matched = match result {
+        Ok(any) => any,
+        Err(e) => {
             eprintln!("fsearch: {e}");
             std::process::exit(2);
-        });
-        let store_path = fsearch::sem::default_store_path();
-        let sem_store = match fsearch::sem::SemStore::load(&store_path) {
-            Some(s) if s.dim as usize == embedder.dim() => s,
-            Some(_) => {
-                eprintln!(
-                    "fsearch: semantic index is from another model — rerun fsearch --index-semantic"
-                );
-                std::process::exit(2);
-            }
-            None => {
-                eprintln!("fsearch: no semantic index yet — run fsearch --index-semantic");
-                std::process::exit(2);
-            }
-        };
-        let qv = embedder.embed(&[q]).unwrap_or_else(|e| {
-            eprintln!("fsearch: {e}");
-            std::process::exit(2);
-        });
-        let mut any = false;
-        for hit in sem_store.query(&qv[0], fsearch::engine::SEMANTIC_LIMIT) {
-            let path = &sem_store.docs[hit.doc].path;
-            if query_filters.is_empty() || query_filters.matches(path) {
-                any = true;
-                println!("{path}:{}:{:.2}", hit.line_start, hit.score);
-            }
-        }
-        any
-    } else if let Some(pattern) = query.strip_prefix('>') {
-        let pattern = pattern.trim_start().to_string();
-        let indices: Vec<usize> = (0..store.len())
-            .filter(|&i| {
-                query_filters.is_empty()
-                    || (query_filters.matches(store.get(i))
-                        && query_filters.matches_meta(&store.meta(i)))
-            })
-            .collect();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let max = config.max_content_filesize;
-        let result = std::thread::scope(|scope| {
-            let handle = scope.spawn(|| {
-                let pdf_cache = fsearch::pdf::default_cache_dir();
-                let r = fsearch::content::search(
-                    &indices,
-                    |i| store.get(i),
-                    &pattern,
-                    max,
-                    &pdf_cache,
-                    &cancel,
-                    &tx,
-                );
-                drop(tx);
-                r
-            });
-            let mut any = false;
-            for hit in rx {
-                any = true;
-                println!("{}:{}:{}", hit.path, hit.line_number, hit.line);
-            }
-            handle.join().expect("content search panicked").map(|_| any)
-        });
-        match result {
-            Ok(any) => any,
-            Err(e) => {
-                eprintln!("fsearch: invalid pattern: {e}");
-                std::process::exit(2);
-            }
-        }
-    } else {
-        match fsearch::matcher::search_boosted(
-            &store,
-            &query,
-            fsearch::matcher::FilenameMode::Fuzzy,
-            500,
-            &std::collections::HashMap::new(),
-            &query_filters,
-            &fsearch::quiet::Quiet::new(config.quiet.clone()),
-        ) {
-            Ok(r) => {
-                // scripting keeps the old behavior: print only the strong
-                // matches, not the fold-away weaker tail
-                for i in r.indices.iter().take(r.strong) {
-                    println!("{}", store.get(*i));
-                }
-                !r.indices.is_empty()
-            }
-            Err(e) => {
-                eprintln!("fsearch: {e}");
-                std::process::exit(2);
-            }
         }
     };
     if !matched {
