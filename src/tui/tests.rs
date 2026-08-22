@@ -26,6 +26,7 @@ fn test_app() -> App {
         theme: Default::default(),
         keys: Default::default(),
         mouse: true,
+        remember_session: true,
         index_apps: false,
         quiet: Vec::new(),
     };

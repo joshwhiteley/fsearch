@@ -39,6 +39,24 @@ impl PreviewLayout {
             PreviewLayout::Hidden => PreviewLayout::Side,
         }
     }
+
+    /// Stable key for the session state file; [`Self::from_key`] inverts it.
+    fn key(self) -> &'static str {
+        match self {
+            PreviewLayout::Side => "side",
+            PreviewLayout::Full => "full",
+            PreviewLayout::Hidden => "hidden",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<PreviewLayout> {
+        match s {
+            "side" => Some(PreviewLayout::Side),
+            "full" => Some(PreviewLayout::Full),
+            "hidden" => Some(PreviewLayout::Hidden),
+            _ => None,
+        }
+    }
 }
 
 /// Row layout for the results list; ctrl-t toggles between them.
@@ -54,6 +72,22 @@ impl Density {
         match self {
             Density::Comfy => Density::Compact,
             Density::Compact => Density::Comfy,
+        }
+    }
+
+    /// Stable key for the session state file; [`Self::from_key`] inverts it.
+    fn key(self) -> &'static str {
+        match self {
+            Density::Comfy => "comfy",
+            Density::Compact => "compact",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Density> {
+        match s {
+            "comfy" => Some(Density::Comfy),
+            "compact" => Some(Density::Compact),
+            _ => None,
         }
     }
 }
@@ -886,6 +920,7 @@ pub fn run(
     theme: Theme,
     keymap: crate::keymap::Keymap,
     mouse: bool,
+    remember_session: bool,
 ) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
@@ -921,6 +956,20 @@ pub fn run(
         // filter rows are arbitrary lines, not real files: start with the
         // preview hidden (Tab still cycles, previews of real files work)
         app.preview_layout = PreviewLayout::Hidden;
+    } else if remember_session {
+        // restore the layout and density saved by the last clean exit;
+        // unknown or missing values keep the config defaults
+        let state = crate::session::load(&crate::session::default_state_path());
+        if let Some(layout) = state
+            .preview_layout
+            .as_deref()
+            .and_then(PreviewLayout::from_key)
+        {
+            app.preview_layout = layout;
+        }
+        if let Some(density) = state.density.as_deref().and_then(Density::from_key) {
+            app.density = density;
+        }
     }
     let queries_path = crate::frecency::default_queries_path();
     app.history.entries = crate::frecency::load_queries(&queries_path);
@@ -968,6 +1017,14 @@ pub fn run(
     };
     restore_terminal(mouse);
     let _ = std::panic::take_hook(); // drop the restoring hook
+    if remember_session && result.is_ok() {
+        // only a clean quit updates the saved settings; errors leave them alone
+        crate::session::save(
+            &crate::session::default_state_path(),
+            app.preview_layout.key(),
+            app.density.key(),
+        );
+    }
     result.map(|_| app.picked)
 }
 

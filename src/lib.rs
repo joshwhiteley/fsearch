@@ -17,6 +17,7 @@ pub mod pdf;
 pub mod query;
 pub mod quiet;
 pub mod sem;
+pub mod session;
 pub mod theme;
 pub mod tui;
 pub mod util;

@@ -53,6 +53,9 @@ pub struct Config {
     pub keys: HashMap<String, Vec<String>>,
     /// Mouse support: click to select, double-click to open, wheel scrolls.
     pub mouse: bool,
+    /// Restore the preview layout and row density from the last run
+    /// (state file at ~/.local/state/fsearch/session.toml).
+    pub remember_session: bool,
     /// Substring patterns demoted below the fold and off the launch screen.
     pub quiet: Vec<String>,
     /// Include /Applications app bundles in the index (macOS).
@@ -68,6 +71,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             keys: HashMap::new(),
             mouse: true,
+            remember_session: true,
             quiet: crate::quiet::DEFAULT_QUIET
                 .iter()
                 .map(|s| s.to_string())
@@ -85,6 +89,7 @@ struct RawConfig {
     theme: Option<RawTheme>,
     keys: Option<HashMap<String, KeySpec>>,
     mouse: Option<bool>,
+    remember_session: Option<bool>,
     quiet: Option<Vec<String>>,
     index_apps: Option<bool>,
 }
@@ -146,6 +151,8 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # index_apps: include /Applications app bundles in the index (macOS)
 # quiet: substrings demoted in ranking (app internals); set [] to disable
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
+# remember_session: restore preview layout and row density between runs
+#   (true/false)
 ";
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
@@ -197,6 +204,7 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
             })
             .unwrap_or_default(),
         mouse: raw.mouse.unwrap_or(true),
+        remember_session: raw.remember_session.unwrap_or(true),
         quiet: raw.quiet.unwrap_or_else(|| d.quiet.clone()),
         index_apps: raw.index_apps.unwrap_or(true),
     })
@@ -332,6 +340,20 @@ mod tests {
         assert!(!c.mouse);
         // default is on
         assert!(Config::default().mouse);
+    }
+
+    #[test]
+    fn remember_session_flag_parses_and_defaults_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "remember_session = false\n").unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert!(!c.remember_session);
+        // default is on, and a config without the key still parses
+        assert!(Config::default().remember_session);
+        let path2 = dir.path().join("plain.toml");
+        std::fs::write(&path2, "roots = [\"/tmp\"]\n").unwrap();
+        assert!(load_or_create(&path2).unwrap().remember_session);
     }
 
     #[test]

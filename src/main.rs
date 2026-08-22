@@ -178,6 +178,7 @@ fn run_filter(initial_query: &str) {
     // build the keymap and mouse flag before the engine consumes the config
     let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
     let mouse = config.mouse;
+    let remember_session = config.remember_session;
     let theme = fsearch::theme::resolve_config(&config.theme);
     let engine = Engine::from_lines(lines);
     match tui::run(
@@ -187,6 +188,7 @@ fn run_filter(initial_query: &str) {
         theme,
         keymap,
         mouse,
+        remember_session,
     ) {
         Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
         Ok(None) => std::process::exit(1), // nothing chosen: signal like grep
@@ -202,13 +204,22 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     // build the keymap and mouse flag before the engine consumes the config
     let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
     let mouse = config.mouse;
+    let remember_session = config.remember_session;
     let theme = fsearch::theme::resolve_config(&config.theme);
     let engine = Engine::new(
         config,
         index::default_cache_path(),
         fsearch::frecency::default_history_path(),
     );
-    match tui::run(engine, ui_mode, initial_query, theme, keymap, mouse) {
+    match tui::run(
+        engine,
+        ui_mode,
+        initial_query,
+        theme,
+        keymap,
+        mouse,
+        remember_session,
+    ) {
         Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
         Ok(None) => {
             if ui_mode == tui::UiMode::Pick {
