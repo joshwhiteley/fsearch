@@ -13,14 +13,14 @@ jobs:
     name: fmt + clippy
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo check --features semantic
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo check --locked --features semantic
 
   test:
     name: test (${{ matrix.os }})
@@ -30,12 +30,37 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      - run: cargo test --locked
       - name: PTY smoke test
         if: runner.os == 'macOS'
         run: |
-          cargo build --bin fsearch
+          cargo build --locked --bin fsearch
           tests/smoke.exp target/debug/fsearch
+
+  # semantic tests use the deterministic fake embedder (FSEARCH_SEM_FAKE=1,
+  # see tests/cli_test.rs), so no model download happens in CI
+  test-semantic:
+    name: test (semantic)
+    runs-on: ubuntu-latest
+    env:
+      FSEARCH_SEM_FAKE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --features semantic
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: cargo audit
+      - run: cargo deny check advisories sources
