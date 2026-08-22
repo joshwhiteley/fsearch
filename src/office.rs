@@ -100,8 +100,13 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     };
     let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = cache_dir.join(format!(".{key}.{}-{nonce}.tmp", std::process::id()));
-    let _ = std::fs::write(&tmp, body);
-    let _ = std::fs::rename(&tmp, target);
+    // a failed write is removed rather than renamed into place, so a
+    // disk-full event can't publish truncated text as a cache hit
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, target);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
     evict_oldest(cache_dir);
     result
 }
