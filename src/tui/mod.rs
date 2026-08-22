@@ -818,7 +818,7 @@ pub fn run(
     // a still-running UI is far worse than a garbled message.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if crate::pdf::in_extract_guard() {
+        if crate::in_parser_guard() {
             return;
         }
         if std::thread::current().name() == Some("main") {

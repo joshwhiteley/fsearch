@@ -20,3 +20,10 @@ pub mod theme;
 pub mod tui;
 pub mod util;
 pub mod walker;
+
+/// True while a panic-guarded parser (pdf-extract, office XML) runs on this
+/// thread. Panic hooks check it so contained parser failures stay silent
+/// instead of spraying over the UI (or tearing the terminal down).
+pub fn in_parser_guard() -> bool {
+    pdf::in_extract_guard() || office::in_extract_guard()
+}
