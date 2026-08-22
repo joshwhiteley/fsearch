@@ -10,6 +10,7 @@ use crate::index::PathStore;
 use crate::matcher::{self, FilenameMode};
 use crate::quiet::Quiet;
 use crate::sem;
+use crate::util::unix_now;
 use crate::walker::FileMeta;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -41,12 +42,6 @@ pub enum Hit {
         line_start: u32,
         score: f32,
     },
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Runs `input` as a full query against `store`, invoking `on_hit` per

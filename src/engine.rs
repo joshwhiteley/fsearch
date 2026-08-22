@@ -4,6 +4,7 @@ use crate::frecency::Frecency;
 use crate::index::PathStore;
 use crate::matcher::{self, FilenameMode};
 use crate::sem;
+use crate::util::unix_now;
 use crate::walker::FileMeta;
 use crate::{config::Config, index, walker};
 use std::collections::{HashMap, HashSet};
@@ -93,6 +94,12 @@ enum Msg {
         generation: u64,
         hit: ContentMatch,
     },
+    /// The content-search pattern was invalid; carries the reason for
+    /// display (no hits were produced).
+    ContentError {
+        generation: u64,
+        error: String,
+    },
     SemanticResults {
         generation: u64,
         rows: Vec<ResultRow>,
@@ -152,7 +159,9 @@ pub struct Engine {
     content_cancel: Option<Arc<AtomicBool>>,
     pending_semantic: Option<(String, Instant)>,
     sem_tx: Option<Sender<SemJob>>,
-    frecency: Frecency,
+    /// Open history; None in filter mode (stdin lines are not files, so
+    /// nothing is recorded or persisted).
+    frecency: Option<Frecency>,
     boosts: Arc<HashMap<String, u32>>,
     quiet: Arc<crate::quiet::Quiet>,
     filter: bool,
@@ -330,12 +339,6 @@ fn watch_loop(
     }
 }
 
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
 /// The single filename search worker: always process only the newest job.
 fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
     let worker_tx = tx;
@@ -479,7 +482,7 @@ impl Engine {
             content_cancel: None,
             pending_semantic: None,
             sem_tx: None,
-            frecency,
+            frecency: Some(frecency),
             boosts,
             quiet: Arc::new(crate::quiet::Quiet::new(quiet_patterns)),
             filter: false,
@@ -503,12 +506,9 @@ impl Engine {
             store: store.clone(),
             indexing: false,
         });
-        // no history for filter mode: an empty boost map, never persisted
+        // no history for filter mode: an empty boost map, nothing persisted
         // (record_open is never called here)
-        let frecency = Frecency::load(std::path::PathBuf::from(
-            "/nonexistent-fsearch-filter-history",
-        ));
-        let boosts = Arc::new(frecency.boosts(unix_now()));
+        let boosts = Arc::new(HashMap::new());
         Engine {
             msg_rx,
             msg_tx,
@@ -530,7 +530,7 @@ impl Engine {
             content_cancel: None,
             pending_semantic: None,
             sem_tx: None,
-            frecency,
+            frecency: None,
             boosts,
             // stdin lines are whatever the pipe says they are — no demotion
             quiet: Arc::new(crate::quiet::Quiet::new(Vec::new())),
@@ -545,8 +545,10 @@ impl Engine {
 
     /// Records that `path` was opened, boosting it in future rankings.
     pub fn record_open(&mut self, path: &str) {
-        self.frecency.record(path);
-        self.boosts = Arc::new(self.frecency.boosts(unix_now()));
+        if let Some(frecency) = self.frecency.as_mut() {
+            frecency.record(path);
+            self.boosts = Arc::new(frecency.boosts(unix_now()));
+        }
     }
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
@@ -712,6 +714,14 @@ impl Engine {
                         self.cancel_content();
                     }
                 }
+                Msg::ContentError { generation, error } => {
+                    // an invalid pattern produced no hits: show the reason
+                    // for the matching generation only
+                    if generation != self.generation {
+                        continue;
+                    }
+                    self.status.error = Some(error);
+                }
                 Msg::SemanticResults {
                     generation,
                     rows,
@@ -825,14 +835,12 @@ impl Engine {
                     break;
                 }
             }
-            // an invalid content pattern reuses FilenameResults purely to carry
-            // the error string; generation matching makes this safe
+            // an invalid content pattern surfaces as a typed error so the
+            // filename channel stays pure filename results
             if let Ok(Err(e)) = searcher.join() {
-                let _ = tx.send(Msg::FilenameResults {
+                let _ = tx.send(Msg::ContentError {
                     generation,
-                    indices: Vec::new(),
-                    strong: 0,
-                    error: Some(format!("invalid pattern: {e}")),
+                    error: format!("invalid pattern: {e}"),
                 });
             }
         });
