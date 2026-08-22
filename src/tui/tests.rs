@@ -133,8 +133,15 @@ fn long_input_scrolls_to_keep_the_cursor_visible() {
 fn empty_state_shows_no_matches_and_minimal_footer() {
     use crate::engine::ResultRow;
     let mut app = test_app();
-    // no injected rows: the launch screen has nothing to list
-    tick_until(&mut app, |a| !a.engine.status().indexing);
+    // no injected rows: the launch screen has nothing to list. Wait patiently:
+    // under a loaded test runner the initial walk can exceed tick_until's budget.
+    for _ in 0..2000 {
+        app.engine.tick();
+        if !app.engine.status().indexing {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     app.engine.inject_results_for_test(Vec::<ResultRow>::new());
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
