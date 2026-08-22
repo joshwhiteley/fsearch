@@ -14,6 +14,12 @@ const QUERY_HINTS: &[(&str, &str)] = &[
     ("tab", "preview"),
 ];
 
+/// Below this total height the wrapped query-hint rows are dropped so the
+/// results list keeps its space.
+const QUERY_HINTS_MIN_HEIGHT: u16 = 12;
+/// Below this height even the contextual shortcut footer is dropped.
+const ACTION_HINTS_MIN_HEIGHT: u16 = 8;
+
 pub(super) fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
     let mut block = Block::default()
         .borders(if theme.borders == BorderKind::None {
@@ -74,6 +80,22 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Footer for the empty state: with nothing selected to act on, keep
+/// quitting and clearing the query discoverable.
+fn minimal_hints(app: &App) -> Vec<(String, String)> {
+    [
+        (crate::keymap::Action::Quit, "quit"),
+        (crate::keymap::Action::ClearQuery, "clear"),
+    ]
+    .into_iter()
+    .filter_map(|(action, label)| {
+        app.keymap
+            .shortcut(action)
+            .map(|shortcut| (shortcut, label.to_string()))
+    })
+    .collect()
+}
+
 fn help_lines(items: &[(String, String)], width: u16, theme: &Theme) -> Vec<Line<'static>> {
     if items.is_empty() || width == 0 {
         return Vec::new();
@@ -123,16 +145,27 @@ fn help_lines(items: &[(String, String)], width: u16, theme: &Theme) -> Vec<Line
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let screen = frame.area();
     let query_items: Vec<(String, String)> = QUERY_HINTS
         .iter()
         .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
         .collect();
-    let query_help = if app.input.is_empty() {
-        help_lines(&query_items, frame.area().width, &app.theme)
+    // on short terminals hint rows are dropped before they starve the body
+    let query_help = if app.input.is_empty() && screen.height >= QUERY_HINTS_MIN_HEIGHT {
+        help_lines(&query_items, screen.width, &app.theme)
     } else {
         Vec::new()
     };
-    let action_help = help_lines(&contextual_hints(app), frame.area().width, &app.theme);
+    let mut action_items = contextual_hints(app);
+    if action_items.is_empty() && app.engine.results().is_empty() {
+        // empty state: keep quit/clear discoverable without results
+        action_items = minimal_hints(app);
+    }
+    let action_help = if screen.height >= ACTION_HINTS_MIN_HEIGHT {
+        help_lines(&action_items, screen.width, &app.theme)
+    } else {
+        Vec::new()
+    };
     // without borders the search bar only needs a title row + the text row
     let input_height = if app.theme.borders == BorderKind::None {
         2
@@ -195,13 +228,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(_) => app.message = None, // expired
         None => {}
     }
-    if let Some(selected) = app.menu {
-        draw_menu(frame, selected, body, &app.theme);
+    if app.menu.is_some() {
+        draw_menu(frame, app, body);
     }
 }
 
-/// Small actions popup anchored inside the body area.
-pub(super) fn draw_menu(frame: &mut Frame, selected: usize, body: Rect, theme: &Theme) {
+/// Small actions popup anchored inside the body area; records its screen
+/// rect on `app` so mouse clicks can hit-test the entries.
+pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
+    let Some(selected) = app.menu else {
+        return;
+    };
     let width = 24u16.min(body.width);
     let height = (App::MENU.len() as u16 + 2).min(body.height);
     let area = Rect {
@@ -210,14 +247,15 @@ pub(super) fn draw_menu(frame: &mut Frame, selected: usize, body: Rect, theme: &
         width,
         height,
     };
+    app.menu_area = area;
     frame.render_widget(ratatui::widgets::Clear, area);
     let items: Vec<ListItem> = App::MENU
         .iter()
         .map(|label| ListItem::new(format!(" {label}")))
         .collect();
     let list = List::new(items)
-        .block(themed_block("actions", theme))
-        .highlight_style(selection_style(theme));
+        .block(themed_block("actions", &app.theme))
+        .highlight_style(selection_style(&app.theme));
     let mut state = ListState::default();
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
@@ -281,7 +319,7 @@ pub(super) fn query_spans(input: &str, accent: Color) -> Vec<Span<'static>> {
     spans
 }
 
-pub(super) fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let mode = if app.engine.is_filter() {
         if app.regex_mode { "regex" } else { "filter" }
     } else {
@@ -297,12 +335,29 @@ pub(super) fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     // the cursor sits in the block's inner rect, so borderless mode (which
     // keeps one row for the title and none for borders) stays in step
     let inner = block.inner(area);
-    let input = Paragraph::new(Line::from(query_spans(&app.input, app.theme.accent))).block(block);
+    // readline-style horizontal scroll: once the edit cursor would leave
+    // the visible row, shift the query left so the cursor stays one cell
+    // inside the right edge
+    let cursor_col = app.input[..app.input_cursor].chars().count();
+    let width = inner.width as usize;
+    if width == 0 {
+        app.input_scroll = 0;
+    } else {
+        if app.input_scroll > cursor_col {
+            app.input_scroll = cursor_col;
+        }
+        if cursor_col >= app.input_scroll + width {
+            app.input_scroll = cursor_col + 1 - width;
+        }
+        let max_skip = app.input.chars().count().saturating_sub(width);
+        app.input_scroll = app.input_scroll.min(max_skip);
+    }
+    let input = Paragraph::new(Line::from(query_spans(&app.input, app.theme.accent)))
+        .scroll((0, app.input_scroll as u16))
+        .block(block);
     frame.render_widget(input, area);
-    frame.set_cursor_position((
-        inner.x + app.input[..app.input_cursor].chars().count() as u16,
-        inner.y,
-    ));
+    let visible_col = (cursor_col - app.input_scroll).min(width.saturating_sub(1));
+    frame.set_cursor_position((inner.x + visible_col as u16, inner.y));
 }
 
 /// Splits `shown` into spans, styling the chars at `positions` (char

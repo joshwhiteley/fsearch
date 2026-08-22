@@ -392,6 +392,7 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.engine.results();
     let visible = app.visible_len();
     let strong = app.engine.strong_count();
+    let has_rows = !rows.is_empty();
     let hidden = rows.len().saturating_sub(visible);
     let opened = rows.iter().take_while(|r| r.recent_open).count();
     let sectioned = app.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
@@ -473,6 +474,19 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     app.list_state.select(Some(display_selected));
     frame.render_stateful_widget(list, area, &mut app.list_state);
     app.slots = slots;
+    // empty state: say so instead of leaving a silent blank pane (the
+    // status bar already carries indexing progress)
+    if !has_rows && !app.engine.status().indexing && app.engine.mode() != Mode::Calc {
+        let text = "(no matches)";
+        let width = text.len() as u16;
+        let rect = Rect {
+            x: app.results_area.x + app.results_area.width.saturating_sub(width) / 2,
+            y: app.results_area.y + app.results_area.height / 2,
+            width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(Span::styled(text, dim)), rect);
+    }
 }
 
 /// `path` with a home-directory prefix shortened to `~`; unchanged otherwise.
