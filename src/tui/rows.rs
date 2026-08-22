@@ -196,6 +196,24 @@ pub(super) fn score_readout(s: f32, accent: Color, dim: Style) -> (usize, Vec<Sp
     (width, spans)
 }
 
+/// Gutter marker for a marked row: an accent-colored bar in front of the
+/// badge. Filter mode never shows marks (rows are arbitrary stdin lines,
+/// not files). Returns the spans and their cell width.
+pub(super) fn mark_spans(app: &App, path: &str) -> (Vec<Span<'static>>, usize) {
+    if !app.marking_enabled() || !app.marks.contains(path) {
+        return (Vec::new(), 0);
+    }
+    (
+        vec![Span::styled(
+            "▌ ",
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )],
+        2,
+    )
+}
+
 pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
     let match_color = app.theme.match_fg.unwrap_or(app.theme.accent);
@@ -292,8 +310,11 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             let parent_chars = shown.chars().count() - name_chars;
             match (r.line_number, &r.line) {
                 (Some(n), Some(line)) => {
+                    let (mark, mark_width) = mark_spans(app, &r.path);
                     let (badge, badge_width) = badge_spans(&r.path, badges, dir_color);
                     let (icon, icon_width) = icon_spans(&r.path, badges, dir_color, app.icons);
+                    let badge: Vec<Span<'static>> = mark.into_iter().chain(badge).collect();
+                    let badge_width = badge_width + mark_width;
                     let colon = format!(":{n}");
                     let age = row_age(r.meta);
                     match app.density {
@@ -365,8 +386,11 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
                 _ => {
+                    let (mark, mark_width) = mark_spans(app, &r.path);
                     let (badge, badge_width) = badge_spans(&r.path, badges, dir_color);
                     let (icon, icon_width) = icon_spans(&r.path, badges, dir_color, app.icons);
+                    let badge: Vec<Span<'static>> = mark.into_iter().chain(badge).collect();
+                    let badge_width = badge_width + mark_width;
                     // positions refer to the full path; shift them onto the
                     // `~`-shortened string, then partition them at the name
                     // boundary (the parent starts at index 0 of `shown`)

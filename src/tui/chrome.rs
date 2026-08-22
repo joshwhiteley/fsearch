@@ -59,9 +59,9 @@ pub(super) fn selection_style(theme: &Theme) -> Style {
 }
 
 fn contextual_hints(app: &App) -> Vec<(String, String)> {
-    if app.engine.results().get(app.selected).is_none() {
+    let Some(selected) = app.visible_selected_row() else {
         return Vec::new();
-    }
+    };
     let open_label = if app.engine.mode() == Mode::Calc {
         "copy result"
     } else if app.engine.is_filter() || app.ui_mode == UiMode::Pick {
@@ -69,16 +69,30 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
     } else {
         "open"
     };
-    let mut actions = vec![(crate::keymap::Action::Open, open_label)];
+    let mut actions = vec![(crate::keymap::Action::Open, open_label.to_string())];
     if app.engine.mode() != Mode::Calc {
         if !app.engine.is_filter() {
-            actions.push((crate::keymap::Action::Reveal, "reveal"));
+            actions.push((crate::keymap::Action::Reveal, "reveal".to_string()));
         }
-        actions.push((crate::keymap::Action::CopyPath, "copy path"));
+        actions.push((crate::keymap::Action::CopyPath, "copy path".to_string()));
         if !app.engine.is_filter() {
-            actions.push((crate::keymap::Action::QuickLook, "quick look"));
-            actions.push((crate::keymap::Action::Menu, "actions"));
-            actions.push((crate::keymap::Action::PreviewLayout, "preview"));
+            actions.push((crate::keymap::Action::QuickLook, "quick look".to_string()));
+            actions.push((crate::keymap::Action::Menu, "actions".to_string()));
+            actions.push((crate::keymap::Action::PreviewLayout, "preview".to_string()));
+            if app.marking_enabled() {
+                let mark_label = if app.marks.contains(&selected.path) {
+                    "unmark"
+                } else {
+                    "mark"
+                };
+                actions.push((crate::keymap::Action::ToggleMark, mark_label.to_string()));
+                if !app.marks.is_empty() {
+                    actions.push((
+                        crate::keymap::Action::ClearMarks,
+                        format!("clear ({} marked)", app.marks.len()),
+                    ));
+                }
+            }
         }
     }
     actions.push((crate::keymap::Action::Help, "help"));
@@ -87,7 +101,7 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
         .filter_map(|(action, label)| {
             app.keymap
                 .shortcut(action)
-                .map(|shortcut| (shortcut, label.to_string()))
+                .map(|shortcut| (shortcut, label))
         })
         .collect()
 }
@@ -365,8 +379,11 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     let Some(selected) = app.menu else {
         return;
     };
+    let entries = app.menu_entries();
+    let selected = selected.min(entries.len().saturating_sub(1));
+    app.menu = Some(selected);
     let width = 24u16.min(body.width);
-    let height = (App::MENU.len() as u16 + 2).min(body.height);
+    let height = (entries.len() as u16 + 2).min(body.height);
     let area = Rect {
         x: body.x + (body.width.saturating_sub(width)) / 2,
         y: body.y + (body.height.saturating_sub(height)) / 2,
@@ -375,7 +392,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     };
     app.menu_area = area;
     frame.render_widget(ratatui::widgets::Clear, area);
-    let items: Vec<ListItem> = App::MENU
+    let items: Vec<ListItem> = entries
         .iter()
         .map(|label| ListItem::new(format!(" {label}")))
         .collect();
@@ -507,9 +524,16 @@ pub(super) fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let dim = Style::default().fg(app.theme.dim);
     let mut spans = vec![Span::raw(format!("{} indexed", s.indexed))];
     spans.push(Span::raw(format!(" · {} matches", s.matches)));
+    // visible marks get their own count so batch actions are predictable
+    if app.marking_enabled() && app.engine.mode() != Mode::Calc {
+        let marked = app.visible_marked_count();
+        if marked > 0 {
+            spans.push(Span::raw(format!(" · {marked} marked")));
+        }
+    }
     // the stat cache is refreshed by the event loop (refresh_status), never
     // here: the draw pass stays free of filesystem access
-    if app.engine.results().get(app.selected).is_some()
+    if app.visible_selected_row().is_some()
         && let Some((is_file, len, modified)) = app.status.meta
     {
         if is_file {
