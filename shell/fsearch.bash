@@ -6,10 +6,12 @@
 #           skip rebinding by commenting out the bind -x line at the bottom
 
 __fsearch_file_widget() {
-  local picked
+  local picked quoted
   picked="$(fsearch --pick < /dev/tty)" || return
-  READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}${picked@Q}${READLINE_LINE:READLINE_POINT}"
-  READLINE_POINT=$((READLINE_POINT + ${#picked} + 2))
+  # printf %q works on bash 3.2 (macOS system bash), unlike ${picked@Q}
+  printf -v quoted '%q' "$picked"
+  READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}${quoted}${READLINE_LINE:READLINE_POINT}"
+  READLINE_POINT=$((READLINE_POINT + ${#quoted}))
 }
 bind -x '"\C-t": __fsearch_file_widget'
 
