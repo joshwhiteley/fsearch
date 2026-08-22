@@ -55,7 +55,8 @@ Run `fsearch` and start typing.
   `/` in a query (or `path:`) searches them at full rank
 - `enter` opens · `→` opens an actions menu (reveal, copy, quick look,
   move to trash) · `ctrl-space` Quick Look · `ctrl-y` copies the path ·
-  `ctrl-p`/`ctrl-n` recall query history ·
+  `ctrl-b` toggles a mark · `alt-b` clears marks · the actions menu batches
+  open/copy/trash over visible marked rows · `ctrl-p`/`ctrl-n` recall query history ·
   `tab` cycles the preview (side → full-window → hidden) · `esc` quits
 
 Piped input flips fsearch into an fzf-style filter: `git ls-files |
@@ -136,6 +137,8 @@ movement, ctrl-a/e/w/d) are fixed and can't be rebound.
     move_up = ["up", "ctrl-k"]
 
 `ctrl-g` cycles the theme presets live (session-only; config wins next run).
+`ctrl-b`/`alt-b` mark and clear files in open mode; filter and `--pick` modes
+keep marking disabled. Batch actions use only visible marked rows.
 `icons = true` prefixes result rows with nerd-font glyphs — it needs a nerd
 font, so it defaults to off.
 

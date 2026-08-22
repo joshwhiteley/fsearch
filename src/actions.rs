@@ -34,6 +34,24 @@ fn run(args: (&'static str, Vec<String>)) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// Runs a destructive action synchronously so a non-zero exit is reported to
+/// the caller instead of being presented as a successful trash operation.
+fn run_checked(args: (&'static str, Vec<String>)) -> std::io::Result<()> {
+    let status = Command::new(args.0)
+        .args(&args.1)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{} exited with {status}",
+            args.0
+        )))
+    }
+}
+
 pub fn open(path: &str) -> std::io::Result<()> {
     run(open_args(path))
 }
@@ -78,7 +96,7 @@ pub fn trash_args(path: &str) -> (&'static str, Vec<String>) {
 
 /// Moves the file to the system trash (recoverable).
 pub fn trash(path: &str) -> std::io::Result<()> {
-    run(trash_args(path))
+    run_checked(trash_args(path))
 }
 
 #[cfg(target_os = "macos")]
@@ -105,7 +123,15 @@ pub fn copy(path: &str) -> std::io::Result<()> {
                     .as_mut()
                     .expect("clipboard stdin is piped")
                     .write_all(path.as_bytes())?;
-                return child.wait().map(|_| ());
+                let status = child.wait()?;
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "{} exited with {status}",
+                        cmd[0]
+                    )))
+                };
             }
             Err(e) => last_err = e,
         }

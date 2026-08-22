@@ -1,5 +1,5 @@
 use crate::actions;
-use crate::engine::{Engine, Mode};
+use crate::engine::{Engine, Mode, ResultRow};
 use crate::highlight::{self, Appearance};
 use crate::matcher::Highlighter;
 use crate::theme::Theme;
@@ -15,6 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use ratatui::{Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -265,6 +266,48 @@ pub struct StatusCache {
     pub meta: Option<(bool, u64, Option<SystemTime>)>,
 }
 
+struct BatchOutcome {
+    succeeded: usize,
+    first_error: Option<(String, String)>,
+}
+
+fn run_batch<F>(paths: &[String], mut action: F) -> BatchOutcome
+where
+    F: FnMut(&str) -> std::io::Result<()>,
+{
+    let mut outcome = BatchOutcome {
+        succeeded: 0,
+        first_error: None,
+    };
+    for path in paths {
+        match action(path) {
+            Ok(()) => outcome.succeeded += 1,
+            Err(error) => {
+                if outcome.first_error.is_none() {
+                    outcome.first_error = Some((path.clone(), error.to_string()));
+                }
+            }
+        }
+    }
+    outcome
+}
+
+fn batch_summary(verb: &str, total: usize, outcome: &BatchOutcome) -> String {
+    if total == 0 {
+        return "no visible marked files".to_string();
+    }
+    let failed = total - outcome.succeeded;
+    match &outcome.first_error {
+        Some((path, error)) => {
+            format!(
+                "error: {verb} {}/{} files; {failed} failed ({path}: {error})",
+                outcome.succeeded, total
+            )
+        }
+        None => format!("{verb} {} files", outcome.succeeded),
+    }
+}
+
 pub struct App {
     pub engine: Engine,
     pub selected: usize,
@@ -303,6 +346,11 @@ pub struct App {
     pub hit_test: HitTest,
     pub highlights: Highlights,
     pub status: StatusCache,
+    /// Multi-select marks, tracked as PATHS so they survive reordering of
+    /// results. The set persists until cleared or quit; batch actions and
+    /// the row indicators operate only on currently-visible marked rows.
+    /// Never populated in filter mode (rows are arbitrary stdin lines).
+    pub marks: HashSet<String>,
 }
 
 impl App {
@@ -386,6 +434,7 @@ impl App {
                 path: String::new(),
                 meta: None,
             },
+            marks: HashSet::new(),
         }
     }
 
@@ -397,15 +446,117 @@ impl App {
         "move to trash",
     ];
 
+    /// Menu entries: the single-selection actions plus batch actions for
+    /// visible marks. Clear remains available for marks hidden by a filter or
+    /// the weaker-match fold.
+    fn menu_entries(&self) -> Vec<&'static str> {
+        let mut entries: Vec<&'static str> = Self::MENU.to_vec();
+        if self.marking_enabled() && self.visible_marked_count() > 0 {
+            entries.extend(["open marked", "copy marked paths", "trash marked"]);
+        }
+        if self.marking_enabled() && !self.marks.is_empty() {
+            entries.push("clear marks");
+        }
+        entries
+    }
+
+    /// The focused row only counts when it belongs to the currently visible
+    /// result set. A folded weak row must not be actionable.
+    fn visible_selected_row(&self) -> Option<&ResultRow> {
+        (self.selected < self.visible_len())
+            .then(|| self.engine.results().get(self.selected))
+            .flatten()
+    }
+
+    /// Paths of currently-visible marked rows in display order, deduplicated
+    /// because content search can return several hits for one path.
+    fn visible_marked(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.engine
+            .results()
+            .iter()
+            .take(self.visible_len())
+            .filter(|row| self.marks.contains(&row.path) && seen.insert(&row.path))
+            .map(|row| row.path.clone())
+            .collect()
+    }
+
+    /// Marking is an Open-mode file feature: `--pick`, filter stdin, and the
+    /// calculator have no persistent file rows to mark.
+    fn marking_enabled(&self) -> bool {
+        self.ui_mode == UiMode::Open && !self.engine.is_filter() && self.engine.mode() != Mode::Calc
+    }
+
+    fn visible_marked_count(&self) -> usize {
+        self.visible_marked().len()
+    }
+
     fn run_menu_action(&mut self, entry: usize) {
+        let Some(action) = self.menu_entries().get(entry).copied() else {
+            self.menu = None;
+            return;
+        };
         self.menu = None;
-        match entry {
-            0 => self.open_selected(),
-            1 => self.act(actions::reveal, "revealed"),
-            2 => self.act(actions::copy, "copied"),
-            3 => self.act(actions::quick_look, "quick look"),
-            4 => self.act(actions::trash, "trashed"),
+        match action {
+            "open" => self.open_selected(),
+            "reveal in finder" => self.act(actions::reveal, "revealed"),
+            "copy path" => self.act(actions::copy, "copied"),
+            "quick look" => self.act(actions::quick_look, "quick look"),
+            "move to trash" => self.act(actions::trash, "trashed"),
+            "open marked" => self.open_marked(),
+            "copy marked paths" => self.copy_marked(),
+            "trash marked" => self.trash_marked(),
+            "clear marks" => self.clear_marks(),
             _ => {}
+        }
+    }
+
+    fn set_message(&mut self, message: String) {
+        self.message = Some((message, Instant::now()));
+    }
+
+    /// Reuses the single-file open path, including frecency recording.
+    fn open_path(&mut self, path: &str) -> std::io::Result<()> {
+        actions::open(path)?;
+        self.engine.record_open(path);
+        Ok(())
+    }
+
+    /// Batch-open every visible marked row, continuing after failures and
+    /// reporting a partial result instead of silently dropping errors.
+    fn open_marked(&mut self) {
+        let paths = self.visible_marked();
+        let outcome = run_batch(&paths, |path| self.open_path(path));
+        self.set_message(batch_summary("opened", paths.len(), &outcome));
+    }
+
+    /// Copies the visible marked paths to the clipboard, newline-joined.
+    fn copy_marked(&mut self) {
+        let paths = self.visible_marked();
+        let message = if paths.is_empty() {
+            "no visible marked files".to_string()
+        } else {
+            match actions::copy(&paths.join("\n")) {
+                Ok(()) => format!("copied {} paths", paths.len()),
+                Err(error) => format!("error copying {} paths: {error}", paths.len()),
+            }
+        };
+        self.set_message(message);
+    }
+
+    /// Moves every visible marked row to the trash, continuing after failures
+    /// and reporting the first failure with the success count.
+    fn trash_marked(&mut self) {
+        let paths = self.visible_marked();
+        let outcome = run_batch(&paths, actions::trash);
+        self.set_message(batch_summary("trashed", paths.len(), &outcome));
+    }
+
+    fn clear_marks(&mut self) {
+        let cleared = self.marks.len();
+        self.marks.clear();
+        if cleared > 0 {
+            self.set_message(format!("cleared {cleared} marks"));
         }
     }
 
@@ -452,11 +603,12 @@ impl App {
         self.message = None;
         // the actions popup swallows navigation while open
         if let Some(selected) = self.menu {
+            let entries = self.menu_entries();
             match key.code {
                 KeyCode::Esc | KeyCode::Left => self.menu = None,
-                KeyCode::Down => self.menu = Some((selected + 1) % Self::MENU.len()),
+                KeyCode::Down => self.menu = Some((selected + 1) % entries.len()),
                 KeyCode::Up => {
-                    self.menu = Some((selected + Self::MENU.len() - 1) % Self::MENU.len());
+                    self.menu = Some((selected + entries.len() - 1) % entries.len());
                 }
                 KeyCode::Enter => self.run_menu_action(selected),
                 _ => {}
@@ -488,7 +640,13 @@ impl App {
                 self.editor.delete_backward();
                 self.refresh_query();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // matches is_editing_key: only bare characters (and ctrl-a/e/w/d
+            // above) type; ctrl/alt-modified chars go to the keymap
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.editor.insert_char(c);
                 self.refresh_query();
             }
@@ -509,7 +667,7 @@ impl App {
             crate::keymap::Action::Quit => return false,
             crate::keymap::Action::Open => return self.activate_selected(),
             crate::keymap::Action::Menu => {
-                if !self.engine.is_filter() && !self.engine.results().is_empty() {
+                if !self.engine.is_filter() && self.visible_selected_row().is_some() {
                     self.menu = Some(0);
                 }
             }
@@ -556,6 +714,19 @@ impl App {
             }
             crate::keymap::Action::PreviewPageDown => {
                 self.preview.scroll = self.preview.scroll.saturating_add(PREVIEW_SCROLL_PAGE);
+            }
+            crate::keymap::Action::ToggleMark => {
+                if self.marking_enabled()
+                    && let Some(path) = self.visible_selected_row().map(|row| row.path.clone())
+                    && !self.marks.remove(&path)
+                {
+                    self.marks.insert(path);
+                }
+            }
+            crate::keymap::Action::ClearMarks => {
+                if self.marking_enabled() {
+                    self.clear_marks();
+                }
             }
         }
         true
@@ -606,31 +777,22 @@ impl App {
     }
 
     fn open_selected(&mut self) {
-        let Some(row) = self.engine.results().get(self.selected) else {
+        let Some(path) = self.visible_selected_row().map(|row| row.path.clone()) else {
             return;
         };
-        let path = row.path.clone();
         // the calculator's "path" is the result — enter copies it
         if self.engine.mode() == Mode::Calc {
-            self.message = Some((
-                match actions::copy(&path) {
-                    Ok(()) => format!("copied: {path}"),
-                    Err(e) => format!("error: {e}"),
-                },
-                Instant::now(),
-            ));
+            self.set_message(match actions::copy(&path) {
+                Ok(()) => format!("copied: {path}"),
+                Err(error) => format!("error: {error}"),
+            });
             return;
         }
-        self.message = Some((
-            match actions::open(&path) {
-                Ok(()) => {
-                    self.engine.record_open(&path);
-                    format!("opened: {path}")
-                }
-                Err(e) => format!("error: {e}"),
-            },
-            Instant::now(),
-        ));
+        let message = match self.open_path(&path) {
+            Ok(()) => format!("opened: {path}"),
+            Err(error) => format!("error opening {path}: {error}"),
+        };
+        self.set_message(message);
     }
 
     /// The Enter behavior, shared by the Enter key and a double-click:
@@ -644,11 +806,7 @@ impl App {
                 true
             }
             UiMode::Pick => {
-                let picked = self
-                    .engine
-                    .results()
-                    .get(self.selected)
-                    .map(|row| row.path.clone());
+                let picked = self.visible_selected_row().map(|row| row.path.clone());
                 if let Some(path) = picked {
                     self.push_history();
                     self.picked = Some(path);
@@ -753,26 +911,26 @@ impl App {
     }
 
     fn act(&mut self, f: impl Fn(&str) -> std::io::Result<()>, verb: &str) {
-        let Some(row) = self.engine.results().get(self.selected) else {
+        let Some(path) = self.visible_selected_row().map(|row| row.path.clone()) else {
             return;
         };
-        self.message = Some((
-            match f(&row.path) {
-                Ok(()) => format!("{verb}: {}", row.path),
-                Err(e) => format!("error: {e}"),
-            },
-            Instant::now(),
-        ));
+        self.set_message(match f(&path) {
+            Ok(()) => format!("{verb}: {path}"),
+            Err(error) => format!("error {verb}ing {path}: {error}"),
+        });
     }
 
     fn load_preview(&mut self) {
-        let Some(row) = self.engine.results().get(self.selected) else {
+        let Some((path, line_number)) = self
+            .visible_selected_row()
+            .map(|row| (row.path.clone(), row.line_number))
+        else {
             self.preview.for_key = None;
             self.preview.content = PreviewContent::Lines(vec![Line::from("no selection")]);
             self.preview.image_dims = None;
             return;
         };
-        let key = (row.path.clone(), row.line_number);
+        let key = (path.clone(), line_number);
         if self.preview.for_key.as_ref() == Some(&key) {
             return;
         }
@@ -781,10 +939,10 @@ impl App {
         self.preview.image_dims = None;
         // directories (trailing '/') and macOS .app bundles are both
         // directories without a text preview
-        if row.path.ends_with('/') || row.path.to_ascii_lowercase().ends_with(".app") {
+        if path.ends_with('/') || path.to_ascii_lowercase().ends_with(".app") {
             // cheap; stays on the UI thread
             self.preview.content =
-                PreviewContent::Lines(directory_listing(&row.path, self.theme.accent));
+                PreviewContent::Lines(directory_listing(&path, self.theme.accent));
             return;
         }
         // expensive loading (file read, highlight, PDF/image decode) happens
@@ -794,8 +952,8 @@ impl App {
         self.preview.generation += 1;
         let _ = self.preview.tx.send(PreviewRequest {
             generation: self.preview.generation,
-            path: row.path.clone(),
-            line_number: row.line_number,
+            path,
+            line_number,
             appearance: self.appearance,
             gutter: self.theme.dim,
         });
@@ -848,12 +1006,14 @@ impl App {
     /// Refreshes the status line's stat cache when the selection changed.
     /// Runs in the event loop so the draw pass never touches the filesystem.
     fn refresh_status(&mut self) {
-        let Some(row) = self.engine.results().get(self.selected) else {
+        let Some(path) = self.visible_selected_row().map(|row| row.path.clone()) else {
+            self.status.path.clear();
+            self.status.meta = None;
             return;
         };
-        if self.status.path != row.path {
-            self.status.path = row.path.clone();
-            self.status.meta = std::fs::metadata(&row.path)
+        if self.status.path != path {
+            self.status.path = path.clone();
+            self.status.meta = std::fs::metadata(&path)
                 .ok()
                 .map(|meta| (meta.is_file(), meta.len(), meta.modified().ok()));
         }
@@ -931,6 +1091,9 @@ fn restore_terminal(mouse: bool) {
 
 /// Runs the UI. Draws on /dev/tty (not stdout), so `--pick` works inside
 /// command substitution. In [`UiMode::Pick`], Enter returns the selection.
+/// The arguments are the independent CLI/runtime knobs used to initialize the
+/// App; keeping them explicit avoids hiding mode-specific behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     engine: Engine,
     ui_mode: UiMode,

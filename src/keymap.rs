@@ -28,6 +28,8 @@ pub enum Action {
     ThemeCycle,
     PreviewPageUp,
     PreviewPageDown,
+    ToggleMark,
+    ClearMarks,
 }
 
 /// Key spec strings for the default bindings (identical to the historical
@@ -51,6 +53,8 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::ThemeCycle, &["ctrl-g"]),
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
+    (Action::ToggleMark, &["ctrl-b"]),
+    (Action::ClearMarks, &["alt-b"]),
 ];
 
 /// Parses a key spec like `"ctrl-y"`, `"CTRL+Y"`, `"alt+shift-x"`, `"f5"`,
@@ -150,6 +154,8 @@ fn action_from_name(name: &str) -> Option<Action> {
         "theme_cycle" => Action::ThemeCycle,
         "preview_page_up" => Action::PreviewPageUp,
         "preview_page_down" => Action::PreviewPageDown,
+        "toggle_mark" => Action::ToggleMark,
+        "clear_marks" => Action::ClearMarks,
         _ => return None,
     })
 }
@@ -338,6 +344,8 @@ mod tests {
         check("ctrl-g", Action::ThemeCycle);
         check("pgup", Action::PreviewPageUp);
         check("pgdn", Action::PreviewPageDown);
+        check("ctrl-b", Action::ToggleMark);
+        check("alt-b", Action::ClearMarks);
         // keys never bound by default
         assert_eq!(km.lookup(KeyCode::Char('q'), KeyModifiers::CONTROL), None);
     }
@@ -357,6 +365,24 @@ mod tests {
         overrides.insert("copy_path".to_string(), vec!["alt-y".to_string()]);
         let custom = Keymap::from_config(&overrides);
         assert_eq!(custom.shortcut(Action::CopyPath).as_deref(), Some("alt-y"));
+    }
+
+    #[test]
+    fn mark_actions_are_configurable() {
+        let mut overrides = HashMap::new();
+        overrides.insert("toggle_mark".to_string(), vec!["ctrl-m".to_string()]);
+        overrides.insert("clear_marks".to_string(), vec!["alt-m".to_string()]);
+        let km = Keymap::from_config(&overrides);
+        assert_eq!(
+            km.lookup(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            Some(Action::ToggleMark)
+        );
+        assert_eq!(
+            km.lookup(KeyCode::Char('m'), KeyModifiers::ALT),
+            Some(Action::ClearMarks)
+        );
+        assert_eq!(km.lookup(KeyCode::Char('b'), KeyModifiers::CONTROL), None);
+        assert_eq!(km.lookup(KeyCode::Char('b'), KeyModifiers::ALT), None);
     }
 
     #[test]

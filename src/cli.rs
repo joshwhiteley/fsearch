@@ -62,6 +62,8 @@ keys:
   tab                  cycle preview: side, full-window, hidden
   ctrl-t               toggle row density (two-line / compact)
   ctrl-x               show or hide weaker matches
+  ctrl-b               toggle mark (open mode)
+  alt-b                clear marks (open mode)
   esc, ctrl-c          quit
   all bindings         remappable via [keys] in config.toml
 

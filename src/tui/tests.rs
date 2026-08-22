@@ -1049,3 +1049,258 @@ fn calc_mode_renders_expression_and_result() {
     assert_eq!(app.engine.results().len(), 0);
     assert!(app.engine.status().error.is_none());
 }
+
+fn file_row(path: &str) -> crate::engine::ResultRow {
+    crate::engine::ResultRow {
+        path: path.into(),
+        line_number: None,
+        line: None,
+        recent_open: false,
+        meta: Some(FileMeta {
+            mtime: now_secs(),
+            size: 10,
+        }),
+        score: None,
+    }
+}
+
+#[test]
+fn ctrl_b_toggles_a_mark_and_renders_the_gutter_indicator() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/notes.md"), file_row("/b/other.txt")]);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(!text.contains('▌'), "no marks initially");
+    assert!(text.contains("ctrl-b mark"), "mark shortcut missing");
+    // mark the focused row
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.marks.contains("/a/notes.md"));
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains('▌'), "mark indicator shown");
+    assert!(text.contains("1 marked"), "status count");
+    assert!(text.contains("ctrl-b unmark"), "unmark shortcut missing");
+    assert!(
+        text.contains("alt-b clear (1 marked)"),
+        "clear shortcut count missing"
+    );
+    // toggling again clears the mark and the indicator disappears
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.marks.is_empty());
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(!buffer_text(&terminal).contains('▌'));
+}
+
+#[test]
+fn marks_survive_moving_the_selection() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/one.md"), file_row("/b/two.md")]);
+    // mark row 0, move down without marking, move back: the mark stays
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.marks, ["/a/one.md".to_string()].into());
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.selected, 0);
+    assert!(app.marks.contains("/a/one.md"));
+}
+
+#[test]
+fn menu_batch_entries_appear_only_with_visible_marks() {
+    use crate::engine::ResultRow;
+    let mut app = test_app();
+    assert!(
+        !app.menu_entries().contains(&"open marked"),
+        "no batch entries without marks"
+    );
+    app.engine.inject_results_for_test(vec![
+        ResultRow {
+            path: "/a/x.pdf".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: None,
+            score: None,
+        },
+        ResultRow {
+            path: "/b/y.pdf".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: None,
+            score: None,
+        },
+        ResultRow {
+            path: "/c/z.pdf".into(),
+            line_number: None,
+            line: None,
+            recent_open: false,
+            meta: None,
+            score: None,
+        },
+    ]);
+    app.marks = ["/a/x.pdf".to_string(), "/c/z.pdf".to_string()].into();
+    let entries = app.menu_entries();
+    for label in [
+        "open marked",
+        "copy marked paths",
+        "trash marked",
+        "clear marks",
+    ] {
+        assert!(entries.contains(&label), "{label} missing");
+    }
+    // batch copy content: visible marked paths in display order,
+    // newline-joined — exactly what goes to the clipboard
+    assert_eq!(app.visible_marked(), vec!["/a/x.pdf", "/c/z.pdf"]);
+    assert_eq!(app.visible_marked().join("\n"), "/a/x.pdf\n/c/z.pdf");
+}
+
+#[test]
+fn clear_marks_action_and_menu_entry_clear_the_set() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/notes.md"), file_row("/b/other.txt")]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(app.marks.len(), 2);
+    // alt-b clears everything with a toast
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    assert!(app.marks.is_empty());
+    assert!(app.message.is_some());
+    // and via its menu entry (the last one when marks are visible)
+    app.marks = ["/a/notes.md".to_string()].into();
+    app.menu = Some(app.menu_entries().len() - 1); // last entry: clear marks
+    app.run_menu_action(app.menu.unwrap());
+    assert!(app.marks.is_empty());
+    assert!(app.marks.is_empty());
+}
+
+#[test]
+fn mark_indicator_coexists_with_icons_in_both_densities() {
+    let mut app = test_app();
+    app.icons = true;
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/notes.rs")]);
+    app.marks.insert("/a/notes.rs".to_string());
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains('▌'),
+        "mark indicator missing in comfy density"
+    );
+    assert!(
+        text.contains('\u{f121}'),
+        "nerd-font icon missing in comfy density"
+    );
+    app.density = Density::Compact;
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains('▌'),
+        "mark indicator missing in compact density"
+    );
+    assert!(
+        text.contains('\u{f121}'),
+        "nerd-font icon missing in compact density"
+    );
+}
+
+#[test]
+fn batch_runner_reports_partial_failures_and_continues() {
+    let paths = vec!["/ok".to_string(), "/bad".to_string(), "/ok2".to_string()];
+    let outcome = super::run_batch(&paths, |path| {
+        if path == "/bad" {
+            Err(std::io::Error::other("permission denied"))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(outcome.succeeded, 2);
+    let Some((path, error)) = &outcome.first_error else {
+        panic!("expected the failed path and error");
+    };
+    assert_eq!(path, "/bad");
+    assert_eq!(error, "permission denied");
+    let summary = super::batch_summary("trashed", paths.len(), &outcome);
+    assert!(summary.contains("trashed 2/3 files"));
+    assert!(summary.contains("1 failed"));
+    assert!(summary.contains("/bad: permission denied"));
+}
+
+#[test]
+fn hidden_selected_rows_are_not_actionable() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/visible.txt")]);
+    app.selected = 1;
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.marks.is_empty());
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert!(app.menu.is_none(), "hidden selection must not open actions");
+}
+
+#[test]
+fn hidden_marks_remain_clearable_without_batch_actions() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/visible.txt")]);
+    app.marks.insert("/hidden/file.txt".to_string());
+    let entries = app.menu_entries();
+    assert!(entries.contains(&"clear marks"));
+    assert!(!entries.contains(&"open marked"));
+    assert!(!entries.contains(&"trash marked"));
+}
+
+#[test]
+fn duplicate_marked_content_hits_are_processed_once() {
+    let mut app = test_app();
+    app.engine.inject_results_for_test(vec![
+        crate::engine::ResultRow {
+            path: "/a/notes.md".into(),
+            line_number: Some(1),
+            line: Some("first".into()),
+            recent_open: false,
+            meta: None,
+            score: None,
+        },
+        crate::engine::ResultRow {
+            path: "/a/notes.md".into(),
+            line_number: Some(2),
+            line: Some("second".into()),
+            recent_open: false,
+            meta: None,
+            score: None,
+        },
+    ]);
+    app.marks.insert("/a/notes.md".to_string());
+    assert_eq!(app.visible_marked_count(), 1);
+    assert_eq!(app.visible_marked(), vec!["/a/notes.md"]);
+}
+
+#[test]
+fn filter_mode_hides_marking_entirely() {
+    let mut app = test_filter_app();
+    tick_until(&mut app, |a| a.engine.results().len() >= 3);
+    // ctrl-b does nothing in filter mode
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.marks.is_empty(), "no marks in filter mode");
+    // even a forced mark renders no indicator or status count
+    app.marks = ["git commit -m fix/thing".to_string()].into();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(!text.contains('▌'), "filter rows show no mark gutter");
+    assert!(!text.contains("marked"), "status hides the mark count");
+    // --pick mode hides marking too: toggling does nothing
+    let mut app = test_app();
+    app.ui_mode = UiMode::Pick;
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/notes.md")]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.marks.is_empty(), "no marks in pick mode");
+}
