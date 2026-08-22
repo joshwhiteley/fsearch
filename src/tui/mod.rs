@@ -142,6 +142,12 @@ pub struct App {
     preview_image_dims: Option<(u32, u32)>,
     /// First line shown in the text preview; reset on selection change.
     preview_scroll: usize,
+    /// Char offset of the first visible input character; shifts once the
+    /// edit cursor would leave the query row.
+    input_scroll: usize,
+    /// Screen rect of the open actions popup, for mouse hit testing;
+    /// Rect::default() while closed.
+    pub menu_area: Rect,
 }
 
 impl App {
@@ -204,6 +210,8 @@ impl App {
             status_meta: None,
             preview_image_dims: None,
             preview_scroll: 0,
+            input_scroll: 0,
+            menu_area: Rect::default(),
         }
     }
 
@@ -572,9 +580,17 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // any left click closes the actions popup
+                // a left click outside the popup closes it; one on an entry
+                // activates that entry (border rows just close)
                 if self.menu.is_some() {
-                    self.menu = None;
+                    let top = self.menu_area.y + 1; // below the title border
+                    let end = self.menu_area.bottom().saturating_sub(1);
+                    if self.menu_area.contains(point) && point.y >= top && point.y < end {
+                        let entry = (point.y - top) as usize;
+                        self.run_menu_action(entry);
+                    } else {
+                        self.menu = None;
+                    }
                     return true;
                 }
                 if self.results_area.contains(point) {

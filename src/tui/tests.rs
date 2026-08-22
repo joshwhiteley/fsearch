@@ -86,6 +86,65 @@ fn hints_show_only_while_input_is_empty() {
 }
 
 #[test]
+fn short_terminals_drop_query_hints_then_the_footer() {
+    let mut app = test_app();
+    // tall enough for everything
+    let mut terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("grep in files"));
+    // medium: query hints dropped, the shortcut footer stays
+    let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(!text.contains("grep in files"), "query hints must yield");
+    assert!(text.contains("esc quit"), "footer kept at height 10");
+    // very short: everything yields to the results pane
+    let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(!buffer_text(&terminal).contains("esc quit"));
+}
+
+#[test]
+fn long_input_scrolls_to_keep_the_cursor_visible() {
+    let mut app = test_app();
+    // 28 chars against a 22-char visible row (24 cols minus borders)
+    app.input = "abcdefghijklmnopqrstuvwxyz01".to_string();
+    app.input_cursor = app.input.len();
+    let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("yz01"), "query tail visible");
+    assert!(!text.contains("abcdef"), "clipped head scrolled off");
+    // the cursor sits inside the frame, one cell inside the right edge
+    let pos = terminal.get_cursor_position().unwrap();
+    assert_eq!(pos.x, 22);
+    assert!(app.input_scroll > 0);
+    // moving the edit cursor back toward the start scrolls back into view:
+    // the window starts exactly at the cursor column
+    app.input_cursor = 2;
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert_eq!(app.input_scroll, 2);
+    let text = buffer_text(&terminal);
+    assert!(text.contains("cdefgh"), "window starts at the cursor");
+    assert!(!text.contains("ab"), "chars before the cursor stay clipped");
+}
+
+#[test]
+fn empty_state_shows_no_matches_and_minimal_footer() {
+    use crate::engine::ResultRow;
+    let mut app = test_app();
+    // no injected rows: the launch screen has nothing to list
+    tick_until(&mut app, |a| !a.engine.status().indexing);
+    app.engine.inject_results_for_test(Vec::<ResultRow>::new());
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("(no matches)"), "empty-state message missing");
+    assert!(text.contains("esc quit"), "minimal footer missing");
+    assert!(text.contains("ctrl-u clear"), "minimal footer missing");
+}
+
+#[test]
 fn selected_file_shows_wrapped_contextual_shortcuts() {
     use crate::engine::ResultRow;
 
@@ -588,9 +647,59 @@ fn click_on_fold_row_toggles_show_weak() {
 fn click_while_menu_open_closes_menu() {
     let mut app = mouse_state();
     app.menu = Some(2);
-    // a click outside the results area closes the actions popup
+    // a click outside the (not yet rendered) popup area closes the menu
     assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1)));
     assert_eq!(app.menu, None);
+}
+
+#[test]
+fn click_on_menu_entry_activates_it() {
+    let mut app = mouse_state();
+    app.menu = Some(2); // "copy path"
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let area = app.menu_area;
+    assert!(area.width > 0, "draw must record the popup hit rect");
+    // third entry row: below the top border, two item rows down
+    let ev = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 5,
+        row: area.y + 3,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_mouse(ev));
+    assert_eq!(app.menu, None);
+    assert!(app.message.is_some(), "the clicked action must have run");
+}
+
+#[test]
+fn click_on_menu_border_or_outside_closes_without_action() {
+    let mut app = mouse_state();
+    app.menu = Some(0);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let area = app.menu_area;
+    // the title border row closes the popup but runs no action
+    let border = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 5,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_mouse(border));
+    assert_eq!(app.menu, None);
+    assert!(app.message.is_none(), "border click must not run an action");
+    // a click well away from the popup closes it too
+    app.menu = Some(0);
+    let outside = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 23,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_mouse(outside));
+    assert_eq!(app.menu, None);
+    assert!(app.message.is_none());
 }
 
 #[test]
