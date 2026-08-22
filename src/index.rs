@@ -1,6 +1,9 @@
 use crate::walker::FileMeta;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MAGIC: &[u8; 8] = b"FSEARCH\0";
 const VERSION: u32 = 3;
@@ -74,13 +77,20 @@ pub fn default_cache_path() -> PathBuf {
     base.join("fsearch").join("index.bin")
 }
 
+/// Pid + counter temp name next to `path`, so concurrent fsearch processes
+/// never write each other's temp file.
+fn tmp_path(path: &Path) -> PathBuf {
+    let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp-{}-{nonce}", std::process::id()))
+}
+
 /// v3 layout: magic, version, count, then three contiguous tables —
 /// lengths (u32), metadata (i64 mtime + u64 size), and the path arena.
 pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     {
         let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
         w.write_all(MAGIC)?;
@@ -97,6 +107,8 @@ pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> 
             w.write_all(p.as_bytes())?;
         }
         w.flush()?;
+        // make the bytes durable before the rename publishes them
+        w.get_ref().sync_all()?;
     }
     std::fs::rename(&tmp, path)
 }
@@ -223,5 +235,15 @@ mod tests {
         bytes[8] = 99; // stomp the version field
         std::fs::write(&file, &bytes).unwrap();
         assert!(load(&file).is_none());
+    }
+
+    #[test]
+    fn tmp_names_are_unique_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        let a = tmp_path(&file);
+        let b = tmp_path(&file);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), b.parent());
     }
 }

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Tracks which files get opened, to boost them in ranking. Backed by an
 /// append-only file of `<unix_ts>\t<count>\t<path>` lines, compacted to one
@@ -151,9 +154,21 @@ impl Frecency {
         for (path, e) in &self.map {
             body.push_str(&format!("{}\t{}\t{}\n", e.last, e.count, path));
         }
-        let tmp = self.file.with_extension("tmp");
-        if std::fs::write(&tmp, body).is_ok() {
+        // pid + counter temp name so concurrent fsearch processes compacting
+        // at once never truncate each other's temp file
+        let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .file
+            .with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+        let ok = std::fs::File::create(&tmp).and_then(|mut f| {
+            f.write_all(body.as_bytes())?;
+            // make the bytes durable before the rename publishes them
+            f.sync_all()
+        });
+        if ok.is_ok() {
             let _ = std::fs::rename(&tmp, &self.file);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }

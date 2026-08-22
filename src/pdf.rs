@@ -1,11 +1,14 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// PDF extraction reads and parses the whole file; skip anything larger.
 pub const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Upper bound on cached extracted texts; oldest entries are evicted.
 pub const MAX_PDF_CACHE_FILES: usize = 4096;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn is_pdf_path(path: &str) -> bool {
     Path::new(path)
@@ -56,11 +59,17 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
         Ok(text) => (&cached, text.as_str()),
         Err(e) => (&cached_err, e.as_str()),
     };
-    // write to a pid-unique temp then rename, so two concurrent instances
-    // never observe a half-written cache entry
-    let tmp = cache_dir.join(format!(".{key}.{}.tmp", std::process::id()));
-    let _ = std::fs::write(&tmp, body);
-    let _ = std::fs::rename(&tmp, target);
+    // write to a pid + counter unique temp then rename, so concurrent
+    // threads and instances never observe a half-written cache entry; a
+    // failed write is removed rather than renamed into place, so a disk-full
+    // event can't publish truncated text as a cache hit
+    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = cache_dir.join(format!(".{key}.{}-{nonce}.tmp", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, target);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
     evict_oldest(cache_dir);
     result
 }
@@ -245,5 +254,28 @@ mod tests {
         let f = std::fs::File::create(&file).unwrap();
         f.set_len(MAX_PDF_BYTES + 1).unwrap();
         assert!(extract_cached(file.to_str().unwrap(), dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_cache_write_publishes_nothing_and_leaves_no_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.pdf");
+        std::fs::write(&file, minimal_pdf("Needle in a haystack")).unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // extraction succeeds but the cache write cannot: the result must
+        // still be returned, with no truncated entry or tmp file left behind
+        let text = extract_cached(file.to_str().unwrap(), &cache);
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(text.is_ok());
+        let names: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.is_empty(), "cache should stay empty, got {names:?}");
     }
 }
