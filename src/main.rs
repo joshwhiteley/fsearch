@@ -1,6 +1,6 @@
 use fsearch::cli::{self, Command};
 use fsearch::{config, engine::Engine, index, tui, walker};
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Write};
 use std::time::Instant;
 
 fn main() {
@@ -22,8 +22,8 @@ fn main() {
                 run_ui(tui::UiMode::Open, "")
             }
         }
-        Command::Help => print!("{}", cli::HELP),
-        Command::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
+        Command::Help => write_stdout(cli::HELP),
+        Command::Version => write_stdout(&format!("fsearch {}\n", env!("CARGO_PKG_VERSION"))),
         Command::Config => edit_config(),
         Command::Reindex => reindex(),
         Command::IndexSemantic => index_semantic(),
@@ -47,6 +47,19 @@ fn load_config() -> config::Config {
             eprintln!("fsearch: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Writes text to stdout. A closed pipe (e.g. `fsearch --help | head`)
+/// exits 0 quietly instead of panicking on the write.
+fn write_stdout(text: &str) {
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = out.write_all(text.as_bytes()).and_then(|_| out.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("fsearch: writing to stdout: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -225,7 +238,8 @@ fn print_search(query: &str) {
 }
 
 /// Piped-stdin filter mode: launch the pick UI over arbitrary lines and
-/// print the chosen line to stdout (exit 1 when nothing is chosen).
+/// print the chosen line to stdout (exit 1 when nothing is chosen, 2 on
+/// real errors).
 fn run_filter(initial_query: &str) {
     if std::io::stdin().is_terminal() {
         eprintln!(
@@ -233,13 +247,19 @@ fn run_filter(initial_query: &str) {
         );
         std::process::exit(2);
     }
-    let lines: Vec<String> = std::io::stdin()
+    const MAX_LINES: usize = 500_000;
+    let mut lines: Vec<String> = std::io::stdin()
         .lock()
         .lines()
         .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
-        .take(500_000)
+        .take(MAX_LINES + 1)
         .collect();
+    if lines.len() > MAX_LINES {
+        // read one extra line so truncation is detectable, then warn once
+        lines.truncate(MAX_LINES);
+        eprintln!("fsearch: input truncated to {MAX_LINES} lines");
+    }
     let config = load_config();
     // build the keymap and mouse flag before the engine consumes the config
     let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
@@ -254,11 +274,11 @@ fn run_filter(initial_query: &str) {
         keymap,
         mouse,
     ) {
-        Ok(Some(picked)) => println!("{picked}"),
+        Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
         Ok(None) => std::process::exit(1), // nothing chosen: signal like grep
         Err(e) => {
             eprintln!("fsearch: {e:#}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }
@@ -275,7 +295,7 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
         fsearch::frecency::default_history_path(),
     );
     match tui::run(engine, ui_mode, initial_query, theme, keymap, mouse) {
-        Ok(Some(picked)) => println!("{picked}"),
+        Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
         Ok(None) => {
             if ui_mode == tui::UiMode::Pick {
                 // nothing chosen: signal it like grep does
@@ -284,7 +304,7 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
         }
         Err(e) => {
             eprintln!("fsearch: {e:#}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }
