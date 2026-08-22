@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Fixed quadratic line counting in semantic chunking, so indexing large
+  documents is linear in size instead of stalling
+- Semantic, path-index, and cache writes now use unique temp names and fsync
+  before rename; concurrent fsearch processes can no longer corrupt each
+  other's stores, and a full disk can no longer publish truncated extraction
+  caches
+- The preview worker survives panics from malformed images or SVGs, preview
+  reads are capped at the 64 KiB window instead of loading whole files, and a
+  docx/xlsx parser panic no longer prints a backtrace into the TUI
+- Semantic search picks up reindexing done in another terminal without a
+  restart, watcher updates handle directory/file swaps without leaving ghost
+  entries, and failed exclude globs or watch roots surface an error instead of
+  silently blanking results
+- Script mode (`-p`, `--big`) shares one query API with the TUI: metadata
+  filters like `larger:` and `changed:` now apply to `?` searches too
+- Piping output to `head` exits cleanly instead of panicking on a broken
+  pipe; stdin filter mode warns when it truncates at 500k lines; cancelled
+  filter/pick runs exit 1 while real errors exit 2
+- TUI: long queries scroll horizontally with the cursor kept visible, hint
+  rows yield space on short terminals, the actions menu responds to clicks,
+  and empty result sets show a "(no matches)" state with a minimal footer
+- Shell integration works with macOS system bash 3.2 again
+- Dependencies: dropped unused OpenEXR/AV1 image codecs (faster builds,
+  smaller binary), declared MSRV 1.85, added Dependabot, cargo-audit/
+  cargo-deny gating, `cargo test --features semantic` in CI, and locked CI
+  builds
 - Search hints now wrap instead of clipping; highlighted results show the
   configured shortcuts for open, reveal, copy path, Quick Look, actions, and
   preview
