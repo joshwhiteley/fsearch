@@ -28,6 +28,7 @@ pub enum Action {
     ThemeCycle,
     PreviewPageUp,
     PreviewPageDown,
+    Help,
 }
 
 /// Key spec strings for the default bindings (identical to the historical
@@ -51,6 +52,7 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::ThemeCycle, &["ctrl-g"]),
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
+    (Action::Help, &["f1", "ctrl-o"]),
 ];
 
 /// Parses a key spec like `"ctrl-y"`, `"CTRL+Y"`, `"alt+shift-x"`, `"f5"`,
@@ -150,6 +152,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "theme_cycle" => Action::ThemeCycle,
         "preview_page_up" => Action::PreviewPageUp,
         "preview_page_down" => Action::PreviewPageDown,
+        "help" => Action::Help,
         _ => return None,
     })
 }
@@ -167,6 +170,54 @@ fn parse_specs<S: AsRef<str>>(specs: &[S]) -> Vec<(KeyCode, KeyModifiers)> {
 /// Key -> command map; `lookup` resolves a key event to its action.
 pub struct Keymap {
     bindings: HashMap<(KeyCode, KeyModifiers), Action>,
+}
+
+impl Action {
+    /// Human-readable name shown in the help overlay.
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::Quit => "quit",
+            Action::Open => "open",
+            Action::Menu => "actions menu",
+            Action::QuickLook => "quick look",
+            Action::CopyPath => "copy path",
+            Action::Reveal => "reveal in finder",
+            Action::ClearQuery => "clear query",
+            Action::RegexToggle => "toggle regex",
+            Action::HistoryPrev => "history back",
+            Action::HistoryNext => "history forward",
+            Action::MoveUp => "move up",
+            Action::MoveDown => "move down",
+            Action::PreviewLayout => "preview layout",
+            Action::DensityToggle => "row density",
+            Action::FoldToggle => "fold weak matches",
+            Action::ThemeCycle => "cycle theme",
+            Action::PreviewPageUp => "preview page up",
+            Action::PreviewPageDown => "preview page down",
+            Action::Help => "help",
+        }
+    }
+
+    /// Display group used by the keymap-driven help overlay.
+    pub fn help_group(self) -> &'static str {
+        match self {
+            Action::MoveUp
+            | Action::MoveDown
+            | Action::HistoryPrev
+            | Action::HistoryNext
+            | Action::Quit => "navigation",
+            Action::Open | Action::Menu | Action::QuickLook | Action::CopyPath | Action::Reveal => {
+                "open & actions"
+            }
+            Action::PreviewLayout
+            | Action::DensityToggle
+            | Action::FoldToggle
+            | Action::ThemeCycle
+            | Action::PreviewPageUp
+            | Action::PreviewPageDown => "view",
+            Action::RegexToggle | Action::ClearQuery | Action::Help => "query modes",
+        }
+    }
 }
 
 fn key_label(code: KeyCode, mods: KeyModifiers) -> Option<String> {
@@ -208,8 +259,18 @@ impl Keymap {
         self.bindings.get(&(code, mods)).copied()
     }
 
-    /// Shortest configured key label for an action, for contextual UI help.
-    pub fn shortcut(&self, action: Action) -> Option<String> {
+    /// Actions that currently have at least one configured binding. The help
+    /// overlay uses this instead of duplicating the binding list.
+    pub fn actions(&self) -> Vec<Action> {
+        let mut actions: Vec<Action> = self.bindings.values().copied().collect();
+        actions.sort_by_key(|action| (action.help_group(), action.label()));
+        actions.dedup();
+        actions
+    }
+
+    /// All configured key labels for an action, shortest first. The help
+    /// overlay lists every binding, not just the shortest.
+    pub fn labels(&self, action: Action) -> Vec<String> {
         let mut labels: Vec<String> = self
             .bindings
             .iter()
@@ -222,14 +283,20 @@ impl Keymap {
                 .cmp(&b.chars().count())
                 .then_with(|| a.cmp(b))
         });
-        labels.into_iter().next()
+        labels
+    }
+
+    /// Shortest configured key label for an action, for contextual UI help.
+    pub fn shortcut(&self, action: Action) -> Option<String> {
+        self.labels(action).into_iter().next()
     }
 
     /// Builds a keymap from config overrides (action name -> key specs).
     /// Starts from the defaults; a valid override REPLACES that action's
     /// whole key list (silently skipping unparsable specs and reserved
     /// editing keys; if none parse, the defaults are kept). Overrides are
-    /// inserted last, so an overriding key wins over a colliding default key.
+    /// inserted after all defaults, in action-name order, so collisions are
+    /// deterministic and an override wins over a colliding default key.
     pub fn from_config(overrides: &HashMap<String, Vec<String>>) -> Keymap {
         let mut bindings: HashMap<(KeyCode, KeyModifiers), Action> = HashMap::new();
         // defaults first, inserted verbatim -- the reserved-key rule applies
@@ -241,7 +308,7 @@ impl Keymap {
                 }
             }
         }
-        // overrides last, so they win collisions
+        let mut parsed_overrides = Vec::new();
         for (name, specs) in overrides {
             let Some(action) = action_from_name(name) else {
                 continue;
@@ -250,9 +317,17 @@ impl Keymap {
             if parsed.is_empty() {
                 continue; // nothing usable: keep the defaults for this action
             }
-            // REPLACE: drop this action's default keys first
+            parsed_overrides.push((name, action, parsed));
+        }
+        // A HashMap has no config-file order. Sort the valid overrides so
+        // that two commands claiming the same key resolve consistently.
+        parsed_overrides.sort_by_key(|(name, _, _)| *name);
+        // Remove every replaced action's defaults before inserting any
+        // override. Otherwise one override can erase another override's key
+        // when that key was also a default for the second action.
+        for (_, action, _) in &parsed_overrides {
             for (default_action, default_specs) in DEFAULT_BINDINGS {
-                if *default_action == action {
+                if *default_action == *action {
                     for spec in *default_specs {
                         if let Some((code, mods)) = parse_key(spec) {
                             bindings.remove(&(code, mods));
@@ -260,6 +335,10 @@ impl Keymap {
                     }
                 }
             }
+        }
+        // Overrides are inserted last, so they win collisions with defaults
+        // and later action names win collisions with earlier ones.
+        for (_, action, parsed) in parsed_overrides {
             for (code, mods) in parsed {
                 bindings.insert((code, mods), action);
             }
@@ -411,6 +490,45 @@ mod tests {
         assert_eq!(km.lookup(KeyCode::Backspace, KeyModifiers::NONE), None);
         assert_eq!(km.lookup(KeyCode::Char('x'), KeyModifiers::NONE), None);
         assert_eq!(km.lookup(KeyCode::Char('w'), KeyModifiers::CONTROL), None);
+    }
+
+    #[test]
+    fn help_defaults_and_override() {
+        let km = Keymap::default();
+        let (f1, none) = (KeyCode::F(1), KeyModifiers::NONE);
+        let (o, ctrl) = (KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(km.lookup(f1, none), Some(Action::Help));
+        assert_eq!(km.lookup(o, ctrl), Some(Action::Help));
+        assert_eq!(km.shortcut(Action::Help).as_deref(), Some("f1"));
+        // both default bindings show up, shortest first
+        assert_eq!(km.labels(Action::Help), vec!["f1", "ctrl-o"]);
+
+        // a config override replaces the whole list, like any other action
+        let mut overrides = HashMap::new();
+        overrides.insert("help".to_string(), vec!["f2".to_string()]);
+        let custom = Keymap::from_config(&overrides);
+        assert_eq!(custom.lookup(KeyCode::F(2), none), Some(Action::Help));
+        assert_eq!(custom.lookup(f1, none), None);
+        assert_eq!(custom.lookup(o, ctrl), None);
+    }
+
+    #[test]
+    fn cross_action_overrides_keep_reassigned_default_keys() {
+        let mut overrides = HashMap::new();
+        // Help takes ThemeCycle's old key while ThemeCycle moves away. The
+        // result must not depend on HashMap iteration order.
+        overrides.insert("help".to_string(), vec!["ctrl-g".to_string()]);
+        overrides.insert("theme_cycle".to_string(), vec!["f2".to_string()]);
+        let km = Keymap::from_config(&overrides);
+        assert_eq!(
+            km.lookup(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            Some(Action::Help)
+        );
+        assert_eq!(
+            km.lookup(KeyCode::F(2), KeyModifiers::NONE),
+            Some(Action::ThemeCycle)
+        );
+        assert_eq!(km.lookup(KeyCode::Char('o'), KeyModifiers::CONTROL), None);
     }
 
     #[test]

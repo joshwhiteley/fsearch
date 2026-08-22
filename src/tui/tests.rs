@@ -980,6 +980,225 @@ fn rounded_borders_render_rounded_corners() {
 }
 
 #[test]
+fn help_overlay_opens_via_key_and_lists_configured_bindings() {
+    let mut app = test_app();
+    // remap copy_path so the overlay must reflect configuration, not defaults
+    let mut keys = std::collections::HashMap::new();
+    keys.insert("copy_path".to_string(), vec!["alt-c".to_string()]);
+    app.keymap = crate::keymap::Keymap::from_config(&keys);
+
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+    assert!(app.help.open, "f1 must open the help overlay");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(app.help.open, "ctrl-o must open the help overlay");
+
+    // 32 rows: the full listing (29 lines) fits without scrolling
+    let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("help"), "overlay title missing");
+    assert!(text.contains("navigation"), "group heading missing");
+    assert!(text.contains("query modes"), "group heading missing");
+    assert!(text.contains("copy path"), "action row missing");
+    assert!(text.contains("alt-c"), "remapped binding missing");
+    assert!(text.contains("enter"), "default open binding missing");
+    assert!(text.contains("cycle theme"), "theme cycle action missing");
+    assert!(text.contains("ctrl-g"), "theme cycle binding missing");
+    // multiple default bindings are listed together
+    assert!(
+        text.contains("esc, ctrl-c"),
+        "multi-binding row missing: {text}"
+    );
+    assert!(
+        text.contains("editing is fixed"),
+        "fixed-editing note missing"
+    );
+
+    // esc closes the overlay instead of quitting; a second esc quits
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(!app.help.open);
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+}
+
+#[test]
+fn help_overlay_is_centered_and_uses_theme_chrome() {
+    let mut app = test_app();
+    app.help.open = true;
+    app.theme = crate::theme::resolve("catppuccin", None);
+    app.theme.borders = BorderKind::Rounded;
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let area = app.help.area;
+    assert_eq!(area.x, (120 - area.width) / 2);
+    assert_eq!(area.y, (40 - area.height) / 2);
+    let top_left = terminal
+        .backend()
+        .buffer()
+        .cell((area.x, area.y))
+        .expect("modal is inside the terminal");
+    assert_eq!(top_left.symbol(), "╭");
+    assert_eq!(top_left.fg, app.theme.border);
+}
+
+#[test]
+fn any_other_key_closes_help_without_reaching_the_app() {
+    let mut app = test_app();
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+    // a plain char closes the overlay and must not land in the query
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    assert!(!app.help.open);
+    assert_eq!(app.editor.input, "", "typing while help is open leaked in");
+}
+
+#[test]
+fn page_keys_scroll_the_help_overlay() {
+    let mut app = test_app();
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(app.help.scroll, 8);
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(app.help.scroll, 16);
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    assert_eq!(app.help.scroll, 8);
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    assert_eq!(app.help.scroll, 0, "scroll saturates at the top");
+    // draw-time clamping keeps scroll inside the content on a tiny screen
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    for _ in 0..20 {
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    }
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let clamped = app.help.scroll;
+    // scrolling further past the end cannot move past the clamped offset
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert_eq!(app.help.scroll, clamped, "scroll must clamp at the bottom");
+
+    // Narrow terminals wrap long action rows instead of clipping their keys.
+    app.help.scroll = 0;
+    let mut narrow = Terminal::new(TestBackend::new(20, 8)).unwrap();
+    narrow.draw(|f| draw(f, &mut app)).unwrap();
+    let top = buffer_text(&narrow);
+    assert!(top.contains("navigation"));
+    let mut seen = top;
+    for _ in 0..20 {
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        narrow.draw(|f| draw(f, &mut app)).unwrap();
+        seen.push_str(&buffer_text(&narrow));
+    }
+    assert!(
+        seen.contains("ctrl-g"),
+        "theme binding was clipped: {seen:?}"
+    );
+    assert!(seen.contains("f1"), "help binding was clipped: {seen:?}");
+}
+
+#[test]
+fn help_mouse_wheel_scrolls_and_clicks_outside_close() {
+    use crate::keymap::Keymap;
+    let mut app = test_app();
+    let mut keys = std::collections::HashMap::new();
+    // Many valid bindings make the listing overflow even a tall box. Keep
+    // Help on its defaults so F1 still opens the modal below.
+    let names = [
+        "quit",
+        "open",
+        "menu",
+        "quick_look",
+        "copy_path",
+        "reveal",
+        "clear_query",
+        "regex_toggle",
+        "history_prev",
+        "history_next",
+        "move_up",
+        "move_down",
+        "preview_layout",
+        "density_toggle",
+        "fold_toggle",
+        "preview_page_up",
+        "preview_page_down",
+    ];
+    for (index, name) in names.into_iter().enumerate() {
+        let modifier = ["alt", "alt+shift", "ctrl+alt"][index / 6];
+        let first = index % 6 + 1;
+        keys.insert(
+            name.to_string(),
+            vec![
+                format!("{modifier}-f{first}"),
+                format!("{modifier}-f{}", first + 6),
+            ],
+        );
+    }
+    app.keymap = Keymap::from_config(&keys);
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(app.help.area.width > 0, "draw must record the hit rect");
+
+    // wheel anywhere scrolls the modal overlay
+    let wheel = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 2,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_mouse(wheel));
+    assert_eq!(app.help.scroll, 3);
+
+    // a click inside does nothing; the overlay stays open
+    let inside = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: app.help.area.x + 2,
+        row: app.help.area.y + 2,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_mouse(inside));
+    assert!(app.help.open, "click inside must keep the overlay open");
+    assert!(app.message.is_none());
+
+    // a click outside closes it
+    let outside = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 23,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_mouse(outside));
+    assert!(!app.help.open);
+    assert_eq!(app.help.scroll, 0, "closing resets the scroll");
+}
+
+#[test]
+fn footers_advertise_the_help_binding() {
+    let mut app = test_app();
+    // empty state: minimal footer carries the hint
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(
+        buffer_text(&terminal).contains("f1 help"),
+        "empty-state footer"
+    );
+
+    // with a selection: contextual footer carries it too
+    app.engine
+        .inject_results_for_test(vec![test_row("/a/report.pdf")]);
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("f1 help"), "contextual footer missing help");
+    assert!(text.contains("ctrl-y copy path"));
+
+    // a remapped binding changes what both footers advertise
+    let mut keys = std::collections::HashMap::new();
+    keys.insert("help".to_string(), vec!["f12".to_string()]);
+    app.keymap = crate::keymap::Keymap::from_config(&keys);
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("f12 help"));
+}
+
+#[test]
 fn score_bar_fill_counts_round() {
     // 0.5 * 5 = 2.5 rounds half-away-from-zero to 3
     assert_eq!(score_bar(0.0).0, 0);

@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 const PREVIEW_BYTES: usize = 64 * 1024;
 const PREVIEW_SCROLL_PAGE: usize = 20;
+/// Rows the help overlay jumps per pgup/pgdn while it is open.
+const HELP_SCROLL_PAGE: u16 = 8;
 
 /// Where the preview lives; Tab cycles. Full trades the results list for
 /// a much larger canvas — images render at ~3x the cell resolution.
@@ -265,6 +267,16 @@ pub struct StatusCache {
     pub meta: Option<(bool, u64, Option<SystemTime>)>,
 }
 
+/// Modal help overlay: the open flag plus scroll offset; `area` records
+/// where it was last drawn so mouse clicks can hit-test inside vs outside.
+pub struct HelpModal {
+    pub open: bool,
+    /// First visible content row; clamped to the content at draw time.
+    pub scroll: u16,
+    /// Screen rect of the rendered overlay, Rect::default() while closed.
+    pub area: Rect,
+}
+
 pub struct App {
     pub engine: Engine,
     pub selected: usize,
@@ -303,6 +315,7 @@ pub struct App {
     pub hit_test: HitTest,
     pub highlights: Highlights,
     pub status: StatusCache,
+    pub help: HelpModal,
 }
 
 impl App {
@@ -386,6 +399,11 @@ impl App {
                 path: String::new(),
                 meta: None,
             },
+            help: HelpModal {
+                open: false,
+                scroll: 0,
+                area: Rect::default(),
+            },
         }
     }
 
@@ -450,6 +468,23 @@ impl App {
     /// Returns false when the app should quit.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.message = None;
+        // the help overlay is modal: any key closes it, except the scroll
+        // keys, which page through the listing when it overflows the box
+        if self.help.open {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.help.scroll = self.help.scroll.saturating_sub(HELP_SCROLL_PAGE);
+                }
+                KeyCode::PageDown => {
+                    self.help.scroll = self.help.scroll.saturating_add(HELP_SCROLL_PAGE);
+                }
+                _ => {
+                    self.help.open = false;
+                    self.help.scroll = 0;
+                }
+            }
+            return true;
+        }
         // the actions popup swallows navigation while open
         if let Some(selected) = self.menu {
             match key.code {
@@ -556,6 +591,10 @@ impl App {
             }
             crate::keymap::Action::PreviewPageDown => {
                 self.preview.scroll = self.preview.scroll.saturating_add(PREVIEW_SCROLL_PAGE);
+            }
+            crate::keymap::Action::Help => {
+                self.help.open = !self.help.open;
+                self.help.scroll = 0;
             }
         }
         true
@@ -667,6 +706,20 @@ impl App {
             x: ev.column,
             y: ev.row,
         };
+        // the help overlay captures the mouse while open: the wheel scrolls
+        // it, a click on an item does nothing, a click outside closes it
+        if self.help.open {
+            match ev.kind {
+                MouseEventKind::ScrollDown => self.help.scroll = self.help.scroll.saturating_add(3),
+                MouseEventKind::ScrollUp => self.help.scroll = self.help.scroll.saturating_sub(3),
+                MouseEventKind::Down(MouseButton::Left) if !self.help.area.contains(point) => {
+                    self.help.open = false;
+                    self.help.scroll = 0;
+                }
+                _ => {}
+            }
+            return true;
+        }
         match ev.kind {
             MouseEventKind::ScrollDown => {
                 if self.hit_test.results_area.contains(point) {
@@ -931,6 +984,7 @@ fn restore_terminal(mouse: bool) {
 
 /// Runs the UI. Draws on /dev/tty (not stdout), so `--pick` works inside
 /// command substitution. In [`UiMode::Pick`], Enter returns the selection.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     engine: Engine,
     ui_mode: UiMode,

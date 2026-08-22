@@ -81,6 +81,7 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
             actions.push((crate::keymap::Action::PreviewLayout, "preview"));
         }
     }
+    actions.push((crate::keymap::Action::Help, "help"));
     actions
         .into_iter()
         .filter_map(|(action, label)| {
@@ -97,6 +98,7 @@ fn minimal_hints(app: &App) -> Vec<(String, String)> {
     [
         (crate::keymap::Action::Quit, "quit"),
         (crate::keymap::Action::ClearQuery, "clear"),
+        (crate::keymap::Action::Help, "help"),
     ]
     .into_iter()
     .filter_map(|(action, label)| {
@@ -242,6 +244,119 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.menu.is_some() {
         draw_menu(frame, app, body);
     }
+    // the help overlay renders last so it floats above everything
+    if app.help.open {
+        draw_help(frame, app, screen);
+    }
+}
+
+/// Groups shown in the help overlay. The actions inside each group come
+/// from the live keymap, so remaps and newly bound actions stay in sync.
+const HELP_GROUPS: &[&str] = &["navigation", "open & actions", "view", "query modes"];
+
+/// Text editing keys are handled before the keymap and can never be bound;
+/// the overlay says so instead of listing them as actions.
+const HELP_EDITING_NOTE: &str = "editing is fixed: typing · backspace · ←/→ · ctrl-a/e/w/d";
+
+fn wrapped_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|chunk| {
+            let text: String = chunk.iter().copied().collect();
+            Line::from(Span::styled(text, style))
+        })
+        .collect()
+}
+
+/// Content rows of the help overlay: grouped actions, each with every
+/// configured binding joined by commas. Long rows wrap to the available modal
+/// width so narrow terminals can still reveal every binding by scrolling.
+fn help_overlay_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let heading = Style::default()
+        .fg(app.theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(app.theme.dim);
+    let configured = app.keymap.actions();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for title in HELP_GROUPS {
+        let rows: Vec<(String, String)> = configured
+            .iter()
+            .filter(|action| action.help_group() == *title)
+            .filter_map(|action| {
+                let labels = app.keymap.labels(*action);
+                (!labels.is_empty()).then(|| ((*action).label().to_string(), labels.join(", ")))
+            })
+            .collect();
+        let Some(label_width) = rows.iter().map(|(label, _)| label.chars().count()).max() else {
+            continue;
+        };
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(wrapped_lines(title, width, heading));
+        for (label, bindings) in rows {
+            let prefix = format!("  {label:<label_width$}   ");
+            if prefix.chars().count() + bindings.chars().count() <= width {
+                lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(bindings, dim),
+                ]));
+            } else {
+                // Keep the compact aligned form on a normal terminal, but
+                // split the label and bindings into visible rows when space
+                // is tight instead of letting Paragraph clip the keys.
+                lines.extend(wrapped_lines(
+                    &format!("  {label}"),
+                    width,
+                    Style::default(),
+                ));
+                lines.extend(wrapped_lines(&format!("    {bindings}"), width, dim));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    lines.extend(wrapped_lines(HELP_EDITING_NOTE, width, dim));
+    lines
+}
+
+/// Centered themed modal listing every action's configured bindings; records
+/// its rect on `app.help` for hit testing.
+pub(super) fn draw_help(frame: &mut Frame, app: &mut App, screen: Rect) {
+    let bordered = app.theme.borders != BorderKind::None;
+    let padding = if bordered { 4usize } else { 2 };
+    // Find the natural width first, then wrap again if the screen is narrower.
+    let natural_lines = help_overlay_lines(app, usize::MAX);
+    let content_w = natural_lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = content_w
+        .saturating_add(padding)
+        .max(20)
+        .min(screen.width.max(1) as usize) as u16;
+    let inner_width = width.saturating_sub(if bordered { 2 } else { 0 }).max(1) as usize;
+    let lines = help_overlay_lines(app, inner_width);
+    let height = lines
+        .len()
+        .saturating_add(if bordered { 2 } else { 1 })
+        .max(3)
+        .min(screen.height.max(1) as usize) as u16;
+    let area = Rect {
+        x: screen.x + screen.width.saturating_sub(width) / 2,
+        y: screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    app.help.area = area;
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = themed_block("help", &app.theme);
+    let inner_rows = block.inner(area).height as usize;
+    let max_scroll = lines.len().saturating_sub(inner_rows) as u16;
+    app.help.scroll = app.help.scroll.min(max_scroll);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .scroll((app.help.scroll, 0));
+    frame.render_widget(paragraph, area);
 }
 
 /// Small actions popup anchored inside the body area; records its screen
