@@ -57,6 +57,7 @@ Run `fsearch` and start typing.
   move to trash) · `ctrl-space` Quick Look · `ctrl-y` copies the path ·
   `ctrl-b` toggles a mark · `alt-b` clears marks · the actions menu batches
   open/copy/trash over visible marked rows · `ctrl-p`/`ctrl-n` recall query history ·
+  `ctrl-g` cycles theme presets · `f1`/`ctrl-o` opens help ·
   `tab` cycles the preview (side → full-window → hidden) · `esc` quits
 
 Piped input flips fsearch into an fzf-style filter: `git ls-files |
@@ -135,12 +136,16 @@ movement, ctrl-a/e/w/d) are fixed and can't be rebound.
     [keys]
     quit = "ctrl-q"
     move_up = ["up", "ctrl-k"]
+    help = ["f1", "ctrl-o"]
+    toggle_mark = "ctrl-b"
+    clear_marks = "alt-b"
 
 `ctrl-g` cycles the theme presets live (session-only; config wins next run).
 `ctrl-b`/`alt-b` mark and clear files in open mode; filter and `--pick` modes
 keep marking disabled. Batch actions use only visible marked rows.
 `icons = true` prefixes result rows with nerd-font glyphs — it needs a nerd
-font, so it defaults to off.
+font, so it defaults to off. `remember_session = false` disables restoring
+preview layout and row density between runs.
 
 Mouse is on by default: click to select, double-click to open, wheel
 scrolls (`mouse = false` in config.toml disables it). While enabled, hold

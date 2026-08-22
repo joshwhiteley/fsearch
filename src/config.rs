@@ -151,6 +151,8 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #         selection_bg / match_fg / section: optional hex overrides,
 #           e.g. selection_bg = \"#313244\"
 # [keys] remaps commands, e.g. quit = \"ctrl-q\", move_up = [\"up\", \"ctrl-k\"]
+#   help = [\"f1\", \"ctrl-o\"], toggle_mark = \"ctrl-b\", clear_marks = \"alt-b\"
+#   theme_cycle = \"ctrl-g\"
 #   (text editing keys - typing, backspace, cursor, ctrl-a/e/w/d - are fixed)
 # index_apps: include /Applications app bundles in the index (macOS)
 # icons: nerd-font glyphs before filenames (true/false; needs a nerd font)

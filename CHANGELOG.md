@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- TUI: cycle themes with `ctrl-g`, open the keymap-driven help overlay with
+  `f1`/`ctrl-o`, and mark visible files with `ctrl-b`/`alt-b` for batch actions;
+  Nerd Font icons, row density, session restore, and configurable keys remain
+  integrated.
 - Fixed quadratic line counting in semantic chunking, so indexing large
   documents is linear in size instead of stalling
 - Semantic, path-index, and cache writes now use unique temp names and fsync

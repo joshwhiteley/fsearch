@@ -64,6 +64,8 @@ keys:
   ctrl-x               show or hide weaker matches
   ctrl-b               toggle mark (open mode)
   alt-b                clear marks (open mode)
+  ctrl-g               cycle theme preset (session-only)
+  f1, ctrl-o           open the help overlay
   esc, ctrl-c          quit
   all bindings         remappable via [keys] in config.toml
 
@@ -255,6 +257,10 @@ mod tests {
             "--index-semantic",
             "ctrl-r",
             "ctrl-t",
+            "ctrl-g",
+            "f1, ctrl-o",
+            "ctrl-b",
+            "alt-b",
         ] {
             assert!(HELP.contains(needle), "help is missing {needle:?}");
         }
