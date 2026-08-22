@@ -109,10 +109,9 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
             Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(image: {e})"))]),
         };
     }
-    match std::fs::read(&req.path) {
+    match read_preview_bytes(&req.path) {
         Ok(bytes) if bytes.contains(&0) => PreviewPayload::Lines(vec![Line::from("(binary file)")]),
-        Ok(mut bytes) => {
-            bytes.truncate(PREVIEW_BYTES);
+        Ok(bytes) => {
             let text = String::from_utf8_lossy(&bytes);
             match req.line_number {
                 // center the preview on the matching line, with a gutter
@@ -144,6 +143,20 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
         }
         Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(unreadable: {e})"))]),
     }
+}
+
+/// Reads at most PREVIEW_BYTES (plus a one-byte truncation sentinel) from
+/// `path`: previewing must never slurp a multi-gigabyte file into memory
+/// just to show its head. Binary detection then runs on that bounded head.
+fn read_preview_bytes(path: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    const CAP: u64 = PREVIEW_BYTES as u64 + 1;
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(CAP.min(len) as usize);
+    file.take(CAP).read_to_end(&mut bytes)?;
+    bytes.truncate(PREVIEW_BYTES);
+    Ok(bytes)
 }
 
 pub(super) fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>> {
@@ -367,5 +380,54 @@ mod tests {
                 .flat_map(|line| line.spans.iter())
                 .any(|span| span.content.contains("Preview Needle"))
         );
+    }
+
+    #[test]
+    fn preview_read_is_bounded_and_keeps_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        // far larger than PREVIEW_BYTES: the read must stop at the cap
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, vec![b'a'; PREVIEW_BYTES * 4]).unwrap();
+        let bytes = read_preview_bytes(big.to_str().unwrap()).unwrap();
+        assert_eq!(bytes.len(), PREVIEW_BYTES);
+        assert!(bytes.iter().all(|&b| b == b'a'));
+
+        // small files round-trip intact
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, b"hello").unwrap();
+        let bytes = read_preview_bytes(small.to_str().unwrap()).unwrap();
+        assert_eq!(bytes, b"hello");
+
+        // missing paths surface the io error like std::fs::read did
+        assert!(read_preview_bytes(dir.path().join("gone.txt").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn oversized_text_file_previews_only_its_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        std::fs::write(&path, {
+            let mut v = vec![b'x'; PREVIEW_BYTES * 3];
+            for slot in v.chunks_mut(80) {
+                slot[slot.len() - 1] = b'\n'; // many lines, >100 of them
+            }
+            v[PREVIEW_BYTES] = 0; // a NUL beyond the cap must not matter
+            v
+        })
+        .unwrap();
+        let payload = preview_payload(&PreviewRequest {
+            generation: 0,
+            path: path.to_string_lossy().into_owned(),
+            line_number: None,
+            appearance: Appearance::Dark,
+            gutter: Color::Gray,
+        });
+        // binary detection runs on the bounded head, so no false "binary"
+        let PreviewPayload::Lines(lines) = payload else {
+            panic!("oversized text file should preview as text");
+        };
+        assert_eq!(lines.len(), 100);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first.contains('x'));
     }
 }

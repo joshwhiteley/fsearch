@@ -8,7 +8,7 @@ fn main() {
     // the default hook from printing contained parser failures as crashes
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if fsearch::pdf::in_extract_guard() || fsearch::office::in_extract_guard() {
+        if fsearch::in_parser_guard() {
             return;
         }
         default_hook(info);
