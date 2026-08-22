@@ -562,8 +562,9 @@ impl SemStore {
         }
         let nonce = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-        {
-            let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+        let written = (|| {
+            let file = std::fs::File::create(&tmp)?;
+            let mut w = BufWriter::new(file);
             w.write_all(STORE_MAGIC)?;
             w.write_all(&self.dim.to_le_bytes())?;
             w.write_all(&(self.docs.len() as u64).to_le_bytes())?;
@@ -581,8 +582,18 @@ impl SemStore {
             }
             self.vectors.write_f16_le(&mut w)?;
             w.flush()?;
+            let file = w.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()
+        })();
+        if let Err(e) = written {
+            drop(std::fs::remove_file(&tmp));
+            return Err(e);
         }
-        std::fs::rename(&tmp, path)
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            drop(std::fs::remove_file(&tmp));
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn validate_for_save(&self) -> std::io::Result<()> {
