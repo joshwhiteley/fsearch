@@ -149,10 +149,15 @@ impl App {
         let (preview_tx, preview_rx) = mpsc::channel::<PreviewRequest>();
         let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
         // one preview worker for the app's lifetime; exits when the app
-        // (and thus preview_tx) is dropped
+        // (and thus preview_tx) is dropped. Per-request work is panic-guarded:
+        // image decoding, SVG rendering, and syntect highlighting all run in
+        // here, and a dead worker would leave previews stuck on "loading..."
         std::thread::spawn(move || {
             while let Ok(req) = preview_rx.recv() {
-                let payload = preview_payload(&req);
+                let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    preview_payload(&req)
+                }))
+                .unwrap_or_else(|_| PreviewPayload::Lines(vec![Line::from("(preview failed)")]));
                 if result_tx
                     .send(PreviewResult {
                         generation: req.generation,
