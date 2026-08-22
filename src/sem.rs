@@ -185,6 +185,9 @@ pub fn chunk_text(text: &str, target: usize, overlap: usize) -> Vec<Chunk> {
     let chars: Vec<char> = text.chars().collect();
     let mut chunks = Vec::new();
     let mut start = 0usize;
+    // newlines seen in chars[..start], carried forward so line tracking stays
+    // linear in document size instead of rescanning the prefix every chunk
+    let mut newlines_before_start = 0usize;
     while start < chars.len() {
         let hard_end = start.saturating_add(target).min(chars.len());
         // prefer to break on a newline in the last quarter of the window
@@ -197,7 +200,7 @@ pub fn chunk_text(text: &str, target: usize, overlap: usize) -> Vec<Chunk> {
                 end = nl + 1;
             }
         }
-        let line_start = chars[..start].iter().filter(|&&c| c == '\n').count() as u32 + 1;
+        let line_start = newlines_before_start as u32 + 1;
         let body: String = chars[start..end].iter().collect();
         if !body.trim().is_empty() {
             chunks.push(Chunk {
@@ -208,7 +211,12 @@ pub fn chunk_text(text: &str, target: usize, overlap: usize) -> Vec<Chunk> {
         if end >= chars.len() {
             break;
         }
-        start = end.saturating_sub(overlap).max(start + 1);
+        let next_start = end.saturating_sub(overlap).max(start + 1);
+        newlines_before_start += chars[start..next_start]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count();
+        start = next_start;
     }
     chunks
 }
@@ -1004,6 +1012,67 @@ mod tests {
         assert_eq!(store.chunk_count(), expected);
         assert!(embedder.calls > 1);
         assert!(embedder.max_batch <= EMBED_BATCH_CHUNKS);
+    }
+
+    /// Independent reference implementation of the original chunker that
+    /// rescans the prefix for every chunk; used to pin line numbers on a
+    /// large document without trusting the code under test.
+    fn naive_chunk_lines(text: &str, target: usize, overlap: usize) -> Vec<(String, u32)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        while start < chars.len() {
+            let hard_end = start.saturating_add(target).min(chars.len());
+            let mut end = hard_end;
+            if hard_end < chars.len() {
+                let window_start = start
+                    .saturating_add(target.saturating_mul(3) / 4)
+                    .min(hard_end);
+                if let Some(nl) = (window_start..hard_end).rev().find(|&i| chars[i] == '\n') {
+                    end = nl + 1;
+                }
+            }
+            let line_start = chars[..start].iter().filter(|&&c| c == '\n').count() as u32 + 1;
+            let body: String = chars[start..end].iter().collect();
+            if !body.trim().is_empty() {
+                out.push((body, line_start));
+            }
+            if end >= chars.len() {
+                break;
+            }
+            start = end.saturating_sub(overlap).max(start + 1);
+        }
+        out
+    }
+
+    #[test]
+    fn large_document_chunking_matches_naive_oracle_and_covers_lines() {
+        let lines = 10_000;
+        let text: String = (1..=lines)
+            .map(|i| format!("line number {i} with some words\n"))
+            .collect();
+        let chunks = chunk_text(&text, CHUNK_CHARS, CHUNK_OVERLAP);
+
+        // line numbers and chunk boundaries match the naive reference
+        let expected = naive_chunk_lines(&text, CHUNK_CHARS, CHUNK_OVERLAP);
+        assert_eq!(chunks.len(), expected.len());
+        assert!(chunks.len() > 10);
+        for (chunk, (text, line_start)) in chunks.iter().zip(expected) {
+            assert_eq!(chunk.text, text);
+            assert_eq!(chunk.line_start, line_start);
+        }
+
+        // coverage: first and last lines land in some chunk, line numbers
+        // are monotonic, and the first chunk starts on line 1
+        assert_eq!(chunks[0].line_start, 1);
+        assert!(chunks.iter().any(|c| c.text.contains("line number 1 ")));
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.text.contains(&format!("line number {lines}")))
+        );
+        let chunk_lines: Vec<u32> = chunks.iter().map(|c| c.line_start).collect();
+        assert!(chunk_lines.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]
