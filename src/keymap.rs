@@ -25,6 +25,7 @@ pub enum Action {
     PreviewLayout,
     DensityToggle,
     FoldToggle,
+    ThemeCycle,
     PreviewPageUp,
     PreviewPageDown,
 }
@@ -47,6 +48,7 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::PreviewLayout, &["tab"]),
     (Action::DensityToggle, &["ctrl-t"]),
     (Action::FoldToggle, &["ctrl-x"]),
+    (Action::ThemeCycle, &["ctrl-g"]),
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
 ];
@@ -145,6 +147,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "preview_layout" => Action::PreviewLayout,
         "density_toggle" => Action::DensityToggle,
         "fold_toggle" => Action::FoldToggle,
+        "theme_cycle" => Action::ThemeCycle,
         "preview_page_up" => Action::PreviewPageUp,
         "preview_page_down" => Action::PreviewPageDown,
         _ => return None,
@@ -332,6 +335,7 @@ mod tests {
         check("tab", Action::PreviewLayout);
         check("ctrl-t", Action::DensityToggle);
         check("ctrl-x", Action::FoldToggle);
+        check("ctrl-g", Action::ThemeCycle);
         check("pgup", Action::PreviewPageUp);
         check("pgdn", Action::PreviewPageDown);
         // keys never bound by default

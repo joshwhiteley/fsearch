@@ -60,6 +60,8 @@ pub struct Config {
     pub quiet: Vec<String>,
     /// Include /Applications app bundles in the index (macOS).
     pub index_apps: bool,
+    /// Nerd-font glyphs before filenames in result rows.
+    pub icons: bool,
 }
 
 impl Default for Config {
@@ -77,6 +79,7 @@ impl Default for Config {
                 .map(|s| s.to_string())
                 .collect(),
             index_apps: true,
+            icons: false,
         }
     }
 }
@@ -92,6 +95,7 @@ struct RawConfig {
     remember_session: Option<bool>,
     quiet: Option<Vec<String>>,
     index_apps: Option<bool>,
+    icons: Option<bool>,
 }
 
 /// A `[keys]` value: either one spec string or a list of them.
@@ -149,6 +153,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # [keys] remaps commands, e.g. quit = \"ctrl-q\", move_up = [\"up\", \"ctrl-k\"]
 #   (text editing keys - typing, backspace, cursor, ctrl-a/e/w/d - are fixed)
 # index_apps: include /Applications app bundles in the index (macOS)
+# icons: nerd-font glyphs before filenames (true/false; needs a nerd font)
 # quiet: substrings demoted in ranking (app internals); set [] to disable
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
 # remember_session: restore preview layout and row density between runs
@@ -207,6 +212,7 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
         remember_session: raw.remember_session.unwrap_or(true),
         quiet: raw.quiet.unwrap_or_else(|| d.quiet.clone()),
         index_apps: raw.index_apps.unwrap_or(true),
+        icons: raw.icons.unwrap_or(false),
     })
 }
 
@@ -354,6 +360,17 @@ mod tests {
         let path2 = dir.path().join("plain.toml");
         std::fs::write(&path2, "roots = [\"/tmp\"]\n").unwrap();
         assert!(load_or_create(&path2).unwrap().remember_session);
+    }
+
+    #[test]
+    fn icons_flag_parses_and_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "icons = true\n").unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert!(c.icons);
+        // default is off
+        assert!(!Config::default().icons);
     }
 
     #[test]

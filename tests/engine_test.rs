@@ -27,6 +27,7 @@ fn config_for(root: &std::path::Path) -> Config {
         mouse: true,
         remember_session: true,
         index_apps: false,
+        icons: false,
         quiet: Vec::new(),
     }
 }

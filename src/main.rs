@@ -178,16 +178,18 @@ fn run_filter(initial_query: &str) {
     // build the keymap and mouse flag before the engine consumes the config
     let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
     let mouse = config.mouse;
+    let icons = config.icons;
     let remember_session = config.remember_session;
-    let theme = fsearch::theme::resolve_config(&config.theme);
+    let theme_cfg = config.theme.clone();
     let engine = Engine::from_lines(lines);
     match tui::run(
         engine,
         tui::UiMode::Pick,
         initial_query,
-        theme,
+        theme_cfg,
         keymap,
         mouse,
+        icons,
         remember_session,
     ) {
         Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
@@ -204,8 +206,9 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     // build the keymap and mouse flag before the engine consumes the config
     let keymap = fsearch::keymap::Keymap::from_config(&config.keys);
     let mouse = config.mouse;
+    let icons = config.icons;
     let remember_session = config.remember_session;
-    let theme = fsearch::theme::resolve_config(&config.theme);
+    let theme_cfg = config.theme.clone();
     let engine = Engine::new(
         config,
         index::default_cache_path(),
@@ -215,9 +218,10 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
         engine,
         ui_mode,
         initial_query,
-        theme,
+        theme_cfg,
         keymap,
         mouse,
+        icons,
         remember_session,
     ) {
         Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
