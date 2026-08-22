@@ -49,7 +49,7 @@ syntect = "5"
 terminal-colorsaurus = "1"
 toml = "1"
 two-face = "0.5"
-zip = { version = "6", default-features = false, features = ["deflate"] }
+zip = { version = "7", default-features = false, features = ["deflate"] }
 
 [features]
 # Sharper cell-art image previews for terminals without a graphics protocol.
