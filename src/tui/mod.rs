@@ -246,6 +246,11 @@ pub struct App {
     pub appearance: Appearance,
     pub picker: Option<Picker>,
     pub theme: Theme,
+    /// The raw `[theme]` config the current theme was resolved from; kept
+    /// so ctrl-g can re-resolve each preset with accent/overrides intact.
+    pub theme_cfg: crate::config::ThemeConfig,
+    /// Nerd-font glyphs before filenames (from `icons = true`).
+    pub icons: bool,
     pub ui_mode: UiMode,
     pub picked: Option<String>,
     /// Open actions popup: Some(selected entry index).
@@ -304,6 +309,8 @@ impl App {
             appearance: Appearance::Dark,
             picker: None,
             theme: crate::theme::resolve("default", None),
+            theme_cfg: crate::config::ThemeConfig::default(),
+            icons: false,
             ui_mode: UiMode::Open,
             picked: None,
             menu: None,
@@ -509,6 +516,7 @@ impl App {
                     }
                 }
             }
+            crate::keymap::Action::ThemeCycle => self.cycle_theme(),
             crate::keymap::Action::PreviewPageUp => {
                 self.preview.scroll = self.preview.scroll.saturating_sub(PREVIEW_SCROLL_PAGE);
             }
@@ -517,6 +525,16 @@ impl App {
             }
         }
         true
+    }
+
+    /// ctrl-g: step through the presets live (session-only, never written
+    /// back to config). The user's accent/border/hex overrides ride along.
+    fn cycle_theme(&mut self) {
+        let names = crate::theme::preset_names();
+        let next = names[(crate::theme::preset_index(&self.theme_cfg.preset) + 1) % names.len()];
+        self.theme_cfg.preset = next.to_string();
+        self.theme = crate::theme::resolve_config(&self.theme_cfg);
+        self.message = Some((format!("theme: {next}"), Instant::now()));
     }
 
     fn refresh_query(&mut self) {
@@ -883,9 +901,10 @@ pub fn run(
     engine: Engine,
     ui_mode: UiMode,
     initial_query: &str,
-    theme: Theme,
+    theme_cfg: crate::config::ThemeConfig,
     keymap: crate::keymap::Keymap,
     mouse: bool,
+    icons: bool,
 ) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
@@ -916,7 +935,9 @@ pub fn run(
     app.appearance = traits.appearance;
     app.picker = picker;
     app.ui_mode = ui_mode;
-    app.theme = theme;
+    app.theme_cfg = theme_cfg;
+    app.theme = crate::theme::resolve_config(&app.theme_cfg);
+    app.icons = icons;
     if app.engine.is_filter() {
         // filter rows are arbitrary lines, not real files: start with the
         // preview hidden (Tab still cycles, previews of real files work)

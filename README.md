@@ -135,6 +135,10 @@ movement, ctrl-a/e/w/d) are fixed and can't be rebound.
     quit = "ctrl-q"
     move_up = ["up", "ctrl-k"]
 
+`ctrl-g` cycles the theme presets live (session-only; config wins next run).
+`icons = true` prefixes result rows with nerd-font glyphs — it needs a nerd
+font, so it defaults to off.
+
 Mouse is on by default: click to select, double-click to open, wheel
 scrolls (`mouse = false` in config.toml disables it). While enabled, hold
 the shift key for native terminal text selection.

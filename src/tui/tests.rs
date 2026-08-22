@@ -1,5 +1,5 @@
 use super::chrome::{draw, gauge_cells, human_age, query_spans};
-use super::rows::{badge_for, score_bar, score_readout, spans_with_styles};
+use super::rows::{badge_for, icon_glyph, icon_spans, score_bar, score_readout, spans_with_styles};
 use super::{App, Density, PreviewContent, PreviewLayout, Slot, UiMode};
 use crate::config::Config;
 use crate::engine::Engine;
@@ -27,6 +27,7 @@ fn test_app() -> App {
         keys: Default::default(),
         mouse: true,
         index_apps: false,
+        icons: false,
         quiet: Vec::new(),
     };
     let engine = Engine::new(
@@ -161,6 +162,99 @@ fn empty_state_shows_no_matches_and_minimal_footer() {
     assert!(text.contains("(no matches)"), "empty-state message missing");
     assert!(text.contains("esc quit"), "minimal footer missing");
     assert!(text.contains("ctrl-u clear"), "minimal footer missing");
+}
+
+#[test]
+fn ctrl_g_cycles_presets_with_a_toast() {
+    let mut app = test_app();
+    // an empty preset counts as "default", so the cycle starts at catppuccin
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert_eq!(app.theme_cfg.preset, "catppuccin");
+    assert_eq!(
+        app.theme.accent,
+        crate::theme::resolve("catppuccin", None).accent
+    );
+    let toast = app
+        .message
+        .as_ref()
+        .expect("cycle raises a toast")
+        .0
+        .clone();
+    assert!(
+        toast.contains("catppuccin"),
+        "toast names the theme: {toast}"
+    );
+    // and walks the declaration order, wrapping back to default after slate
+    for expected in ["gruvbox", "nord", "tokyonight", "slate", "default"] {
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(app.theme_cfg.preset, expected);
+    }
+}
+
+#[test]
+fn theme_cycle_keeps_hex_overrides() {
+    let mut app = test_app();
+    app.theme_cfg.accent = Some("#ff0080".into());
+    app.theme = crate::theme::resolve_config(&app.theme_cfg);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert_eq!(app.theme_cfg.preset, "catppuccin");
+    // the user's accent override rides along onto the next preset
+    assert_eq!(app.theme.accent, Color::Rgb(0xff, 0x00, 0x80));
+}
+
+#[test]
+fn icons_render_only_when_enabled() {
+    use crate::engine::ResultRow;
+    let mut app = test_app();
+    app.engine.inject_results_for_test(vec![ResultRow {
+        path: "/a/b/notes.md".into(),
+        line_number: None,
+        line: None,
+        recent_open: false,
+        meta: None,
+        score: None,
+    }]);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(
+        !buffer_text(&terminal).contains('\u{f15c}'),
+        "no glyph by default"
+    );
+    // comfy density shows the doc glyph before the filename
+    app.icons = true;
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains('\u{f15c}'));
+    // compact density too
+    app.density = Density::Compact;
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains('\u{f15c}'));
+}
+
+#[test]
+fn icon_glyphs_map_kinds() {
+    assert_eq!(icon_glyph("/x/a.rs"), "\u{f121}"); // code
+    assert_eq!(icon_glyph("/x/a.py"), "\u{f121}");
+    assert_eq!(icon_glyph("/x/report.pdf"), "\u{f15c}"); // doc
+    assert_eq!(icon_glyph("/x/notes.md"), "\u{f15c}");
+    assert_eq!(icon_glyph("/x/pic.png"), "\u{f1c5}"); // image
+    assert_eq!(icon_glyph("/x/movie.mkv"), "\u{f1c8}"); // video
+    assert_eq!(icon_glyph("/x/song.flac"), "\u{f1c7}"); // audio
+    assert_eq!(icon_glyph("/x/bundle.tgz"), "\u{f1c6}"); // archive
+    assert_eq!(icon_glyph("/x/Tools.app"), "\u{f135}"); // launch
+    assert_eq!(icon_glyph("/x/folder/"), "\u{f07b}"); // dir-ish
+    assert_eq!(icon_glyph("/x/noext"), "\u{f15b}"); // default file
+}
+
+#[test]
+fn icon_spans_are_empty_when_disabled() {
+    let theme = crate::theme::resolve("default", None);
+    let (spans, width) = icon_spans("/x/a.rs", theme.badges, theme.accent, false);
+    assert!(spans.is_empty());
+    assert_eq!(width, 0);
+    let (spans, width) = icon_spans("/x/a.rs", theme.badges, theme.accent, true);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].content.as_ref(), "\u{f121} ");
+    assert_eq!(width, 2);
 }
 
 #[test]

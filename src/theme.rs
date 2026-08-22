@@ -192,6 +192,20 @@ pub fn resolve(preset: &str, accent: Option<&str>) -> Theme {
     })
 }
 
+/// Preset names in [`PRESETS`] declaration order, for the runtime cycler.
+pub fn preset_names() -> Vec<&'static str> {
+    PRESETS.iter().map(|(name, _)| *name).collect()
+}
+
+/// Position of `preset` in [`PRESETS`] (case-insensitive). Unknown or empty
+/// names map to 0, matching [`resolve_config`]'s fallback to "default".
+pub fn preset_index(preset: &str) -> usize {
+    PRESETS
+        .iter()
+        .position(|(name, _)| name.eq_ignore_ascii_case(preset))
+        .unwrap_or(0)
+}
+
 /// Full theme resolution: preset + accent, then the config's border style
 /// and the hex overrides (`selection_bg` / `match_fg` / `section`).
 /// Unknown or malformed values are ignored, leaving the preset's choice.
@@ -226,6 +240,22 @@ mod tests {
 
     #[test]
     fn presets_resolve_and_unknowns_fall_back() {
+        // the cycler walks this exact declaration order
+        assert_eq!(
+            preset_names(),
+            [
+                "default",
+                "catppuccin",
+                "gruvbox",
+                "nord",
+                "tokyonight",
+                "slate"
+            ]
+        );
+        assert_eq!(preset_index("nord"), 3);
+        assert_eq!(preset_index("NORD"), 3); // case-insensitive like resolve_config
+        assert_eq!(preset_index(""), 0); // empty counts as default
+        assert_eq!(preset_index("no-such-theme"), 0);
         assert_eq!(
             resolve("gruvbox", None).accent,
             Color::Rgb(0xfe, 0x80, 0x19)
