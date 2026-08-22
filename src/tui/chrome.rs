@@ -79,6 +79,12 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
             actions.push((crate::keymap::Action::QuickLook, "quick look"));
             actions.push((crate::keymap::Action::Menu, "actions"));
             actions.push((crate::keymap::Action::PreviewLayout, "preview"));
+            if app.engine.mode() != Mode::Calc
+                && app.ui_mode == UiMode::Open
+                && !app.engine.is_filter()
+            {
+                actions.push((crate::keymap::Action::ToggleMark, "mark"));
+            }
         }
     }
     actions
@@ -250,8 +256,9 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     let Some(selected) = app.menu else {
         return;
     };
+    let entries = app.menu_entries();
     let width = 24u16.min(body.width);
-    let height = (App::MENU.len() as u16 + 2).min(body.height);
+    let height = (entries.len() as u16 + 2).min(body.height);
     let area = Rect {
         x: body.x + (body.width.saturating_sub(width)) / 2,
         y: body.y + (body.height.saturating_sub(height)) / 2,
@@ -260,7 +267,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     };
     app.menu_area = area;
     frame.render_widget(ratatui::widgets::Clear, area);
-    let items: Vec<ListItem> = App::MENU
+    let items: Vec<ListItem> = entries
         .iter()
         .map(|label| ListItem::new(format!(" {label}")))
         .collect();
@@ -392,6 +399,13 @@ pub(super) fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let dim = Style::default().fg(app.theme.dim);
     let mut spans = vec![Span::raw(format!("{} indexed", s.indexed))];
     spans.push(Span::raw(format!(" · {} matches", s.matches)));
+    // visible marks get their own count so batch actions are predictable
+    if app.marking_enabled() && app.engine.mode() != Mode::Calc {
+        let marked = app.visible_marked_count();
+        if marked > 0 {
+            spans.push(Span::raw(format!(" · {marked} marked")));
+        }
+    }
     // the stat cache is refreshed by the event loop (refresh_status), never
     // here: the draw pass stays free of filesystem access
     if app.engine.results().get(app.selected).is_some()

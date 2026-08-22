@@ -27,6 +27,8 @@ pub enum Action {
     FoldToggle,
     PreviewPageUp,
     PreviewPageDown,
+    ToggleMark,
+    ClearMarks,
 }
 
 /// Key spec strings for the default bindings (identical to the historical
@@ -49,6 +51,8 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::FoldToggle, &["ctrl-x"]),
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
+    (Action::ToggleMark, &["ctrl-b"]),
+    (Action::ClearMarks, &["alt-b"]),
 ];
 
 /// Parses a key spec like `"ctrl-y"`, `"CTRL+Y"`, `"alt+shift-x"`, `"f5"`,
@@ -147,6 +151,8 @@ fn action_from_name(name: &str) -> Option<Action> {
         "fold_toggle" => Action::FoldToggle,
         "preview_page_up" => Action::PreviewPageUp,
         "preview_page_down" => Action::PreviewPageDown,
+        "toggle_mark" => Action::ToggleMark,
+        "clear_marks" => Action::ClearMarks,
         _ => return None,
     })
 }
@@ -334,6 +340,8 @@ mod tests {
         check("ctrl-x", Action::FoldToggle);
         check("pgup", Action::PreviewPageUp);
         check("pgdn", Action::PreviewPageDown);
+        check("ctrl-b", Action::ToggleMark);
+        check("alt-b", Action::ClearMarks);
         // keys never bound by default
         assert_eq!(km.lookup(KeyCode::Char('q'), KeyModifiers::CONTROL), None);
     }

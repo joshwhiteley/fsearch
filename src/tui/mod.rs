@@ -15,6 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use ratatui::{Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -264,6 +265,11 @@ pub struct App {
     pub hit_test: HitTest,
     pub highlights: Highlights,
     pub status: StatusCache,
+    /// Multi-select marks, tracked as PATHS so they survive reordering of
+    /// results. The set persists until cleared or quit; batch actions and
+    /// the row indicators operate only on currently-visible marked rows.
+    /// Never populated in filter mode (rows are arbitrary stdin lines).
+    pub marks: HashSet<String>,
 }
 
 impl App {
@@ -345,6 +351,7 @@ impl App {
                 path: String::new(),
                 meta: None,
             },
+            marks: HashSet::new(),
         }
     }
 
@@ -356,15 +363,103 @@ impl App {
         "move to trash",
     ];
 
+    /// Menu entries: the single-selection actions plus, when marked rows
+    /// are visible, the batch actions over those rows.
+    fn menu_entries(&self) -> Vec<&'static str> {
+        let mut entries: Vec<&'static str> = Self::MENU.to_vec();
+        if self.marking_enabled() && self.visible_marked_count() > 0 {
+            entries.extend([
+                "open marked",
+                "copy marked paths",
+                "trash marked",
+                "clear marks",
+            ]);
+        }
+        entries
+    }
+
+    /// Paths of currently-visible marked rows, in display order.
+    fn visible_marked(&self) -> Vec<String> {
+        self.engine
+            .results()
+            .iter()
+            .take(self.visible_len())
+            .filter(|r| self.marks.contains(&r.path))
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    /// Marking is an Open-mode feature: `--pick` returns one choice and
+    /// `--filter` rows are arbitrary stdin lines, so neither shows marks.
+    fn marking_enabled(&self) -> bool {
+        self.ui_mode == UiMode::Open && !self.engine.is_filter()
+    }
+
+    fn visible_marked_count(&self) -> usize {
+        self.engine
+            .results()
+            .iter()
+            .take(self.visible_len())
+            .filter(|r| self.marks.contains(&r.path))
+            .count()
+    }
+
     fn run_menu_action(&mut self, entry: usize) {
         self.menu = None;
+        let batch = Self::MENU.len();
         match entry {
             0 => self.open_selected(),
             1 => self.act(actions::reveal, "revealed"),
             2 => self.act(actions::copy, "copied"),
             3 => self.act(actions::quick_look, "quick look"),
             4 => self.act(actions::trash, "trashed"),
+            i if i == batch => self.open_marked(),
+            i if i == batch + 1 => self.copy_marked(),
+            i if i == batch + 2 => self.trash_marked(),
+            i if i == batch + 3 => self.clear_marks(),
             _ => {}
+        }
+    }
+
+    /// Batch-open every visible marked row, reusing the single-file open.
+    fn open_marked(&mut self) {
+        let paths = self.visible_marked();
+        let mut opened = 0usize;
+        for path in &paths {
+            if actions::open(path).is_ok() {
+                self.engine.record_open(path);
+                opened += 1;
+            }
+        }
+        self.message = Some((format!("opened {opened} files"), Instant::now()));
+    }
+
+    /// Copies the visible marked paths to the clipboard, newline-joined.
+    fn copy_marked(&mut self) {
+        let paths = self.visible_marked();
+        let count = paths.len();
+        self.message = Some((
+            match actions::copy(&paths.join("\n")) {
+                Ok(()) => format!("copied {count} paths"),
+                Err(e) => format!("error: {e}"),
+            },
+            Instant::now(),
+        ));
+    }
+
+    /// Moves every visible marked row to the trash, reusing the single-file
+    /// trash action per row.
+    fn trash_marked(&mut self) {
+        let paths = self.visible_marked();
+        let trashed = paths.iter().filter(|p| actions::trash(p).is_ok()).count();
+        self.message = Some((format!("trashed {trashed} files"), Instant::now()));
+    }
+
+    fn clear_marks(&mut self) {
+        let cleared = self.marks.len();
+        self.marks.clear();
+        if cleared > 0 {
+            self.message = Some((format!("cleared {cleared} marks"), Instant::now()));
         }
     }
 
@@ -411,11 +506,12 @@ impl App {
         self.message = None;
         // the actions popup swallows navigation while open
         if let Some(selected) = self.menu {
+            let entries = self.menu_entries();
             match key.code {
                 KeyCode::Esc | KeyCode::Left => self.menu = None,
-                KeyCode::Down => self.menu = Some((selected + 1) % Self::MENU.len()),
+                KeyCode::Down => self.menu = Some((selected + 1) % entries.len()),
                 KeyCode::Up => {
-                    self.menu = Some((selected + Self::MENU.len() - 1) % Self::MENU.len());
+                    self.menu = Some((selected + entries.len() - 1) % entries.len());
                 }
                 KeyCode::Enter => self.run_menu_action(selected),
                 _ => {}
@@ -447,7 +543,13 @@ impl App {
                 self.editor.delete_backward();
                 self.refresh_query();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // matches is_editing_key: only bare characters (and ctrl-a/e/w/d
+            // above) type; ctrl/alt-modified chars go to the keymap
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.editor.insert_char(c);
                 self.refresh_query();
             }
@@ -514,6 +616,20 @@ impl App {
             }
             crate::keymap::Action::PreviewPageDown => {
                 self.preview.scroll = self.preview.scroll.saturating_add(PREVIEW_SCROLL_PAGE);
+            }
+            crate::keymap::Action::ToggleMark => {
+                // filter rows are arbitrary stdin lines, not files: no marks
+                if self.marking_enabled()
+                    && let Some(row) = self.engine.results().get(self.selected)
+                    && !self.marks.remove(&row.path)
+                {
+                    self.marks.insert(row.path.clone());
+                }
+            }
+            crate::keymap::Action::ClearMarks => {
+                if self.marking_enabled() {
+                    self.clear_marks();
+                }
             }
         }
         true
