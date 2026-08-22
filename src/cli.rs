@@ -20,7 +20,8 @@ fsearch — fast Alfred-style file search for the terminal
 usage:
   fsearch              launch the interactive search ui
   fsearch --config     open the config file in $VISUAL/$EDITOR,
-                       or reveal it in Finder when neither is set
+                       or reveal it in the desktop file manager when
+                       neither is set
   fsearch --reindex    rebuild the file index now
   fsearch --index-semantic
                        build/refresh the semantic index for ? queries
@@ -31,6 +32,7 @@ usage:
   fsearch --pick [Q]   interactive ui, but enter prints the selection to
                        stdout instead of opening it (for scripts/pipes)
   fsearch --filter [Q] fuzzy-filter stdin lines and print the selection
+  cat list | fsearch   same as --filter: piped stdin fuzzy-filters lines
   fsearch --doctor     print what the terminal probe detected
   fsearch --help       show this help
   fsearch --version    print the version
@@ -54,7 +56,7 @@ query syntax:
 keys:
   up/down, ctrl-k/j    move selection
   enter                open with default app
-  ctrl-f               reveal in Finder
+  ctrl-f               reveal in the file manager
   ctrl-y               copy path to clipboard
   ctrl-u               clear query
   tab                  cycle preview: side, full-window, hidden
@@ -74,7 +76,8 @@ pub enum ConfigOpen {
     Reveal,
 }
 
-/// $VISUAL wins over $EDITOR; with neither set, reveal the file in Finder.
+/// $VISUAL wins over $EDITOR; with neither set, reveal the file in the
+/// desktop file manager.
 pub fn choose_config_open(visual: Option<&str>, editor: Option<&str>) -> ConfigOpen {
     visual
         .into_iter()
