@@ -201,6 +201,8 @@ impl Action {
             Action::PreviewPageUp => "preview page up",
             Action::PreviewPageDown => "preview page down",
             Action::Help => "help",
+            Action::ToggleMark => "toggle mark",
+            Action::ClearMarks => "clear marks",
         }
     }
 
@@ -222,6 +224,7 @@ impl Action {
             | Action::PreviewPageUp
             | Action::PreviewPageDown => "view",
             Action::RegexToggle | Action::ClearQuery | Action::Help => "query modes",
+            Action::ToggleMark | Action::ClearMarks => "open & actions",
         }
     }
 }
@@ -427,6 +430,23 @@ mod tests {
         check("alt-b", Action::ClearMarks);
         // keys never bound by default
         assert_eq!(km.lookup(KeyCode::Char('q'), KeyModifiers::CONTROL), None);
+    }
+
+    #[test]
+    fn every_default_action_has_help_metadata() {
+        let actions = Keymap::default().actions();
+        assert_eq!(actions.len(), 21);
+        for action in actions {
+            assert!(!action.label().is_empty());
+            assert!(
+                matches!(
+                    action.help_group(),
+                    "navigation" | "open & actions" | "view" | "query modes"
+                ),
+                "unexpected help group for {}",
+                action.label()
+            );
+        }
     }
 
     #[test]

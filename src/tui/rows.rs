@@ -100,15 +100,15 @@ pub(super) fn badge_spans(
     accent: Color,
 ) -> (Vec<Span<'static>>, usize) {
     let (label, color) = badge_for(path, badges, accent);
-    let width = label.chars().count() + 3; // " label " + the gap
-    let span = Span::styled(
+    let label_span = Span::styled(
         format!(" {label} "),
         Style::default()
             .fg(Color::Black)
             .bg(color)
             .add_modifier(Modifier::BOLD),
     );
-    (vec![span, Span::raw(" ")], width)
+    let width = label_span.width() + Span::raw(" ").width();
+    (vec![label_span, Span::raw(" ")], width)
 }
 
 /// Nerd-font glyph for a path's kind; the same buckets as [`badge_for`].
@@ -145,12 +145,11 @@ pub(super) fn icon_spans(
     }
     let glyph = icon_glyph(path);
     let (_, color) = badge_for(path, badges, accent);
+    let content = format!("{glyph} ");
+    let width = Span::raw(content.clone()).width();
     (
-        vec![Span::styled(
-            format!("{glyph} "),
-            Style::default().fg(color),
-        )],
-        glyph.chars().count() + 1,
+        vec![Span::styled(content, Style::default().fg(color))],
+        width,
     )
 }
 
@@ -184,6 +183,9 @@ pub(super) fn score_readout(s: f32, accent: Color, dim: Style) -> (usize, Vec<Sp
     let fill = "\u{25b0}".repeat(filled);
     let rest = "\u{25b1}".repeat(5 - filled);
     let pct = format!(" {:.0}%", s * 100.0);
+    let width = Span::raw(fill.clone()).width()
+        + Span::raw(rest.clone()).width()
+        + Span::raw(pct.clone()).width();
     let mut spans: Vec<Span<'static>> = Vec::new();
     if !fill.is_empty() {
         spans.push(Span::styled(fill, Style::default().fg(accent)));
@@ -191,7 +193,6 @@ pub(super) fn score_readout(s: f32, accent: Color, dim: Style) -> (usize, Vec<Sp
     if !rest.is_empty() {
         spans.push(Span::styled(rest, dim));
     }
-    let width = 5 + pct.chars().count();
     spans.push(Span::styled(pct, dim));
     (width, spans)
 }
@@ -203,15 +204,14 @@ pub(super) fn mark_spans(app: &App, path: &str) -> (Vec<Span<'static>>, usize) {
     if !app.marking_enabled() || !app.marks.contains(path) {
         return (Vec::new(), 0);
     }
-    (
-        vec![Span::styled(
-            "▌ ",
-            Style::default()
-                .fg(app.theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )],
-        2,
-    )
+    let span = Span::styled(
+        "▌ ",
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let width = span.width();
+    (vec![span], width)
 }
 
 pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -250,7 +250,7 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         app.highlights.content_input.clear();
         content_re = None;
     }
-    let inner_width = area.width.saturating_sub(2) as usize; // minus the borders
+    let inner_width = themed_block("results", &app.theme).inner(area).width as usize;
     let name_plain = Style::default().add_modifier(Modifier::BOLD);
     let parent_hl = Style::default().fg(match_color).add_modifier(Modifier::DIM);
     let items: Vec<ListItem> = app
@@ -307,6 +307,7 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let parent = shown[..shown.len() - name.len()].to_string();
             let name_chars = name.chars().count();
+            let name_width = Span::raw(name.clone()).width();
             let parent_chars = shown.chars().count() - name_chars;
             match (r.line_number, &r.line) {
                 (Some(n), Some(line)) => {
@@ -335,8 +336,8 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                                 if let Some((right_width, right_spans)) = right {
                                     let left = badge_width
                                         + icon_width
-                                        + name_chars
-                                        + colon.chars().count();
+                                        + name_width
+                                        + Span::raw(colon.clone()).width();
                                     if let Some(pad) = right_pad(left, right_width, inner_width) {
                                         spans.push(Span::raw(" ".repeat(pad)));
                                         spans.extend(right_spans);
@@ -372,10 +373,10 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                                     score_readout(s, app.theme.accent, dim);
                                 let left = badge_width
                                     + icon_width
-                                    + name_chars
-                                    + colon.chars().count()
+                                    + name_width
+                                    + Span::raw(colon.clone()).width()
                                     + 1
-                                    + line.chars().count();
+                                    + Span::raw(line.clone()).width();
                                 if let Some(pad) = right_pad(left, right_width, inner_width) {
                                     spans.push(Span::raw(" ".repeat(pad)));
                                     spans.extend(right_spans);
@@ -426,8 +427,9 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                             line1.extend(icon);
                             line1.extend(name_spans);
                             if let Some(age) = &age {
-                                let left = badge_width + icon_width + name_chars;
-                                if let Some(pad) = right_pad(left, age.chars().count(), inner_width)
+                                let left = badge_width + icon_width + name_width;
+                                if let Some(pad) =
+                                    right_pad(left, Span::raw(age.clone()).width(), inner_width)
                                 {
                                     line1.push(Span::raw(" ".repeat(pad)));
                                     line1.push(Span::styled(age.clone(), dim));
@@ -462,11 +464,11 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                             if let Some(right) = &right {
                                 let left = badge_width
                                     + icon_width
-                                    + name_chars
+                                    + name_width
                                     + 3
-                                    + parent.chars().count();
+                                    + Span::raw(parent.clone()).width();
                                 if let Some(pad) =
-                                    right_pad(left, right.chars().count(), inner_width)
+                                    right_pad(left, Span::raw(right.clone()).width(), inner_width)
                                 {
                                     line1.push(Span::raw(" ".repeat(pad)));
                                     line1.push(Span::styled(right.clone(), dim));
@@ -496,7 +498,7 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     // result rows are 2 lines in Comfy density, 1 in Compact (content rows
     // are 2 lines in comfy too); filter rows are always 1 line. headers and
     // the fold row are 1 line each.
-    let row_height: u16 = if app.engine.is_filter() {
+    let row_height: u16 = if app.engine.is_filter() || app.engine.mode() == Mode::Calc {
         1
     } else {
         match app.density {

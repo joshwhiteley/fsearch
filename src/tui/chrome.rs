@@ -31,6 +31,22 @@ const QUERY_HINTS_MIN_HEIGHT: u16 = 12;
 /// Below this height even the contextual shortcut footer is dropped.
 const ACTION_HINTS_MIN_HEIGHT: u16 = 8;
 
+fn cap_hint_lines(lines: Vec<Line<'static>>, limit: usize) -> Vec<Line<'static>> {
+    if lines.len() <= limit {
+        return lines;
+    }
+    if limit == 0 {
+        return Vec::new();
+    }
+    if limit == 1 {
+        return vec![lines.last().cloned().expect("non-empty hint lines")];
+    }
+    let last = lines.last().cloned().expect("non-empty hint lines");
+    let mut capped: Vec<Line<'static>> = lines.into_iter().take(limit - 1).collect();
+    capped.push(last);
+    capped
+}
+
 pub(super) fn themed_block(title: &str, theme: &Theme) -> Block<'static> {
     let mut block = Block::default()
         .borders(if theme.borders == BorderKind::None {
@@ -95,7 +111,7 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
             }
         }
     }
-    actions.push((crate::keymap::Action::Help, "help"));
+    actions.push((crate::keymap::Action::Help, "help".to_string()));
     actions
         .into_iter()
         .filter_map(|(action, label)| {
@@ -123,52 +139,64 @@ fn minimal_hints(app: &App) -> Vec<(String, String)> {
     .collect()
 }
 
+fn render_hint_row(row: Vec<(String, String)>, key_style: Style, dim: Style) -> Line<'static> {
+    let mut spans = vec![Span::styled(" ", dim)];
+    for (index, (key, label)) in row.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(key, key_style));
+        if !label.is_empty() {
+            spans.push(Span::styled(format!(" {label}"), dim));
+        }
+    }
+    Line::from(spans)
+}
+
 fn help_lines(items: &[(String, String)], width: u16, theme: &Theme) -> Vec<Line<'static>> {
     if items.is_empty() || width == 0 {
         return Vec::new();
     }
     let width = width as usize;
-    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    let key_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+    let mut lines = Vec::new();
     let mut row = Vec::new();
     let mut used = 1usize; // left padding
     for (key, label) in items {
         let label_width = if label.is_empty() {
             0
         } else {
-            1 + label.chars().count()
+            1 + Span::raw(label.clone()).width()
         };
-        let item_width = key.chars().count() + label_width;
+        let item_width = Span::raw(key.clone()).width() + label_width;
+        if item_width + 1 > width {
+            if !row.is_empty() {
+                lines.push(render_hint_row(std::mem::take(&mut row), key_style, dim));
+                used = 1;
+            }
+            let text = if label.is_empty() {
+                format!(" {key}")
+            } else {
+                format!(" {key} {label}")
+            };
+            lines.extend(wrapped_lines(&text, width, dim));
+            continue;
+        }
         let separator = if row.is_empty() { 0 } else { 3 }; // " · "
         if !row.is_empty() && used + separator + item_width > width {
-            rows.push(std::mem::take(&mut row));
+            lines.push(render_hint_row(std::mem::take(&mut row), key_style, dim));
             used = 1;
         }
         used += (if row.is_empty() { 0 } else { 3 }) + item_width;
         row.push((key.clone(), label.clone()));
     }
     if !row.is_empty() {
-        rows.push(row);
+        lines.push(render_hint_row(row, key_style, dim));
     }
-
-    let key_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(theme.dim);
-    rows.into_iter()
-        .map(|row| {
-            let mut spans = vec![Span::styled(" ", dim)];
-            for (index, (key, label)) in row.into_iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled(" · ", dim));
-                }
-                spans.push(Span::styled(key, key_style));
-                if !label.is_empty() {
-                    spans.push(Span::styled(format!(" {label}"), dim));
-                }
-            }
-            Line::from(spans)
-        })
-        .collect()
+    lines
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -178,6 +206,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
         .collect();
     // on short terminals hint rows are dropped before they starve the body
+    let input_height = {
+        let requested = if app.theme.borders == BorderKind::None {
+            2
+        } else {
+            3
+        };
+        requested.min(screen.height.saturating_sub(2).max(1))
+    };
     let query_help = if app.editor.input.is_empty() && screen.height >= QUERY_HINTS_MIN_HEIGHT {
         help_lines(&query_items, screen.width, &app.theme)
     } else {
@@ -193,12 +229,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         Vec::new()
     };
-    // without borders the search bar only needs a title row + the text row
-    let input_height = if app.theme.borders == BorderKind::None {
-        2
-    } else {
-        3
-    };
+    // Keep one body row and the status row even when wrapped hints are tall.
+    // The contextual footer wins over the optional query hints, and retaining
+    // the last footer row keeps the help shortcut discoverable when clipped.
+    let hint_capacity = screen.height.saturating_sub(input_height.saturating_add(2)) as usize;
+    let action_help = cap_hint_lines(action_help, hint_capacity);
+    let query_help = cap_hint_lines(query_help, hint_capacity.saturating_sub(action_help.len()));
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -390,18 +426,22 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
         width,
         height,
     };
-    app.menu_area = area;
     frame.render_widget(ratatui::widgets::Clear, area);
     let items: Vec<ListItem> = entries
         .iter()
         .map(|label| ListItem::new(format!(" {label}")))
         .collect();
+    let block = themed_block("actions", &app.theme);
+    let inner = block.inner(area);
     let list = List::new(items)
-        .block(themed_block("actions", &app.theme))
+        .block(block)
         .highlight_style(selection_style(&app.theme));
     let mut state = ListState::default();
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+    app.menu_area = area;
+    app.menu_inner = inner;
+    app.menu_offset = state.offset();
 }
 
 /// Preview for a directory entry: its children, folders first.
@@ -522,15 +562,18 @@ pub(super) fn human_age(modified: std::time::SystemTime) -> String {
 pub(super) fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let s = app.engine.status();
     let dim = Style::default().fg(app.theme.dim);
-    let mut spans = vec![Span::raw(format!("{} indexed", s.indexed))];
-    spans.push(Span::raw(format!(" · {} matches", s.matches)));
-    // visible marks get their own count so batch actions are predictable
-    if app.marking_enabled() && app.engine.mode() != Mode::Calc {
+    let marked = if app.marking_enabled() && app.engine.mode() != Mode::Calc {
         let marked = app.visible_marked_count();
-        if marked > 0 {
-            spans.push(Span::raw(format!(" · {marked} marked")));
-        }
+        (marked > 0).then_some(marked)
+    } else {
+        None
+    };
+    let mut spans = Vec::new();
+    if let Some(marked) = marked {
+        spans.push(Span::raw(format!("{marked} marked · ")));
     }
+    spans.push(Span::raw(format!("{} indexed", s.indexed)));
+    spans.push(Span::raw(format!(" · {} matches", s.matches)));
     // the stat cache is refreshed by the event loop (refresh_status), never
     // here: the draw pass stays free of filesystem access
     if app.visible_selected_row().is_some()

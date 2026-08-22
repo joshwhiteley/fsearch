@@ -1005,6 +1005,10 @@ fn help_overlay_opens_via_key_and_lists_configured_bindings() {
     assert!(text.contains("enter"), "default open binding missing");
     assert!(text.contains("cycle theme"), "theme cycle action missing");
     assert!(text.contains("ctrl-g"), "theme cycle binding missing");
+    assert!(text.contains("toggle mark"), "mark action missing");
+    assert!(text.contains("ctrl-b"), "mark binding missing");
+    assert!(text.contains("clear marks"), "clear-mark action missing");
+    assert!(text.contains("alt-b"), "clear-mark binding missing");
     // multiple default bindings are listed together
     assert!(
         text.contains("esc, ctrl-c"),
@@ -1089,8 +1093,8 @@ fn page_keys_scroll_the_help_overlay() {
         seen.push_str(&buffer_text(&narrow));
     }
     assert!(
-        seen.contains("ctrl-g"),
-        "theme binding was clipped: {seen:?}"
+        seen.contains("cycle theme"),
+        "theme action was clipped: {seen:?}"
     );
     assert!(seen.contains("f1"), "help binding was clipped: {seen:?}");
 }
@@ -1260,6 +1264,7 @@ fn calc_mode_renders_expression_and_result() {
     assert!(text.contains("calc"), "mode label");
     assert!(text.contains("2*(3+4) ="), "expression");
     assert!(text.contains("14"), "result");
+    assert_eq!(app.hit_test.slots, vec![(Slot::Row(0), 1)]);
     // an unfinished expression shows no rows and no error
     app.editor.input = "= 2*".to_string();
     app.editor.input_cursor = app.editor.input.len();

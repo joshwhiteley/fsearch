@@ -352,6 +352,9 @@ pub struct App {
     /// Screen rect of the open actions popup, for mouse hit testing;
     /// Rect::default() while closed.
     pub menu_area: Rect,
+    /// Actual list content rect and scroll offset for the open actions popup.
+    pub menu_inner: Rect,
+    pub menu_offset: usize,
     pub editor: Editor,
     pub history: History,
     pub preview: Preview,
@@ -412,6 +415,8 @@ impl App {
             keymap: crate::keymap::Keymap::default(),
             list_state: ListState::default(),
             menu_area: Rect::default(),
+            menu_inner: Rect::default(),
+            menu_offset: 0,
             editor: Editor {
                 input: String::new(),
                 input_cursor: 0,
@@ -753,6 +758,7 @@ impl App {
             crate::keymap::Action::Help => {
                 self.help.open = !self.help.open;
                 self.help.scroll = 0;
+            }
             crate::keymap::Action::ToggleMark => {
                 if self.marking_enabled()
                     && let Some(path) = self.visible_selected_row().map(|row| row.path.clone())
@@ -896,10 +902,8 @@ impl App {
                 // a left click outside the popup closes it; one on an entry
                 // activates that entry (border rows just close)
                 if self.menu.is_some() {
-                    let top = self.menu_area.y + 1; // below the title border
-                    let end = self.menu_area.bottom().saturating_sub(1);
-                    if self.menu_area.contains(point) && point.y >= top && point.y < end {
-                        let entry = (point.y - top) as usize;
+                    if self.menu_inner.contains(point) {
+                        let entry = self.menu_offset + (point.y - self.menu_inner.y) as usize;
                         self.run_menu_action(entry);
                     } else {
                         self.menu = None;
