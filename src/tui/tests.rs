@@ -185,8 +185,8 @@ fn ctrl_g_cycles_presets_with_a_toast() {
         toast.contains("catppuccin"),
         "toast names the theme: {toast}"
     );
-    // and walks the declaration order, wrapping back to default after slate
-    for expected in ["gruvbox", "nord", "tokyonight", "slate", "default"] {
+    // and walks the declaration order, wrapping back to default after forge
+    for expected in ["gruvbox", "nord", "tokyonight", "slate", "forge", "default"] {
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         assert_eq!(app.theme_cfg.preset, expected);
     }

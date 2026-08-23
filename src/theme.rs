@@ -166,6 +166,29 @@ const PRESETS: &[(&str, Theme)] = &[
             borders: BorderKind::Sharp,
         },
     ),
+    (
+        // warm copper/wheat/steel on near-black, matching the pi "forge"
+        // terminal theme; rounded borders to match its chrome
+        "forge",
+        Theme {
+            accent: Color::Rgb(0xd0, 0x6a, 0x32), // copper core
+            dim: Color::Rgb(0x9c, 0x94, 0x88),    // warm muted gray
+            border: Color::Rgb(0x5f, 0x32, 0x1c), // deep copper
+            title: Color::Rgb(0xf0, 0x97, 0x5f),  // hot copper
+            selection_bg: Some(Color::Rgb(0x3a, 0x26, 0x17)),
+            match_fg: Some(Color::Rgb(0xf0, 0x97, 0x5f)),
+            section: Some(Color::Rgb(0xac, 0x99, 0x72)), // aged wheat
+            badges: [
+                Color::Rgb(0x95, 0xa7, 0xba), // image: steel
+                Color::Rgb(0xf0, 0x97, 0x5f), // video/audio: hot copper
+                Color::Rgb(0xd3, 0xbf, 0x92), // doc: wheat
+                Color::Rgb(0x78, 0x9d, 0x7f), // code: oxide green
+                Color::Rgb(0xe0, 0x6a, 0x5f), // archive: hot iron
+                Color::Rgb(0x78, 0x71, 0x69), // other: dim text
+            ],
+            borders: BorderKind::Rounded,
+        },
+    ),
 ];
 
 fn parse_hex(s: &str) -> Option<Color> {
@@ -249,7 +272,8 @@ mod tests {
                 "gruvbox",
                 "nord",
                 "tokyonight",
-                "slate"
+                "slate",
+                "forge"
             ]
         );
         assert_eq!(preset_index("nord"), 3);
@@ -270,6 +294,16 @@ mod tests {
         assert_eq!(t.dim, Color::Rgb(0xa9, 0xb1, 0xd6));
         assert_eq!(t.selection_bg, Some(Color::Rgb(0x28, 0x34, 0x57)));
         assert_eq!(t.match_fg, Some(Color::Rgb(0x7a, 0xa2, 0xf7)));
+    }
+
+    #[test]
+    fn forge_matches_the_pi_palette() {
+        let t = resolve("forge", None);
+        assert_eq!(t.accent, Color::Rgb(0xd0, 0x6a, 0x32));
+        assert_eq!(t.selection_bg, Some(Color::Rgb(0x3a, 0x26, 0x17)));
+        assert_eq!(t.match_fg, Some(Color::Rgb(0xf0, 0x97, 0x5f)));
+        // the one preset whose native chrome is rounded, like pi's
+        assert_eq!(t.borders, BorderKind::Rounded);
     }
 
     #[test]

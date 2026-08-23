@@ -121,8 +121,8 @@ Box…) are skipped by default; remove them from `excludes` to index them.
 `fsearch --reindex` rebuilds the index after changes.
 
 Themes: add a `[theme]` section with `preset = "catppuccin"` (also
-`gruvbox`, `nord`, `tokyonight`, and the higher-contrast `slate`) and an
-optional `accent = "#7aa2f7"` override.
+`gruvbox`, `nord`, `tokyonight`, the higher-contrast `slate`, and the
+copper-toned `forge`) and an optional `accent = "#7aa2f7"` override.
 
 `quiet = ["/Library/", "/."]` lists path substrings demoted in ranking;
 set `quiet = []` to disable smart filtering. Border style is

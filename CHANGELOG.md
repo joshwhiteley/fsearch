@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `forge` theme preset: warm copper/wheat/steel on near-black with rounded
+  borders, matching the pi "forge" terminal theme
+
 ## 0.9.0 — 2026-08-23
 
 - TUI: cycle themes with `ctrl-g`, open the keymap-driven help overlay with
