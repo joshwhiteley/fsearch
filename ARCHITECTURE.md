@@ -32,14 +32,17 @@ src/
   calc.rs      the `= expr` evaluator (recursive descent, no deps)
   quiet.rs     "quiet path" demotion patterns
   frecency.rs  open history → ranking boosts
+  session.rs   remembers preview layout + density between runs
   keymap.rs    configurable keybindings (spec parser + action table)
   pdf.rs       PDF text extraction (cached, panic-guarded)
   office.rs    docx/xlsx text extraction (cached)
   engine.rs    orchestration: threads, generations, debounce, result state
+  query.rs     headless one-shot search shared by -p / --big script mode
   highlight.rs syntax highlighting (syntect + two-face)
   images.rs    image decoding (image crate + resvg)
   theme.rs     UI color presets + tokens
   actions.rs   open / reveal / copy / trash
+  util.rs      tiny shared helpers (human sizes, unix time)
   tui/
     mod.rs     App state, event loop, terminal probe
     rows.rs    result row rendering

@@ -1,12 +1,15 @@
 [package]
 name = "fsearch"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.87"
 license = "MIT"
 description = "Fast Alfred-style file search for the terminal"
 repository = "https://github.com/joshwhiteley/fsearch"
 homepage = "https://github.com/joshwhiteley/fsearch"
+readme = "README.md"
+keywords = ["search", "fuzzy", "tui", "finder", "semantic"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 anyhow = "1"

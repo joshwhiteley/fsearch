@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-08-23
 
 - TUI: cycle themes with `ctrl-g`, open the keymap-driven help overlay with
   `f1`/`ctrl-o`, and mark visible files with `ctrl-b`/`alt-b` for batch actions;
@@ -58,7 +58,7 @@
   instead of reverse video
 - .app bundles preview their directory contents instead of "(unreadable)"
 
-## 0.7.0 — 2026-08-20
+## 0.7.0 — 2026-08-20 (never tagged; first shipped in the v0.8.0 binaries)
 
 - Filter mode: `git ls-files | fsearch` (or `… | fsearch --filter`)
   fuzzy-filters piped stdin lines in the full TUI and prints the
@@ -74,7 +74,7 @@
   so broken PDFs are attempted once, not per keystroke
 - Fixed: semantic score bars sliced a UTF-8 char boundary and crashed
 
-## 0.6.0 — 2026-08-19
+## 0.6.0 — 2026-08-19 (never tagged; first shipped in the v0.8.0 binaries)
 
 - Rich result rows: colored kind badges, bold filenames, dim parent
   path + size, right-aligned age; grep and semantic hits show the
