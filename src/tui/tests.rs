@@ -1006,9 +1006,9 @@ fn help_overlay_opens_via_key_and_lists_configured_bindings() {
     assert!(text.contains("cycle theme"), "theme cycle action missing");
     assert!(text.contains("ctrl-g"), "theme cycle binding missing");
     assert!(text.contains("toggle mark"), "mark action missing");
-    assert!(text.contains("ctrl-b"), "mark binding missing");
+    assert!(text.contains("ctrl-s"), "mark binding missing");
     assert!(text.contains("clear marks"), "clear-mark action missing");
-    assert!(text.contains("alt-b"), "clear-mark binding missing");
+    assert!(text.contains("alt-s"), "clear-mark binding missing");
     // multiple default bindings are listed together
     assert!(
         text.contains("esc, ctrl-c"),
@@ -1289,7 +1289,7 @@ fn file_row(path: &str) -> crate::engine::ResultRow {
 }
 
 #[test]
-fn ctrl_b_toggles_a_mark_and_renders_the_gutter_indicator() {
+fn mark_key_toggles_a_mark_and_renders_the_gutter_indicator() {
     let mut app = test_app();
     app.engine
         .inject_results_for_test(vec![file_row("/a/notes.md"), file_row("/b/other.txt")]);
@@ -1297,21 +1297,32 @@ fn ctrl_b_toggles_a_mark_and_renders_the_gutter_indicator() {
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
     assert!(!text.contains('▌'), "no marks initially");
-    assert!(text.contains("ctrl-b mark"), "mark shortcut missing");
-    // mark the focused row
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(text.contains("ctrl-s mark"), "mark shortcut missing");
+    // mark the focused row: the mark lands and the selection advances
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(app.marks.contains("/a/notes.md"));
+    assert_eq!(app.selected, 1, "marking advances fzf-style");
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("batch")),
+        "first mark points at the batch-action menu"
+    );
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
     assert!(text.contains('▌'), "mark indicator shown");
     assert!(text.contains("1 marked"), "status count");
-    assert!(text.contains("ctrl-b unmark"), "unmark shortcut missing");
+    // back on the marked row the footer flips to unmark
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("ctrl-s unmark"), "unmark shortcut missing");
     assert!(
-        text.contains("alt-b clear (1 marked)"),
+        text.contains("alt-s clear (1 marked)"),
         "clear shortcut count missing"
     );
     // toggling again clears the mark and the indicator disappears
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(app.marks.is_empty());
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert!(!buffer_text(&terminal).contains('▌'));
@@ -1322,10 +1333,9 @@ fn marks_survive_moving_the_selection() {
     let mut app = test_app();
     app.engine
         .inject_results_for_test(vec![file_row("/a/one.md"), file_row("/b/two.md")]);
-    // mark row 0, move down without marking, move back: the mark stays
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(app.selected, 1);
+    // mark row 0 (selection auto-advances), move back: the mark stays
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(app.selected, 1, "marking advances the selection");
     assert_eq!(app.marks, ["/a/one.md".to_string()].into());
     app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(app.selected, 0);
@@ -1387,12 +1397,12 @@ fn clear_marks_action_and_menu_entry_clear_the_set() {
     let mut app = test_app();
     app.engine
         .inject_results_for_test(vec![file_row("/a/notes.md"), file_row("/b/other.txt")]);
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    // two mark presses in a row cover both rows thanks to auto-advance
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert_eq!(app.marks.len(), 2);
-    // alt-b clears everything with a toast
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    // clear-marks clears everything with a toast
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
     assert!(app.marks.is_empty());
     assert!(app.message.is_some());
     // and via its menu entry (the last one when marks are visible)
@@ -1462,7 +1472,7 @@ fn hidden_selected_rows_are_not_actionable() {
     app.engine
         .inject_results_for_test(vec![file_row("/a/visible.txt")]);
     app.selected = 1;
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(app.marks.is_empty());
     app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     assert!(app.menu.is_none(), "hidden selection must not open actions");
@@ -1510,8 +1520,8 @@ fn duplicate_marked_content_hits_are_processed_once() {
 fn filter_mode_hides_marking_entirely() {
     let mut app = test_filter_app();
     tick_until(&mut app, |a| a.engine.results().len() >= 3);
-    // ctrl-b does nothing in filter mode
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    // the mark key does nothing in filter mode
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(app.marks.is_empty(), "no marks in filter mode");
     // even a forced mark renders no indicator or status count
     app.marks = ["git commit -m fix/thing".to_string()].into();
@@ -1525,6 +1535,6 @@ fn filter_mode_hides_marking_entirely() {
     app.ui_mode = UiMode::Pick;
     app.engine
         .inject_results_for_test(vec![file_row("/a/notes.md")]);
-    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(app.marks.is_empty(), "no marks in pick mode");
 }

@@ -762,9 +762,20 @@ impl App {
             crate::keymap::Action::ToggleMark => {
                 if self.marking_enabled()
                     && let Some(path) = self.visible_selected_row().map(|row| row.path.clone())
-                    && !self.marks.remove(&path)
                 {
-                    self.marks.insert(path);
+                    if !self.marks.remove(&path) {
+                        self.marks.insert(path);
+                        if self.marks.len() == 1 {
+                            // first mark: point at the batch-action menu
+                            let menu = self
+                                .keymap
+                                .shortcut(crate::keymap::Action::Menu)
+                                .unwrap_or_else(|| "menu".into());
+                            self.set_message(format!("1 marked · {menu} for batch actions"));
+                        }
+                    }
+                    // fzf-style: advance so a run of files marks quickly
+                    self.move_selection(1);
                 }
             }
             crate::keymap::Action::ClearMarks => {

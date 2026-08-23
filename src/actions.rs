@@ -73,7 +73,25 @@ pub fn quick_look_args(path: &str) -> (&'static str, Vec<String>) {
 
 /// Opens the system Quick Look panel (macOS) for the file.
 pub fn quick_look(path: &str) -> std::io::Result<()> {
-    run(quick_look_args(path))
+    run(quick_look_args(path))?;
+    // qlmanage's panel opens BEHIND the focused terminal, which makes it
+    // look like nothing happened. Best-effort raise: needs Accessibility
+    // permission for the terminal; fails silently without it.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("osascript")
+            .args([
+                "-e",
+                "delay 0.3",
+                "-e",
+                "tell application \"System Events\" to set frontmost of \
+                 first application process whose name is \"qlmanage\" to true",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

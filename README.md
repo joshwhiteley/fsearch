@@ -141,7 +141,8 @@ movement, ctrl-a/e/w/d) are fixed and can't be rebound.
     clear_marks = "alt-b"
 
 `ctrl-g` cycles the theme presets live (session-only; config wins next run).
-`ctrl-b`/`alt-b` mark and clear files in open mode; filter and `--pick` modes
+`ctrl-s`/`alt-s` mark and clear files in open mode (marking advances to the
+next row, fzf-style); filter and `--pick` modes
 keep marking disabled. Batch actions use only visible marked rows.
 `icons = true` prefixes result rows with nerd-font glyphs — it needs a nerd
 font, so it defaults to off. `remember_session = false` disables restoring

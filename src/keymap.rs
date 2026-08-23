@@ -55,8 +55,10 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
     (Action::Help, &["f1", "ctrl-o"]),
-    (Action::ToggleMark, &["ctrl-b"]),
-    (Action::ClearMarks, &["alt-b"]),
+    // ctrl-b would collide with the tmux/herdr mux prefix, which swallows
+    // it before the app ever sees the key
+    (Action::ToggleMark, &["ctrl-s"]),
+    (Action::ClearMarks, &["alt-s"]),
 ];
 
 /// Parses a key spec like `"ctrl-y"`, `"CTRL+Y"`, `"alt+shift-x"`, `"f5"`,
@@ -426,8 +428,8 @@ mod tests {
         check("ctrl-g", Action::ThemeCycle);
         check("pgup", Action::PreviewPageUp);
         check("pgdn", Action::PreviewPageDown);
-        check("ctrl-b", Action::ToggleMark);
-        check("alt-b", Action::ClearMarks);
+        check("ctrl-s", Action::ToggleMark);
+        check("alt-s", Action::ClearMarks);
         // keys never bound by default
         assert_eq!(km.lookup(KeyCode::Char('q'), KeyModifiers::CONTROL), None);
     }
@@ -480,8 +482,8 @@ mod tests {
             km.lookup(KeyCode::Char('m'), KeyModifiers::ALT),
             Some(Action::ClearMarks)
         );
-        assert_eq!(km.lookup(KeyCode::Char('b'), KeyModifiers::CONTROL), None);
-        assert_eq!(km.lookup(KeyCode::Char('b'), KeyModifiers::ALT), None);
+        assert_eq!(km.lookup(KeyCode::Char('s'), KeyModifiers::CONTROL), None);
+        assert_eq!(km.lookup(KeyCode::Char('s'), KeyModifiers::ALT), None);
     }
 
     #[test]

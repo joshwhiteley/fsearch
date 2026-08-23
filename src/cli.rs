@@ -62,8 +62,8 @@ keys:
   tab                  cycle preview: side, full-window, hidden
   ctrl-t               toggle row density (two-line / compact)
   ctrl-x               show or hide weaker matches
-  ctrl-b               toggle mark (open mode)
-  alt-b                clear marks (open mode)
+  ctrl-s               mark file + move down (open mode)
+  alt-s                clear marks (open mode)
   ctrl-g               cycle theme preset (session-only)
   f1, ctrl-o           open the help overlay
   esc, ctrl-c          quit
@@ -259,8 +259,8 @@ mod tests {
             "ctrl-t",
             "ctrl-g",
             "f1, ctrl-o",
-            "ctrl-b",
-            "alt-b",
+            "ctrl-s",
+            "alt-s",
         ] {
             assert!(HELP.contains(needle), "help is missing {needle:?}");
         }

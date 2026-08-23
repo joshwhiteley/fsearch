@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Marking moved from `ctrl-b`/`alt-b` to `ctrl-s`/`alt-s`: terminal
+  multiplexers (tmux, herdr) swallow `ctrl-b` as their prefix key before the
+  app ever sees it. Marking now advances to the next row fzf-style, and the
+  first mark shows a toast pointing at the batch-actions menu
+- Quick Look's panel opened behind the focused terminal, which made
+  `ctrl-space` look like a no-op; fsearch now raises it (needs the terminal
+  to have Accessibility permission; silently skipped otherwise)
 - `forge` theme preset: warm copper/wheat/steel on near-black with rounded
   borders, matching the pi "forge" terminal theme
 
