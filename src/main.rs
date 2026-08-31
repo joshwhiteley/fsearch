@@ -192,6 +192,8 @@ fn run_filter(initial_query: &str) {
         mouse,
         icons,
         remember_session,
+        Vec::new(),
+        None,
     ) {
         Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
         Ok(None) => std::process::exit(1), // nothing chosen: signal like grep
@@ -210,6 +212,8 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     let icons = config.icons;
     let remember_session = config.remember_session;
     let theme_cfg = config.theme.clone();
+    let custom_actions = config.actions.clone();
+    let action_warning = config.action_warning.clone();
     let engine = Engine::new(
         config,
         index::default_cache_path(),
@@ -224,6 +228,8 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
         mouse,
         icons,
         remember_session,
+        custom_actions,
+        action_warning,
     ) {
         Ok(Some(picked)) => write_stdout(&format!("{picked}\n")),
         Ok(None) => {

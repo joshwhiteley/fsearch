@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use crate::config::CustomAction;
+
 #[cfg(target_os = "macos")]
 pub fn open_args(path: &str) -> (&'static str, Vec<String>) {
     ("open", vec![path.to_string()])
@@ -32,6 +34,68 @@ fn run(args: (&'static str, Vec<String>)) -> std::io::Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// Turns a result path into an absolute path without requiring it to exist.
+/// The index normally already stores absolute paths, but filter-like callers
+/// and tests may provide relative paths.
+pub fn absolute_path(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        path.to_string_lossy().into_owned()
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(path).to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    }
+}
+
+/// Expands custom-action placeholders into argv without shell parsing.
+/// `{paths}` is special: its argv element is repeated once per path.
+pub fn expand_args(cmd: &[String], path: &str, paths: &[String]) -> Vec<String> {
+    let path = absolute_path(path);
+    let paths: Vec<String> = paths.iter().map(|path| absolute_path(path)).collect();
+    let dir = std::path::Path::new(&path)
+        .parent()
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        )
+        .to_string_lossy()
+        .into_owned();
+    let mut args = Vec::new();
+    for arg in cmd {
+        if arg.contains("{paths}") {
+            args.extend(paths.iter().map(|path| {
+                arg.replace("{paths}", path)
+                    .replace("{path}", path)
+                    .replace("{dir}", &dir)
+            }));
+        } else {
+            args.push(arg.replace("{path}", &path).replace("{dir}", &dir));
+        }
+    }
+    args
+}
+
+/// Launches a configured action detached from the TUI, with no shell and no
+/// inherited standard streams.
+pub fn run_custom(action: &CustomAction, selected: &str, paths: &[String]) -> std::io::Result<()> {
+    let args = expand_args(&action.cmd, selected, paths);
+    let Some((program, args)) = args.split_first() else {
+        return Err(std::io::Error::other("custom action has no command"));
+    };
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+pub fn has_paths_placeholder(cmd: &[String]) -> bool {
+    cmd.iter().any(|arg| arg.contains("{paths}"))
 }
 
 /// Runs a destructive action synchronously so a non-zero exit is reported to
@@ -160,6 +224,64 @@ pub fn copy(path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn custom(cmd: &[&str]) -> CustomAction {
+        CustomAction {
+            name: "test".into(),
+            cmd: cmd.iter().map(|arg| (*arg).into()).collect(),
+            ext: Vec::new(),
+            kind: None,
+            enter: false,
+        }
+    }
+
+    #[test]
+    fn custom_placeholders_expand_without_shell_joining() {
+        let cmd = vec![
+            "editor".to_string(),
+            "--file={path}".to_string(),
+            "{dir}".to_string(),
+            "{paths}".to_string(),
+            "--marked={paths}".to_string(),
+        ];
+        let paths = vec!["/tmp/one file.rs".to_string(), "/tmp/two.rs".to_string()];
+        assert_eq!(
+            expand_args(&cmd, "/tmp/one file.rs", &paths),
+            vec![
+                "editor",
+                "--file=/tmp/one file.rs",
+                "/tmp",
+                "/tmp/one file.rs",
+                "/tmp/two.rs",
+                "--marked=/tmp/one file.rs",
+                "--marked=/tmp/two.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_paths_are_made_absolute_for_custom_actions() {
+        let args = expand_args(
+            &["{path}".into(), "{dir}".into()],
+            "relative/file.txt",
+            &["relative/file.txt".into()],
+        );
+        assert!(std::path::Path::new(&args[0]).is_absolute());
+        assert_eq!(
+            args[1],
+            std::path::Path::new(&args[0])
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn custom_runner_reports_missing_program() {
+        let action = custom(&["fsearch-command-that-does-not-exist"]);
+        let error = run_custom(&action, "/tmp/file.txt", &["/tmp/file.txt".into()]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

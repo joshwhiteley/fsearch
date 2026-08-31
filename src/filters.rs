@@ -53,6 +53,14 @@ pub fn kind_for_ext(ext: &str) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
+/// Whether `kind` is one of the buckets accepted by the `kind:` query
+/// filter.
+pub fn is_known_kind(kind: &str) -> bool {
+    KINDS
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(kind))
+}
+
 /// "7d", "12h", "30m", "2w" → seconds.
 fn parse_duration_secs(s: &str) -> Option<i64> {
     let (num, unit) = s.split_at(s.len().checked_sub(1)?);

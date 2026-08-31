@@ -64,6 +64,51 @@ pub struct Config {
     pub icons: bool,
     /// Blend bare filename searches with semantic results when available.
     pub unified: bool,
+    /// User-defined commands shown in the actions menu.
+    pub actions: Vec<CustomAction>,
+    /// One warning for any malformed `[[actions]]` entries that were skipped.
+    pub action_warning: Option<String>,
+}
+
+/// A command configured in an `[[actions]]` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomAction {
+    pub name: String,
+    pub cmd: Vec<String>,
+    pub ext: Vec<String>,
+    pub kind: Option<String>,
+    pub enter: bool,
+}
+
+impl CustomAction {
+    /// Whether this action applies to a file path. Directories are represented
+    /// by a trailing slash in the index and never match custom actions.
+    pub fn matches(&self, path: &str) -> bool {
+        if path.ends_with('/') {
+            return false;
+        }
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if !self.ext.is_empty()
+            && !ext
+                .as_deref()
+                .is_some_and(|e| self.ext.iter().any(|want| want.eq_ignore_ascii_case(e)))
+        {
+            return false;
+        }
+        if let Some(kind) = &self.kind {
+            if !ext
+                .as_deref()
+                .and_then(crate::filters::kind_for_ext)
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(kind))
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Default for Config {
@@ -83,6 +128,8 @@ impl Default for Config {
             index_apps: true,
             icons: false,
             unified: true,
+            actions: Vec::new(),
+            action_warning: None,
         }
     }
 }
@@ -100,6 +147,7 @@ struct RawConfig {
     index_apps: Option<bool>,
     icons: Option<bool>,
     unified: Option<bool>,
+    actions: Option<Vec<toml::Value>>,
 }
 
 /// A `[keys]` value: either one spec string or a list of them.
@@ -165,7 +213,101 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
 # remember_session: restore preview layout and row density between runs
 #   (true/false)
+# Custom actions run argv directly (never through a shell). Paths support
+# {path}, {paths} (one argv element spliced per marked file), and {dir}.
+#
+# [[actions]]
+# name = \"open in cursor\"
+# cmd = [\"cursor\", \"{path}\"]
+# kind = \"code\"
+#
+# [[actions]]
+# name = \"open in Preview\"
+# cmd = [\"open\", \"-a\", \"Preview\", \"{path}\"]
+# ext = [\"pdf\"]
+#
+# [[actions]]
+# name = \"open in Word\"
+# cmd = [\"open\", \"-a\", \"Microsoft Word\", \"{path}\"]
+# ext = [\"docx\"]
+# enter = true replaces the default opener for matching files.
+# Malformed actions are skipped; only add commands you trust.
 ";
+
+fn parse_actions(raw: Option<Vec<toml::Value>>) -> (Vec<CustomAction>, usize) {
+    let mut skipped = 0;
+    let actions = raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|raw| {
+            let Some(table) = raw.as_table() else {
+                skipped += 1;
+                return None;
+            };
+            let name = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .map(str::trim)
+                .map(str::to_string);
+            let cmd = table
+                .get("cmd")
+                .and_then(toml::Value::as_array)
+                .and_then(|cmd| {
+                    let cmd: Option<Vec<String>> = cmd
+                        .iter()
+                        .map(toml::Value::as_str)
+                        .map(|arg| arg.map(str::to_string))
+                        .collect();
+                    cmd.filter(|cmd| {
+                        !cmd.is_empty()
+                            && cmd
+                                .first()
+                                .is_some_and(|program| !program.trim().is_empty())
+                    })
+                });
+            let ext = match table.get("ext") {
+                Some(ext) => ext.as_array().and_then(|ext| {
+                    ext.iter()
+                        .map(toml::Value::as_str)
+                        .map(|value| value.map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                }),
+                None => Some(Vec::new()),
+            };
+            let kind = table
+                .get("kind")
+                .and_then(toml::Value::as_str)
+                .map(|kind| kind.trim().to_ascii_lowercase());
+            let enter = match table.get("enter") {
+                Some(enter) => enter.as_bool(),
+                None => Some(false),
+            };
+            let valid_kind = match table.get("kind") {
+                None => true,
+                Some(_) => kind.as_deref().is_some_and(crate::filters::is_known_kind),
+            };
+            if name.is_none() || cmd.is_none() || ext.is_none() || enter.is_none() || !valid_kind {
+                skipped += 1;
+                return None;
+            }
+            let ext = ext
+                .unwrap()
+                .into_iter()
+                .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|ext| !ext.is_empty())
+                .collect();
+            Some(CustomAction {
+                name: name.unwrap(),
+                cmd: cmd.unwrap(),
+                ext,
+                kind,
+                enter: enter.unwrap(),
+            })
+        })
+        .collect();
+    (actions, skipped)
+}
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
     if !path.exists() {
@@ -183,6 +325,13 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path).context("reading config")?;
     let raw: RawConfig = toml::from_str(&text).context("parsing config.toml")?;
     let d = Config::default();
+    let (actions, skipped_actions) = parse_actions(raw.actions);
+    let action_warning = (skipped_actions > 0).then(|| {
+        format!(
+            "warning: skipped {skipped_actions} malformed custom action{}",
+            if skipped_actions == 1 { "" } else { "s" }
+        )
+    });
     Ok(Config {
         roots: raw
             .roots
@@ -221,6 +370,8 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
         index_apps: raw.index_apps.unwrap_or(true),
         icons: raw.icons.unwrap_or(false),
         unified: raw.unified.unwrap_or(true),
+        actions,
+        action_warning,
     })
 }
 
@@ -262,6 +413,9 @@ mod tests {
         let c = load_or_create(&path).unwrap();
         assert_eq!(c.roots, Config::default().roots);
         assert!(path.exists());
+        let generated = std::fs::read_to_string(&path).unwrap();
+        assert!(generated.contains("# cmd = [\"open\", \"-a\", \"Preview\", \"{path}\"]"));
+        assert!(generated.contains("# cmd = [\"open\", \"-a\", \"Microsoft Word\", \"{path}\"]"));
         // the created file must itself parse back
         let again = load_or_create(&path).unwrap();
         assert_eq!(again.excludes, c.excludes);
@@ -399,5 +553,79 @@ mod tests {
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("~/Documents"), home.join("Documents"));
         assert_eq!(expand_tilde("/etc"), PathBuf::from("/etc"));
+    }
+
+    #[test]
+    fn custom_actions_parse_and_normalize_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[actions]]\nname = \"code\"\ncmd = [\"cursor\", \"{path}\"]\n\
+             ext = [\"RS\", \".Py\"]\nkind = \"CODE\"\nenter = true\n",
+        )
+        .unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert_eq!(c.actions.len(), 1);
+        assert_eq!(c.actions[0].name, "code");
+        assert_eq!(c.actions[0].cmd, vec!["cursor", "{path}"]);
+        assert_eq!(c.actions[0].ext, vec!["rs", "py"]);
+        assert_eq!(c.actions[0].kind.as_deref(), Some("code"));
+        assert!(c.actions[0].enter);
+        assert!(c.actions[0].matches("/tmp/main.rs"));
+        assert!(!c.actions[0].matches("/tmp/main.txt"));
+    }
+
+    #[test]
+    fn malformed_custom_actions_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[actions]]\nname = \"\"\ncmd = [\"open\"]\n\n\
+             [[actions]]\nname = \"bad command\"\ncmd = []\n\n\
+             [[actions]]\nname = \"bad kind\"\ncmd = [\"open\"]\nkind = \"spreadsheet\"\n\n\
+             [[actions]]\nname = \"valid\"\ncmd = [\"open\"]\n",
+        )
+        .unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert_eq!(
+            c.actions
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["valid"]
+        );
+        assert_eq!(
+            c.action_warning.as_deref(),
+            Some("warning: skipped 3 malformed custom actions")
+        );
+    }
+
+    #[test]
+    fn wrong_typed_custom_actions_do_not_reject_valid_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[actions]]\nname = \"wrong command\"\ncmd = \"open\"\n\n\
+             [[actions]]\nname = \"valid\"\ncmd = [\"open\"]\n",
+        )
+        .unwrap();
+        let c = load_or_create(&path).unwrap();
+        assert_eq!(c.actions.len(), 1);
+        assert_eq!(c.actions[0].name, "valid");
+        assert_eq!(
+            c.action_warning.as_deref(),
+            Some("warning: skipped 1 malformed custom action")
+        );
+    }
+
+    #[test]
+    fn action_kind_vocabulary_matches_query_kinds() {
+        for kind in ["image", "video", "audio", "doc", "code", "app", "archive"] {
+            assert!(crate::filters::is_known_kind(kind));
+        }
+        assert!(!crate::filters::is_known_kind("spreadsheet"));
     }
 }

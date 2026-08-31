@@ -30,6 +30,8 @@ fn config_for(root: &std::path::Path) -> Config {
         icons: false,
         unified: true,
         quiet: Vec::new(),
+        actions: Vec::new(),
+        action_warning: None,
     }
 }
 
