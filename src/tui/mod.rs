@@ -103,6 +103,16 @@ pub enum UiMode {
     Pick,
 }
 
+/// State saved while the results list is temporarily used to choose a
+/// destination directory.
+pub struct DestinationPicker {
+    pub kind: actions::TransferKind,
+    pub paths: Vec<String>,
+    pub previous_query: String,
+    pub previous_selected: usize,
+    pub previous_show_weak: bool,
+}
+
 /// One entry of the results list as laid out on screen, for mouse hit
 /// testing. `Row(i)` is an engine result; `Header` and `Fold` are the
 /// decorative rows (launch sections, weaker-matches divider, fold row).
@@ -128,6 +138,7 @@ impl Editor {
     fn clear(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.input_scroll = 0;
     }
 
     /// Byte offset of the start of the last char in `s[..end]` (0 if none).
@@ -367,6 +378,8 @@ pub struct App {
     /// the row indicators operate only on currently-visible marked rows.
     /// Never populated in filter mode (rows are arbitrary stdin lines).
     pub marks: HashSet<String>,
+    /// Temporarily replaces the normal query with a directory-only search.
+    pub destination_picker: Option<DestinationPicker>,
 }
 
 impl App {
@@ -458,6 +471,7 @@ impl App {
                 area: Rect::default(),
             },
             marks: HashSet::new(),
+            destination_picker: None,
         }
     }
 
@@ -475,7 +489,13 @@ impl App {
     fn menu_entries(&self) -> Vec<&'static str> {
         let mut entries: Vec<&'static str> = Self::MENU.to_vec();
         if self.marking_enabled() && self.visible_marked_count() > 0 {
-            entries.extend(["open marked", "copy marked paths", "trash marked"]);
+            entries.extend([
+                "open marked",
+                "copy marked paths",
+                "trash marked",
+                "move marked to…",
+                "copy marked to…",
+            ]);
         }
         if self.marking_enabled() && !self.marks.is_empty() {
             entries.push("clear marks");
@@ -507,7 +527,10 @@ impl App {
     /// Marking is an Open-mode file feature: `--pick`, filter stdin, and the
     /// calculator have no persistent file rows to mark.
     fn marking_enabled(&self) -> bool {
-        self.ui_mode == UiMode::Open && !self.engine.is_filter() && self.engine.mode() != Mode::Calc
+        self.destination_picker.is_none()
+            && self.ui_mode == UiMode::Open
+            && !self.engine.is_filter()
+            && self.engine.mode() != Mode::Calc
     }
 
     fn visible_marked_count(&self) -> usize {
@@ -529,6 +552,8 @@ impl App {
             "open marked" => self.open_marked(),
             "copy marked paths" => self.copy_marked(),
             "trash marked" => self.trash_marked(),
+            "move marked to…" => self.enter_destination_picker(actions::TransferKind::Move),
+            "copy marked to…" => self.enter_destination_picker(actions::TransferKind::Copy),
             "clear marks" => self.clear_marks(),
             _ => {}
         }
@@ -573,6 +598,105 @@ impl App {
         let paths = self.visible_marked();
         let outcome = run_batch(&paths, actions::trash);
         self.set_message(batch_summary("trashed", paths.len(), &outcome));
+    }
+
+    fn transfer_summary(verb: &str, outcome: &actions::TransferOutcome, total: usize) -> String {
+        if total == 0 {
+            return "no visible marked files".to_string();
+        }
+        let mut summary = format!("{verb} {}", outcome.succeeded);
+        if outcome.skipped > 0 {
+            let reason = match (outcome.skipped_exists, outcome.skipped_directories) {
+                (_, 0) => "exists".to_string(),
+                (0, _) => "directory".to_string(),
+                (exists, directories) => format!("exists {exists}, directory {directories}"),
+            };
+            summary.push_str(&format!(", skipped {} ({reason})", outcome.skipped));
+        }
+        if outcome.failed > 0 {
+            if let Some((path, error)) = &outcome.first_error {
+                format!(
+                    "error: {summary}; {} failed ({path}: {error})",
+                    outcome.failed
+                )
+            } else {
+                format!("error: {summary}; {} failed", outcome.failed)
+            }
+        } else if outcome.skipped == 0 {
+            summary.push_str(if outcome.succeeded == 1 {
+                " file"
+            } else {
+                " files"
+            });
+            summary
+        } else {
+            summary
+        }
+    }
+
+    fn enter_destination_picker(&mut self, kind: actions::TransferKind) {
+        let paths = self.visible_marked();
+        if paths.is_empty() {
+            return;
+        }
+        let picker = DestinationPicker {
+            kind,
+            paths,
+            previous_query: self.editor.input.clone(),
+            previous_selected: self.selected,
+            previous_show_weak: self.show_weak,
+        };
+        self.destination_picker = Some(picker);
+        self.editor.clear();
+        self.refresh_query_keep_history();
+    }
+
+    fn restore_destination_picker(&mut self, picker: DestinationPicker) {
+        self.destination_picker = None;
+        self.editor.input = picker.previous_query;
+        self.editor.input_cursor = self.editor.input.len();
+        self.editor.input_scroll = 0;
+        self.refresh_query_keep_history();
+        self.selected = picker.previous_selected;
+        self.show_weak = picker.previous_show_weak;
+    }
+
+    fn cancel_destination_picker(&mut self) {
+        if let Some(picker) = self.destination_picker.take() {
+            self.restore_destination_picker(picker);
+        }
+    }
+
+    fn choose_destination(&mut self) {
+        let Some(destination) = self
+            .visible_selected_row()
+            .filter(|row| row.path.ends_with('/'))
+            .map(|row| row.path.clone())
+        else {
+            self.set_message("no directory selected".to_string());
+            return;
+        };
+        let Some(picker) = self.destination_picker.take() else {
+            return;
+        };
+        let paths = picker.paths.clone();
+        let kind = picker.kind;
+        let destination = std::path::Path::new(&destination);
+        let outcome = match kind {
+            actions::TransferKind::Move => actions::move_files(&paths, destination),
+            actions::TransferKind::Copy => actions::copy_files(&paths, destination),
+        };
+        if kind == actions::TransferKind::Move {
+            for path in &outcome.succeeded_paths {
+                self.marks.remove(path);
+            }
+        }
+        let verb = match kind {
+            actions::TransferKind::Move => "moved",
+            actions::TransferKind::Copy => "copied",
+        };
+        self.restore_destination_picker(picker);
+        self.set_message(Self::transfer_summary(verb, &outcome, paths.len()));
     }
 
     fn clear_marks(&mut self) {
@@ -654,6 +778,16 @@ impl App {
                 _ => {}
             }
             return true;
+        }
+        if self.destination_picker.is_some() {
+            match key.code {
+                KeyCode::Esc => self.cancel_destination_picker(),
+                KeyCode::Enter => self.choose_destination(),
+                _ => {}
+            }
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                return true;
+            }
         }
         // text editing is fixed and handled before the keymap, so those keys
         // can never be rebound (see fsearch::keymap::is_editing_key)
@@ -805,7 +939,16 @@ impl App {
     fn refresh_query_keep_history(&mut self) {
         self.selected = 0;
         self.show_weak = false;
-        self.engine.set_query(&self.editor.input, self.regex_mode);
+        let query = if self.destination_picker.is_some() {
+            if self.editor.input.is_empty() {
+                "dir:".to_string()
+            } else {
+                format!("dir: {}", self.editor.input)
+            }
+        } else {
+            self.editor.input.clone()
+        };
+        self.engine.set_query(&query, self.regex_mode);
     }
 
     /// Rows currently on screen: the strong block when weaker matches are
@@ -854,6 +997,10 @@ impl App {
     /// open the selection (Open mode) or return it and exit (`--pick`).
     /// Returns false when the app should quit.
     fn activate_selected(&mut self) -> bool {
+        if self.destination_picker.is_some() {
+            self.choose_destination();
+            return true;
+        }
         match self.ui_mode {
             UiMode::Open => {
                 self.push_history();

@@ -117,6 +117,112 @@ pub fn trash(path: &str) -> std::io::Result<()> {
     run_checked(trash_args(path))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    Move,
+    Copy,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TransferOutcome {
+    pub succeeded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub skipped_exists: usize,
+    pub skipped_directories: usize,
+    pub succeeded_paths: Vec<String>,
+    pub first_error: Option<(String, String)>,
+}
+
+fn source_name(path: &str) -> Option<&str> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+fn destination_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn transfer(
+    paths: &[String],
+    destination: &std::path::Path,
+    kind: TransferKind,
+) -> TransferOutcome {
+    let mut outcome = TransferOutcome::default();
+    for source in paths {
+        let source_path = std::path::Path::new(source);
+        let Some(name) = source_name(source) else {
+            record_error(&mut outcome, source, "path has no file name".to_string());
+            continue;
+        };
+        let metadata = match std::fs::symlink_metadata(source_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_error(&mut outcome, source, error.to_string());
+                continue;
+            }
+        };
+        if metadata.is_dir() {
+            outcome.skipped += 1;
+            outcome.skipped_directories += 1;
+            continue;
+        }
+        let target = destination.join(name);
+        match destination_exists(&target) {
+            Ok(true) => {
+                outcome.skipped += 1;
+                outcome.skipped_exists += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                record_error(&mut outcome, source, error.to_string());
+                continue;
+            }
+        }
+        let result = match kind {
+            TransferKind::Copy => std::fs::copy(source_path, &target).map(|_| ()),
+            TransferKind::Move => match std::fs::rename(source_path, &target) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                    std::fs::copy(source_path, &target)
+                        .and_then(|_| std::fs::remove_file(source_path))
+                }
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(()) => {
+                outcome.succeeded += 1;
+                outcome.succeeded_paths.push(source.clone());
+            }
+            Err(error) => record_error(&mut outcome, source, error.to_string()),
+        }
+    }
+    outcome
+}
+
+fn record_error(outcome: &mut TransferOutcome, path: &str, error: String) {
+    outcome.failed += 1;
+    if outcome.first_error.is_none() {
+        outcome.first_error = Some((path.to_string(), error));
+    }
+}
+
+pub fn move_files(paths: &[String], destination: &std::path::Path) -> TransferOutcome {
+    transfer(paths, destination, TransferKind::Move)
+}
+
+pub fn copy_files(paths: &[String], destination: &std::path::Path) -> TransferOutcome {
+    transfer(paths, destination, TransferKind::Copy)
+}
+
 #[cfg(target_os = "macos")]
 const CLIPBOARD_COMMANDS: &[&[&str]] = &[&["pbcopy"]];
 
@@ -211,6 +317,106 @@ mod tests {
         assert_eq!(
             reveal_args("/a/b.txt"),
             ("xdg-open", vec!["/a".to_string()])
+        );
+    }
+
+    #[test]
+    fn move_files_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let source = source_dir.join("note.txt");
+        std::fs::write(&source, "hello").unwrap();
+
+        let paths = vec![source.to_string_lossy().into_owned()];
+        let outcome = move_files(&paths, &destination);
+
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("note.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn copy_files_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("note.txt");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, "hello").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+
+        let paths = vec![source.to_string_lossy().into_owned()];
+        let outcome = copy_files(&paths, &destination);
+
+        assert_eq!(outcome.succeeded, 1);
+        assert!(source.exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("note.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn transfer_skips_existing_destination_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("note.txt");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, "source").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("note.txt"), "existing").unwrap();
+
+        let paths = vec![source.to_string_lossy().into_owned()];
+        let outcome = move_files(&paths, &destination);
+
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.skipped_exists, 1);
+        assert!(source.exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("note.txt")).unwrap(),
+            "existing"
+        );
+
+        let outcome = copy_files(&paths, &destination);
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.skipped_exists, 1);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "source");
+    }
+
+    #[test]
+    fn copy_files_skips_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        let source_file = dir.path().join("note.txt");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::write(&source_file, "hello").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+
+        let paths = vec![
+            source_dir.to_string_lossy().into_owned(),
+            source_file.to_string_lossy().into_owned(),
+        ];
+        let outcome = copy_files(&paths, &destination);
+
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.skipped_directories, 1);
+        assert!(source_dir.exists());
+        assert!(!destination.join("source").is_file());
+
+        let moved_dir = vec![format!("{}/", source_dir.to_string_lossy())];
+        let move_outcome = move_files(&moved_dir, &destination);
+        assert_eq!(move_outcome.skipped_directories, 1);
+        assert!(source_dir.exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("note.txt")).unwrap(),
+            "hello"
         );
     }
 }
