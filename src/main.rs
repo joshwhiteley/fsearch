@@ -212,7 +212,12 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str) {
     let icons = config.icons;
     let remember_session = config.remember_session;
     let theme_cfg = config.theme.clone();
-    let custom_actions = config.actions.clone();
+    // no user-defined actions: offer detected-editor defaults instead
+    let custom_actions = if config.actions.is_empty() {
+        fsearch::config::default_actions()
+    } else {
+        config.actions.clone()
+    };
     let action_warning = config.action_warning.clone();
     let engine = Engine::new(
         config,

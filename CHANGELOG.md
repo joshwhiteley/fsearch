@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-08-31
 
+- Built-in default actions: with no `[[actions]]` configured, installed GUI
+  code editors (Cursor, VS Code, Zed, Sublime Text) get "open in …" menu
+  entries for code files; defining your own actions replaces the defaults
 - Unified search: bare queries blend filename and semantic results into one
   ranked list (reciprocal rank fusion); semantic-only rows are labeled, and
   `unified = false` restores the old filename-only behavior

@@ -111,6 +111,76 @@ impl CustomAction {
     }
 }
 
+/// Built-in actions offered when the user has not defined any `[[actions]]`:
+/// "open in <editor>" menu entries for GUI code editors that are actually
+/// installed. Menu-only (`enter = false`) so the default opener is untouched.
+pub fn default_actions() -> Vec<CustomAction> {
+    #[cfg(target_os = "macos")]
+    {
+        editor_actions_in(std::path::Path::new("/Applications"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        editor_actions_on_path(std::env::var_os("PATH").as_deref())
+    }
+}
+
+/// macOS: one action per installed editor bundle under `apps`.
+fn editor_actions_in(apps: &std::path::Path) -> Vec<CustomAction> {
+    const EDITORS: &[(&str, &str, &str)] = &[
+        ("Cursor.app", "Cursor", "open in cursor"),
+        (
+            "Visual Studio Code.app",
+            "Visual Studio Code",
+            "open in vs code",
+        ),
+        ("Zed.app", "Zed", "open in zed"),
+        ("Sublime Text.app", "Sublime Text", "open in sublime text"),
+    ];
+    EDITORS
+        .iter()
+        .filter(|(bundle, _, _)| apps.join(bundle).exists())
+        .map(|(_, app, name)| CustomAction {
+            name: (*name).to_string(),
+            cmd: vec![
+                "open".into(),
+                "-a".into(),
+                (*app).to_string(),
+                "{path}".into(),
+            ],
+            ext: Vec::new(),
+            kind: Some("code".into()),
+            enter: false,
+        })
+        .collect()
+}
+
+/// Elsewhere: one action per editor binary found on PATH.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn editor_actions_on_path(path: Option<&std::ffi::OsStr>) -> Vec<CustomAction> {
+    const EDITORS: &[(&str, &str)] = &[
+        ("cursor", "open in cursor"),
+        ("code", "open in vs code"),
+        ("zed", "open in zed"),
+        ("subl", "open in sublime text"),
+    ];
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    EDITORS
+        .iter()
+        .filter(|(bin, _)| dirs.iter().any(|d| d.join(bin).is_file()))
+        .map(|(bin, name)| CustomAction {
+            name: (*name).to_string(),
+            cmd: vec![(*bin).to_string(), "{path}".into()],
+            ext: Vec::new(),
+            kind: Some("code".into()),
+            enter: false,
+        })
+        .collect()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -215,6 +285,9 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #   (true/false)
 # Custom actions run argv directly (never through a shell). Paths support
 # {path}, {paths} (one argv element spliced per marked file), and {dir}.
+# Until you define any [[actions]], fsearch offers built-in defaults:
+# \"open in <editor>\" menu entries for installed GUI code editors
+# (Cursor, VS Code, Zed, Sublime Text). Defining your own replaces them.
 #
 # [[actions]]
 # name = \"open in cursor\"
@@ -522,6 +595,30 @@ mod tests {
         let path2 = dir.path().join("plain.toml");
         std::fs::write(&path2, "roots = [\"/tmp\"]\n").unwrap();
         assert!(load_or_create(&path2).unwrap().remember_session);
+    }
+
+    #[test]
+    fn default_actions_detect_installed_editors_only() {
+        let apps = tempfile::tempdir().unwrap();
+        assert!(editor_actions_in(apps.path()).is_empty());
+        std::fs::create_dir(apps.path().join("Cursor.app")).unwrap();
+        std::fs::create_dir(apps.path().join("Zed.app")).unwrap();
+        let actions = editor_actions_in(apps.path());
+        let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["open in cursor", "open in zed"]);
+        // menu-only entries scoped to code files, argv through `open -a`
+        assert!(actions.iter().all(|a| !a.enter));
+        assert!(actions.iter().all(|a| a.kind.as_deref() == Some("code")));
+        assert_eq!(actions[0].cmd, ["open", "-a", "Cursor", "{path}"]);
+
+        let bins = tempfile::tempdir().unwrap();
+        assert!(editor_actions_on_path(Some(bins.path().as_os_str())).is_empty());
+        std::fs::write(bins.path().join("code"), "").unwrap();
+        let actions = editor_actions_on_path(Some(bins.path().as_os_str()));
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].name, "open in vs code");
+        assert_eq!(actions[0].cmd, ["code", "{path}"]);
+        assert!(editor_actions_on_path(None).is_empty());
     }
 
     #[test]
