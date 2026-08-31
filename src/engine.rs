@@ -51,10 +51,71 @@ pub struct ResultRow {
     /// (frecency) — the UI groups these under "recent opens".
     pub recent_open: bool,
     /// Index metadata (mtime seconds, size bytes) for filename rows;
-    /// content-hit and semantic rows carry none.
+    /// content-hit and semantic-only rows carry none.
     pub meta: Option<crate::walker::FileMeta>,
-    /// Semantic match score 0..=1; None for every non-semantic row.
+    /// Semantic match score 0..=1; None for non-semantic and filename-only
+    /// rows.
     pub score: Option<f32>,
+}
+
+/// Merges filename and semantic rankings with reciprocal rank fusion. Ranks
+/// are one-based, matching the RRF formula `1 / (60 + rank)`.
+type SourceRank = Option<(usize, ResultRow)>;
+type UnifiedSources = (SourceRank, SourceRank);
+
+fn merge_unified_results(filename: &[ResultRow], semantic: &[ResultRow]) -> Vec<ResultRow> {
+    let mut by_path: HashMap<String, UnifiedSources> = HashMap::new();
+    for (rank, row) in filename.iter().enumerate() {
+        by_path
+            .entry(row.path.clone())
+            .or_default()
+            .0
+            .get_or_insert((rank + 1, row.clone()));
+    }
+    for (rank, row) in semantic.iter().enumerate() {
+        by_path
+            .entry(row.path.clone())
+            .or_default()
+            .1
+            .get_or_insert((rank + 1, row.clone()));
+    }
+
+    let mut ranked: Vec<(f64, usize, usize, ResultRow)> = by_path
+        .into_values()
+        .map(|(filename, semantic)| {
+            let filename_rank = filename.as_ref().map_or(usize::MAX, |(rank, _)| *rank);
+            let semantic_rank = semantic.as_ref().map_or(usize::MAX, |(rank, _)| *rank);
+            let rrf = filename
+                .as_ref()
+                .map_or(0.0, |(rank, _)| 1.0 / (60.0 + *rank as f64))
+                + semantic
+                    .as_ref()
+                    .map_or(0.0, |(rank, _)| 1.0 / (60.0 + *rank as f64));
+            let row = match (filename, semantic) {
+                (Some((_, mut filename)), Some((_, semantic))) => {
+                    // Keep filename metadata/frecency/display fields, but add
+                    // the best semantic context so the row explains the hit.
+                    filename.line_number = semantic.line_number;
+                    filename.line = semantic.line;
+                    filename.score = semantic.score;
+                    filename
+                }
+                (Some((_, filename)), None) => filename,
+                (None, Some((_, semantic))) => semantic,
+                (None, None) => unreachable!("unified row has no source"),
+            };
+            (rrf, filename_rank, semantic_rank, row)
+        })
+        .collect();
+    // RRF is the primary order; source ranks and then the path make ties
+    // deterministic without changing the ranking signal.
+    ranked.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.path.cmp(&b.3.path))
+    });
+    ranked.into_iter().map(|(_, _, _, row)| row).collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,6 +208,10 @@ pub struct Engine {
     job_tx: Sender<FilenameJob>,
     store: Arc<PathStore>,
     results: Vec<ResultRow>,
+    /// Source rankings retained so a delayed semantic response can be merged
+    /// without losing the instant filename result set.
+    filename_results: Vec<ResultRow>,
+    semantic_results: Vec<ResultRow>,
     status: EngineStatus,
     mode: Mode,
     generation: u64,
@@ -164,6 +229,11 @@ pub struct Engine {
     frecency: Option<Frecency>,
     boosts: Arc<HashMap<String, u32>>,
     quiet: Arc<crate::quiet::Quiet>,
+    /// Whether bare fuzzy queries may blend in semantic results.
+    unified: bool,
+    /// Position of the unified fold boundary; derived from filename strong
+    /// matches so semantic-only rows do not redefine the filename floor.
+    unified_strong: usize,
     filter: bool,
 }
 
@@ -172,6 +242,13 @@ const WATCH_SAVE_EVERY: Duration = Duration::from_secs(60);
 
 fn cache_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Bare queries only start the semantic worker when a persisted store exists;
+/// this keeps builds without semantic support and first-run installs on the
+/// instant filename-only path.
+fn semantic_store_available() -> bool {
+    sem::default_store_path().is_file()
 }
 
 /// Live watcher plus its event stream (the watcher must stay alive for
@@ -390,6 +467,7 @@ impl Engine {
         // indexer: cached paths first, then a fresh walk, then save
         let indexer_tx = msg_tx.clone();
         let max_content_filesize = config.max_content_filesize;
+        let unified = config.unified;
         std::thread::spawn(move || {
             let cached = index::load(&cache_path);
             let expected = cached.as_ref().map(|c| c.len());
@@ -467,6 +545,8 @@ impl Engine {
             job_tx,
             store: Arc::new(PathStore::empty()),
             results: Vec::new(),
+            filename_results: Vec::new(),
+            semantic_results: Vec::new(),
             status: EngineStatus {
                 indexing: true,
                 ..Default::default()
@@ -485,6 +565,8 @@ impl Engine {
             frecency: Some(frecency),
             boosts,
             quiet: Arc::new(crate::quiet::Quiet::new(quiet_patterns)),
+            unified,
+            unified_strong: 0,
             filter: false,
         }
     }
@@ -515,6 +597,8 @@ impl Engine {
             job_tx,
             store,
             results: Vec::new(),
+            filename_results: Vec::new(),
+            semantic_results: Vec::new(),
             status: EngineStatus {
                 indexing: false,
                 ..Default::default()
@@ -534,6 +618,8 @@ impl Engine {
             boosts,
             // stdin lines are whatever the pipe says they are — no demotion
             quiet: Arc::new(crate::quiet::Quiet::new(Vec::new())),
+            unified: false,
+            unified_strong: 0,
             filter: true,
         }
     }
@@ -549,6 +635,39 @@ impl Engine {
             frecency.record(path);
             self.boosts = Arc::new(frecency.boosts(unix_now()));
         }
+    }
+
+    fn is_unified_query(&self) -> bool {
+        self.unified && self.mode == Mode::Fuzzy && !self.query.is_empty()
+    }
+
+    /// Rebuilds the visible list from both source rankings. The fold boundary
+    /// is the position of the last filename strong match, so filename scoring
+    /// still controls weaker-match folding while semantic-only rows retain
+    /// their RRF order within the visible list.
+    fn rebuild_unified(&mut self) {
+        self.results = merge_unified_results(&self.filename_results, &self.semantic_results);
+        self.status.matches = self.results.len();
+        if self.strong == 0 {
+            // No filename match means every merged row is semantic-only;
+            // there is no filename weak tail to fold away.
+            self.unified_strong = self.results.len();
+            return;
+        }
+        let strong_paths: HashSet<&str> = self
+            .filename_results
+            .iter()
+            .take(self.strong)
+            .map(|row| row.path.as_str())
+            .collect();
+        self.unified_strong = self
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| strong_paths.contains(row.path.as_str()))
+            .map(|(i, _)| i + 1)
+            .max()
+            .unwrap_or(0);
     }
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
@@ -610,6 +729,9 @@ impl Engine {
         self.query = query.clone();
         self.status.error = None;
         self.cancel_content();
+        self.filename_results.clear();
+        self.semantic_results.clear();
+        self.unified_strong = 0;
         match mode {
             Mode::Content => {
                 self.results.clear();
@@ -627,7 +749,17 @@ impl Engine {
                     self.pending_semantic = Some((query, Instant::now()));
                 }
             }
-            Mode::Fuzzy | Mode::Regex | Mode::Calc => {
+            Mode::Fuzzy => {
+                self.pending_content = None;
+                self.pending_semantic =
+                    if !query.is_empty() && self.unified && semantic_store_available() {
+                        Some((query, Instant::now()))
+                    } else {
+                        None
+                    };
+                self.dispatch_filename();
+            }
+            Mode::Regex | Mode::Calc => {
                 self.pending_content = None;
                 self.pending_semantic = None;
                 self.dispatch_filename();
@@ -651,6 +783,11 @@ impl Engine {
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
                         self.generation += 1;
                         self.dispatch_filename();
+                        if self.is_unified_query() && semantic_store_available() {
+                            // The index update invalidates the generation of a
+                            // pending semantic response, so debounce it again.
+                            self.pending_semantic = Some((self.query.clone(), Instant::now()));
+                        }
                     }
                 }
                 Msg::IndexProgress { count, expected } => {
@@ -677,7 +814,7 @@ impl Engine {
                     if generation != self.generation {
                         continue;
                     }
-                    self.results = indices
+                    self.filename_results = indices
                         .into_iter()
                         .filter(|&i| i < self.store.len())
                         .map(|i| {
@@ -693,8 +830,14 @@ impl Engine {
                             }
                         })
                         .collect();
-                    self.strong = strong.min(self.results.len());
-                    self.status.matches = self.results.len();
+                    self.strong = strong.min(self.filename_results.len());
+                    if self.is_unified_query() {
+                        self.rebuild_unified();
+                    } else {
+                        self.results = self.filename_results.clone();
+                        self.unified_strong = self.strong;
+                        self.status.matches = self.results.len();
+                    }
                     self.status.error = error;
                 }
                 Msg::ContentHit { generation, hit } => {
@@ -731,12 +874,20 @@ impl Engine {
                         continue;
                     }
                     let f = &self.filters;
-                    self.results = rows
+                    let rows: Vec<ResultRow> = rows
                         .into_iter()
                         .filter(|r| f.is_empty() || f.matches(&r.path))
                         .collect();
-                    self.status.matches = self.results.len();
-                    self.status.error = error;
+                    if self.is_unified_query() {
+                        self.semantic_results = rows;
+                        self.rebuild_unified();
+                        // Unified search is best-effort: a missing model or
+                        // broken store must not change bare filename behavior.
+                    } else if self.mode == Mode::Semantic {
+                        self.results = rows;
+                        self.status.matches = self.results.len();
+                        self.status.error = error;
+                    }
                 }
             }
         }
@@ -746,21 +897,40 @@ impl Engine {
         &self.results
     }
 
-    /// How many leading filename rows sit above the relative score floor
-    /// (equal to the result count for content/semantic modes, which have no
-    /// score floor).
+    /// How many rows remain above the filename relative score floor (semantic
+    /// rows are all visible when there is no filename match; content/semantic
+    /// modes have no score floor).
     pub fn strong_count(&self) -> usize {
         match self.mode {
+            Mode::Fuzzy if self.is_unified_query() => self.unified_strong,
             Mode::Fuzzy | Mode::Regex => self.strong,
             _ => self.results.len(),
         }
     }
 
-    /// Test-only: place rows directly so UI states can be rendered without
-    /// waiting on worker threads.
+    /// Test-only: place filename rows directly so UI states can be rendered
+    /// without waiting on worker threads.
     #[doc(hidden)]
     pub fn inject_results_for_test(&mut self, rows: Vec<ResultRow>) {
+        self.filename_results = rows.clone();
         self.results = rows;
+    }
+
+    /// Test-only: enqueue semantic rows as if they came from the worker.
+    #[doc(hidden)]
+    pub fn inject_semantic_results_for_test(&mut self, rows: Vec<ResultRow>) {
+        self.inject_semantic_results_for_test_at(self.generation, rows);
+    }
+
+    /// Test-only: enqueue semantic rows with an explicit generation, allowing
+    /// stale-worker rejection to be exercised without a real embedder.
+    #[doc(hidden)]
+    pub fn inject_semantic_results_for_test_at(&mut self, generation: u64, rows: Vec<ResultRow>) {
+        let _ = self.msg_tx.send(Msg::SemanticResults {
+            generation,
+            rows,
+            error: None,
+        });
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -1229,5 +1399,124 @@ mod tests {
         // the regex toggle still works
         engine.set_query("? y", true);
         assert_eq!(engine.mode(), Mode::Regex);
+    }
+
+    fn unified_test_engine(unified: bool) -> (Engine, tempfile::TempDir, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("topic.txt"), "topic").unwrap();
+        let aux = tempfile::tempdir().unwrap();
+        let config = Config {
+            roots: vec![root.path().to_path_buf()],
+            excludes: Vec::new(),
+            index_apps: false,
+            quiet: Vec::new(),
+            unified,
+            ..Config::default()
+        };
+        (
+            Engine::new(
+                config,
+                aux.path().join("index.bin"),
+                aux.path().join("history"),
+            ),
+            root,
+            aux,
+        )
+    }
+
+    fn test_row(path: &str, semantic: bool) -> ResultRow {
+        ResultRow {
+            path: path.to_string(),
+            line_number: semantic.then_some(7),
+            line: semantic.then(|| "semantic context".to_string()),
+            recent_open: false,
+            meta: (!semantic).then_some(FileMeta { mtime: 7, size: 11 }),
+            score: semantic.then_some(0.8),
+        }
+    }
+
+    fn ready_for_unified_query(unified: bool) -> (Engine, tempfile::TempDir, tempfile::TempDir) {
+        let (mut engine, root, aux) = unified_test_engine(unified);
+        wait_for(&mut engine, |e| {
+            !e.status().indexing && e.status().indexed == 1
+        });
+        engine.set_query("topic", false);
+        wait_for(&mut engine, |e| !e.results().is_empty());
+        (engine, root, aux)
+    }
+
+    #[test]
+    fn unified_injected_rows_use_rrf_and_merge_context() {
+        let (mut engine, _root, _aux) = ready_for_unified_query(true);
+        engine.inject_results_for_test(vec![
+            test_row("/filename-a", false),
+            test_row("/both", false),
+            test_row("/filename-c", false),
+        ]);
+        engine.inject_semantic_results_for_test(vec![
+            test_row("/semantic-only", true),
+            test_row("/both", true),
+        ]);
+        engine.tick();
+
+        let paths: Vec<&str> = engine
+            .results()
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        // /both has two rank-2 contributions; the remaining rows are ordered
+        // by their one-list RRF scores, with deterministic source-rank ties.
+        assert_eq!(
+            paths,
+            ["/both", "/filename-a", "/semantic-only", "/filename-c"]
+        );
+        // The filename strong row is second after fusion, so the fold keeps
+        // it (and the semantic row ahead of it) visible.
+        assert_eq!(engine.strong_count(), 2);
+        let both = &engine.results()[0];
+        assert_eq!(both.meta, Some(FileMeta { mtime: 7, size: 11 }));
+        assert_eq!(both.line_number, Some(7));
+        assert_eq!(both.line.as_deref(), Some("semantic context"));
+        assert_eq!(both.score, Some(0.8));
+    }
+
+    #[test]
+    fn unified_drops_stale_injected_semantic_rows() {
+        let (mut engine, _root, _aux) = ready_for_unified_query(true);
+        engine.inject_semantic_results_for_test(vec![test_row("/stale", true)]);
+        engine.set_query("newer", false);
+        engine.tick();
+        assert!(!engine.results().iter().any(|row| row.path == "/stale"));
+    }
+
+    #[test]
+    fn unified_false_ignores_semantic_rows() {
+        let (mut engine, _root, _aux) = ready_for_unified_query(false);
+        let before: Vec<String> = engine
+            .results()
+            .iter()
+            .map(|row| row.path.clone())
+            .collect();
+        engine.inject_semantic_results_for_test(vec![test_row("/semantic-only", true)]);
+        engine.tick();
+        let after: Vec<String> = engine
+            .results()
+            .iter()
+            .map(|row| row.path.clone())
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn unified_semantic_only_rows_are_not_folded() {
+        let (mut engine, _root, _aux) = ready_for_unified_query(true);
+        engine.inject_results_for_test(Vec::new());
+        // Simulate the filename worker returning no matches.
+        engine.strong = 0;
+        engine.inject_semantic_results_for_test(vec![test_row("/semantic-only", true)]);
+        engine.tick();
+        assert_eq!(engine.results().len(), 1);
+        assert_eq!(engine.strong_count(), 1);
+        assert_eq!(engine.results()[0].path, "/semantic-only");
     }
 }

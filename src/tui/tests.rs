@@ -29,6 +29,7 @@ fn test_app() -> App {
         remember_session: true,
         index_apps: false,
         icons: false,
+        unified: true,
         quiet: Vec::new(),
     };
     let engine = Engine::new(
@@ -690,6 +691,19 @@ fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
         row,
         modifiers: KeyModifiers::NONE,
     }
+}
+
+#[test]
+fn selection_anchor_survives_result_reranking() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![test_row("/a"), test_row("/b")]);
+    app.move_selection(1);
+    app.engine
+        .inject_results_for_test(vec![test_row("/b"), test_row("/a")]);
+    app.restore_selection_anchor();
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.engine.results()[app.selected].path, "/b");
 }
 
 fn mouse_state() -> App {

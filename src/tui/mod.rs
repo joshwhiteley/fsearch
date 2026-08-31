@@ -323,6 +323,9 @@ fn batch_summary(verb: &str, total: usize, outcome: &BatchOutcome) -> String {
 pub struct App {
     pub engine: Engine,
     pub selected: usize,
+    /// Path pinned by an explicit user movement; asynchronous result
+    /// re-ranking restores this path instead of silently changing selection.
+    selection_anchor: Option<String>,
     pub regex_mode: bool,
     pub preview_layout: PreviewLayout,
     pub density: Density,
@@ -399,6 +402,7 @@ impl App {
         App {
             engine,
             selected: 0,
+            selection_anchor: None,
             regex_mode: false,
             preview_layout: PreviewLayout::Side,
             density: Density::Comfy,
@@ -804,6 +808,7 @@ impl App {
 
     fn refresh_query_keep_history(&mut self) {
         self.selected = 0;
+        self.selection_anchor = None;
         self.show_weak = false;
         self.engine.set_query(&self.editor.input, self.regex_mode);
     }
@@ -826,9 +831,30 @@ impl App {
         let len = self.visible_len();
         if len == 0 {
             self.selected = 0;
+            self.selection_anchor = None;
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+        self.selection_anchor = self
+            .engine
+            .results()
+            .get(self.selected)
+            .map(|row| row.path.clone());
+    }
+
+    fn restore_selection_anchor(&mut self) {
+        let Some(path) = self.selection_anchor.clone() else {
+            return;
+        };
+        let new_index = self
+            .engine
+            .results()
+            .iter()
+            .position(|row| row.path == path);
+        match new_index {
+            Some(i) if i < self.visible_len() => self.selected = i,
+            _ => self.selection_anchor = None,
+        }
     }
 
     fn open_selected(&mut self) {
@@ -952,6 +978,8 @@ impl App {
                         });
                         self.hit_test.last_click = Some((i, now));
                         self.selected = i;
+                        self.selection_anchor =
+                            self.engine.results().get(i).map(|row| row.path.clone());
                         if double {
                             self.activate_selected()
                         } else {
@@ -1232,6 +1260,7 @@ pub fn run(
     }
     let result = loop {
         app.engine.tick();
+        app.restore_selection_anchor();
         // side effects stay out of the draw pass: apply worker results,
         // issue new preview loads, and stat the selected path here
         app.poll_preview();
