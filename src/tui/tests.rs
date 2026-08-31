@@ -1416,6 +1416,8 @@ fn menu_batch_entries_appear_only_with_visible_marks() {
         "open marked",
         "copy marked paths",
         "trash marked",
+        "move marked to…",
+        "copy marked to…",
         "clear marks",
     ] {
         assert!(
@@ -1511,6 +1513,106 @@ fn first_matching_enter_action_overrides_open() {
 }
 
 #[test]
+fn destination_picker_preserves_query_selection_and_marks_on_cancel() {
+    let mut app = test_app();
+    app.engine.inject_results_for_test(vec![
+        file_row("/a/notes.md"),
+        file_row("/b/other.txt"),
+        file_row("/tmp/destination/"),
+    ]);
+    app.editor.input = "notes".to_string();
+    app.editor.input_cursor = app.editor.input.len();
+    app.selected = 1;
+    app.show_weak = true; // injected rows have no score-floor metadata
+    app.marks.insert("/a/notes.md".to_string());
+
+    let move_entry = app
+        .menu_entries()
+        .iter()
+        .position(|entry| entry.label == "move marked to…")
+        .unwrap();
+    app.run_menu_action(move_entry);
+
+    let picker = app.destination_picker.as_ref().unwrap();
+    assert_eq!(picker.paths, vec!["/a/notes.md"]);
+    assert_eq!(app.editor.input, "");
+    assert_eq!(app.selected, 0);
+    assert!(
+        app.menu_entries()
+            .iter()
+            .all(|entry| !entry.label.ends_with("marked"))
+    );
+    assert!(
+        app.menu_entries()
+            .iter()
+            .all(|entry| !entry.label.contains("marked to"))
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("move 1 file to…"));
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.destination_picker.is_none());
+    assert!(app.show_weak);
+    assert_eq!(app.editor.input, "notes");
+    assert_eq!(app.selected, 1);
+    assert!(app.marks.contains("/a/notes.md"));
+}
+
+#[test]
+fn choosing_move_destination_removes_only_moved_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    let collision_source = dir.path().join("existing.txt");
+    let destination = dir.path().join("destination");
+    std::fs::write(&source, "hello").unwrap();
+    std::fs::write(&collision_source, "new").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("existing.txt"), "old").unwrap();
+    let source = source.to_string_lossy().into_owned();
+    let collision_source = collision_source.to_string_lossy().into_owned();
+    let destination = format!("{}/", destination.to_string_lossy());
+
+    let mut app = test_app();
+    app.engine.inject_results_for_test(vec![
+        file_row(&source),
+        file_row(&collision_source),
+        file_row(&destination),
+    ]);
+    app.marks = [source.clone(), collision_source.clone()].into();
+    let move_entry = app
+        .menu_entries()
+        .iter()
+        .position(|entry| entry.label == "move marked to…")
+        .unwrap();
+    app.run_menu_action(move_entry);
+    // The real search worker will replace these rows asynchronously; inject
+    // the selected directory so this test exercises Enter deterministically.
+    app.engine
+        .inject_results_for_test(vec![file_row(&destination)]);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(app.destination_picker.is_none());
+    assert_eq!(app.marks, [collision_source.clone()].into());
+    assert!(!std::path::Path::new(&source).exists());
+    assert!(std::path::Path::new(&collision_source).exists());
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&destination).join("source.txt")).unwrap(),
+        "hello"
+    );
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&destination).join("existing.txt")).unwrap(),
+        "old"
+    );
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|(message, _)| message == "moved 1, skipped 1 (exists)")
+    );
+}
+
+#[test]
 fn custom_actions_are_disabled_in_pick_filter_and_directory_modes() {
     let mut app = test_app();
     app.custom_actions = vec![custom_action("always", &["true"], &[], None, true)];
@@ -1538,6 +1640,55 @@ fn custom_actions_are_disabled_in_pick_filter_and_directory_modes() {
             .iter()
             .any(|entry| entry.label == "always")
     );
+}
+
+#[test]
+fn choosing_copy_destination_keeps_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    let destination = dir.path().join("destination");
+    std::fs::write(&source, "hello").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let source = source.to_string_lossy().into_owned();
+    let destination = format!("{}/", destination.to_string_lossy());
+
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row(&source), file_row(&destination)]);
+    app.marks.insert(source.clone());
+    let copy_entry = app
+        .menu_entries()
+        .iter()
+        .position(|entry| entry.label == "copy marked to…")
+        .unwrap();
+    app.run_menu_action(copy_entry);
+    app.engine
+        .inject_results_for_test(vec![file_row(&destination)]);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(app.destination_picker.is_none());
+    assert_eq!(app.marks, [source.clone()].into());
+    assert!(std::path::Path::new(&source).exists());
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&destination).join("source.txt")).unwrap(),
+        "hello"
+    );
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|(message, _)| message == "copied 1 file")
+    );
+}
+
+#[test]
+fn destination_menu_entries_require_visible_marks() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/a/visible.txt")]);
+    app.marks.insert("/hidden/file.txt".to_string());
+    let entries = app.menu_entries();
+    assert!(!entries.iter().any(|e| e.label == "move marked to…"));
+    assert!(!entries.iter().any(|e| e.label == "copy marked to…"));
 }
 
 #[test]

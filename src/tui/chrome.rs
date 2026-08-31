@@ -509,18 +509,32 @@ pub(super) fn query_spans(input: &str, accent: Color) -> Vec<Span<'static>> {
 }
 
 pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
-    let mode = if app.engine.is_filter() {
-        if app.regex_mode { "regex" } else { "filter" }
+    let title = if let Some(picker) = &app.destination_picker {
+        let verb = match picker.kind {
+            crate::actions::TransferKind::Move => "move",
+            crate::actions::TransferKind::Copy => "copy",
+        };
+        let noun = if picker.paths.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        format!("{verb} {} {noun} to…", picker.paths.len())
     } else {
-        match (app.engine.mode(), app.regex_mode) {
-            (Mode::Content, _) => "content",
-            (Mode::Semantic, _) => "semantic",
-            (Mode::Calc, _) => "calc",
-            (_, true) => "regex",
-            _ => "fuzzy",
-        }
+        let mode = if app.engine.is_filter() {
+            if app.regex_mode { "regex" } else { "filter" }
+        } else {
+            match (app.engine.mode(), app.regex_mode) {
+                (Mode::Content, _) => "content",
+                (Mode::Semantic, _) => "semantic",
+                (Mode::Calc, _) => "calc",
+                (_, true) => "regex",
+                _ => "fuzzy",
+            }
+        };
+        format!("fsearch [{mode}]")
     };
-    let block = themed_block(&format!("fsearch [{mode}]"), &app.theme);
+    let block = themed_block(&title, &app.theme);
     // the cursor sits in the block's inner rect, so borderless mode (which
     // keeps one row for the title and none for borders) stays in step
     let inner = block.inner(area);
