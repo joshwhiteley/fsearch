@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Source files gain an "open in nvim" action. fsearch temporarily leaves its
+  terminal screen, runs Neovim in the foreground, then restores the same
+  search session when Neovim exits
+
 ## 0.10.0 — 2026-08-31
 
 - Built-in default actions: with no `[[actions]]` configured, installed GUI

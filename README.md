@@ -53,10 +53,11 @@ Run `fsearch` and start typing.
   and hidden-directory churn (logs, dotfiles) sit behind the weaker-matches
   fold and stay off the launch screen. `ctrl-x` reveals them, and typing a
   `/` in a query (or `path:`) searches them at full rank
-- `enter` opens · `→` opens an actions menu (reveal, copy, quick look,
-  move to trash) · `ctrl-space` Quick Look · `ctrl-y` copies the path ·
-  `ctrl-b` toggles a mark · `alt-b` clears marks · the actions menu batches
-  open/copy/trash over visible marked rows · `ctrl-p`/`ctrl-n` recall query history ·
+- `enter` opens · `→` opens an actions menu (including foreground Neovim
+  for source files, reveal, copy, quick look, and trash) · `ctrl-space` Quick
+  Look · `ctrl-y` copies the path · `ctrl-s` toggles a mark · `alt-s` clears
+  marks · the actions menu batches open/copy/trash over visible marked rows ·
+  `ctrl-p`/`ctrl-n` recall query history ·
   `ctrl-g` cycles theme presets · `f1`/`ctrl-o` opens help ·
   `tab` cycles the preview (side → full-window → hidden) · `esc` quits
 

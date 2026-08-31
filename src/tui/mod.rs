@@ -16,6 +16,7 @@ use ratatui::widgets::ListState;
 use ratatui::{Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
 use std::collections::HashSet;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -297,6 +298,7 @@ struct BatchOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltInAction {
     Open,
+    Nvim,
     Reveal,
     Copy,
     QuickLook,
@@ -410,6 +412,8 @@ pub struct App {
     pub marks: HashSet<String>,
     /// User-defined actions loaded from `[[actions]]`.
     pub custom_actions: Vec<crate::config::CustomAction>,
+    /// Selected source file waiting to open in foreground Neovim.
+    pub nvim_request: Option<String>,
     /// Temporarily replaces the normal query with a directory-only search.
     pub destination_picker: Option<DestinationPicker>,
 }
@@ -505,6 +509,7 @@ impl App {
             },
             marks: HashSet::new(),
             custom_actions: Vec::new(),
+            nvim_request: None,
             destination_picker: None,
         }
     }
@@ -535,6 +540,16 @@ impl App {
                         command: MenuCommand::Custom(index),
                     }),
             );
+        }
+        if self
+            .visible_selected_row()
+            .is_some_and(|row| is_source_file(&row.path))
+            && self.custom_actions_enabled()
+        {
+            entries.push(MenuEntry {
+                label: "open in nvim".into(),
+                command: MenuCommand::BuiltIn(BuiltInAction::Nvim),
+            });
         }
         entries.extend(Self::MENU.into_iter().map(|(command, label)| MenuEntry {
             label: label.to_string(),
@@ -619,6 +634,9 @@ impl App {
         self.menu = None;
         match action.command {
             MenuCommand::BuiltIn(BuiltInAction::Open) => self.open_selected(),
+            MenuCommand::BuiltIn(BuiltInAction::Nvim) => {
+                self.nvim_request = self.visible_selected_row().map(|row| row.path.clone());
+            }
             MenuCommand::BuiltIn(BuiltInAction::Reveal) => self.act(actions::reveal, "revealed"),
             MenuCommand::BuiltIn(BuiltInAction::Copy) => self.act(actions::copy, "copied"),
             MenuCommand::BuiltIn(BuiltInAction::QuickLook) => {
@@ -1505,8 +1523,68 @@ pub fn probe_terminal() -> (highlight::TerminalTraits, Option<Picker>) {
     (traits, picker)
 }
 
+fn is_source_file(path: &str) -> bool {
+    if path.ends_with('/') {
+        return false;
+    }
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(crate::filters::kind_for_ext)
+        == Some("code")
+}
+
 fn open_tty() -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open("/dev/tty")
+}
+
+fn run_nvim_foreground(path: &str) -> std::io::Result<()> {
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
+    let stdin = tty.try_clone()?;
+    let stdout = tty.try_clone()?;
+    let status = Command::new("nvim")
+        .arg("--")
+        .arg(path)
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(tty))
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("nvim exited with {status}")))
+    }
+}
+
+fn resume_terminal(
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+    mouse: bool,
+) -> std::io::Result<()> {
+    enable_raw_mode()?;
+    if mouse {
+        execute!(
+            terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture
+        )?;
+    } else {
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    }
+    terminal.clear()
+}
+
+fn open_in_nvim(
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+    path: &str,
+    mouse: bool,
+) -> std::io::Result<()> {
+    restore_terminal(mouse);
+    let result = run_nvim_foreground(path);
+    let resumed = resume_terminal(terminal, mouse);
+    resumed.and(result)
 }
 
 fn restore_terminal(mouse: bool) {
@@ -1634,6 +1712,15 @@ pub fn run(
             }
             Ok(false) => {}
             Err(e) => break Err(e.into()),
+        }
+        if let Some(path) = app.nvim_request.take() {
+            match open_in_nvim(&mut terminal, &path, mouse) {
+                Ok(()) => {
+                    app.engine.record_open(&path);
+                    app.set_message("returned from nvim".into());
+                }
+                Err(error) => app.set_message(format!("error opening nvim: {error}")),
+            }
         }
     };
     restore_terminal(mouse);

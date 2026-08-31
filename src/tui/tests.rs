@@ -1432,6 +1432,35 @@ fn menu_batch_entries_appear_only_with_visible_marks() {
 }
 
 #[test]
+fn nvim_action_is_source_only_and_queues_the_selected_path() {
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/main.rs")]);
+    let entry = app
+        .menu_entries()
+        .iter()
+        .position(|entry| entry.label == "open in nvim")
+        .expect("source files offer nvim");
+    app.run_menu_action(entry);
+    assert_eq!(app.nvim_request.as_deref(), Some("/tmp/main.rs"));
+
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/manual.pdf")]);
+    assert!(
+        !app.menu_entries()
+            .iter()
+            .any(|entry| entry.label == "open in nvim")
+    );
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/project/")]);
+    assert!(
+        !app.menu_entries()
+            .iter()
+            .any(|entry| entry.label == "open in nvim")
+    );
+}
+
+#[test]
 fn custom_actions_are_composed_above_builtins_only_for_matching_files() {
     let mut app = test_app();
     app.custom_actions = vec![
