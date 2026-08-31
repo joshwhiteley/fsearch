@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Unified search: bare queries blend filename and semantic results into one
+  ranked list (reciprocal rank fusion); semantic-only rows are labeled, and
+  `unified = false` restores the old filename-only behavior
+- Custom actions: `[[actions]]` entries in config.toml add commands to the
+  actions menu with `{path}`/`{paths}`/`{dir}` placeholders, optional
+  `ext`/`kind` filters, and `enter = true` to replace the default opener for
+  matching files (e.g. code → Cursor, pdf → Preview, docx → Word)
+- Move/copy marked files: the actions menu gains "move marked to…" and
+  "copy marked to…", with an in-app directory picker; collisions are skipped
+  and reported, cross-device moves fall back to copy+delete
+- Archive preview: selecting a .zip, .tar, .tar.gz, or .tgz lists its
+  contents in the preview pane (bounded, corrupt-safe)
+- Project search: well-matching directories now appear in default fuzzy
+  results (finding `sage-kc/` by typing "sage kc"), and files inside a
+  matching directory get a segment bonus so project contents outrank
+  similarly-named decoys
+- Script mode hits write through the pipe-safe path again (`fsearch -p q |
+  head` no longer panics)
 - Marking moved from `ctrl-b`/`alt-b` to `ctrl-s`/`alt-s`: terminal
   multiplexers (tmux, herdr) swallow `ctrl-b` as their prefix key before the
   app ever sees it. Marking now advances to the next row fzf-style, and the
