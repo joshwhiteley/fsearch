@@ -30,6 +30,8 @@ fn test_app() -> App {
         index_apps: false,
         icons: false,
         quiet: Vec::new(),
+        actions: Vec::new(),
+        action_warning: None,
     };
     let engine = Engine::new(
         config,
@@ -1288,6 +1290,22 @@ fn file_row(path: &str) -> crate::engine::ResultRow {
     }
 }
 
+fn custom_action(
+    name: &str,
+    cmd: &[&str],
+    ext: &[&str],
+    kind: Option<&str>,
+    enter: bool,
+) -> crate::config::CustomAction {
+    crate::config::CustomAction {
+        name: name.into(),
+        cmd: cmd.iter().map(|arg| (*arg).into()).collect(),
+        ext: ext.iter().map(|value| (*value).into()).collect(),
+        kind: kind.map(str::to_string),
+        enter,
+    }
+}
+
 #[test]
 fn mark_key_toggles_a_mark_and_renders_the_gutter_indicator() {
     let mut app = test_app();
@@ -1347,7 +1365,9 @@ fn menu_batch_entries_appear_only_with_visible_marks() {
     use crate::engine::ResultRow;
     let mut app = test_app();
     assert!(
-        !app.menu_entries().contains(&"open marked"),
+        !app.menu_entries()
+            .iter()
+            .any(|entry| entry.label == "open marked"),
         "no batch entries without marks"
     );
     app.engine.inject_results_for_test(vec![
@@ -1384,12 +1404,126 @@ fn menu_batch_entries_appear_only_with_visible_marks() {
         "trash marked",
         "clear marks",
     ] {
-        assert!(entries.contains(&label), "{label} missing");
+        assert!(
+            entries.iter().any(|entry| entry.label == label),
+            "{label} missing"
+        );
     }
     // batch copy content: visible marked paths in display order,
     // newline-joined — exactly what goes to the clipboard
     assert_eq!(app.visible_marked(), vec!["/a/x.pdf", "/c/z.pdf"]);
     assert_eq!(app.visible_marked().join("\n"), "/a/x.pdf\n/c/z.pdf");
+}
+
+#[test]
+fn custom_actions_are_composed_above_builtins_only_for_matching_files() {
+    let mut app = test_app();
+    app.custom_actions = vec![
+        custom_action("code action", &["true", "{path}"], &[], Some("code"), false),
+        custom_action("pdf action", &["true"], &["pdf"], None, false),
+    ];
+    // No selected result means no custom entries, but built-ins remain.
+    assert!(
+        !app.menu_entries()
+            .iter()
+            .any(|entry| entry.label == "code action")
+    );
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/main.rs")]);
+    let entries = app.menu_entries();
+    assert_eq!(entries[0].label, "code action");
+    assert!(entries.iter().any(|entry| entry.label == "open"));
+    assert!(!entries.iter().any(|entry| entry.label == "pdf action"));
+    assert_eq!(entries[0].command, super::MenuCommand::Custom(0));
+}
+
+#[test]
+fn custom_action_runs_once_for_marked_paths_placeholder() {
+    let mut app = test_app();
+    app.custom_actions = vec![custom_action(
+        "batch action",
+        &["true", "{paths}"],
+        &[],
+        None,
+        false,
+    )];
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/one.rs"), file_row("/tmp/two.txt")]);
+    app.marks = ["/tmp/one.rs".into(), "/tmp/two.txt".into()].into();
+    app.run_menu_action(0);
+    assert_eq!(
+        app.message.as_ref().map(|(message, _)| message.as_str()),
+        Some("opened 2 in batch action")
+    );
+}
+
+#[test]
+fn custom_action_reports_marked_spawn_failures() {
+    let mut app = test_app();
+    app.custom_actions = vec![custom_action(
+        "broken action",
+        &["fsearch-command-that-does-not-exist", "{path}"],
+        &[],
+        None,
+        false,
+    )];
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/one.rs"), file_row("/tmp/two.txt")]);
+    app.marks = ["/tmp/one.rs".into(), "/tmp/two.txt".into()].into();
+    app.run_menu_action(0);
+    assert!(app.message.as_ref().is_some_and(|(message, _)| {
+        message.contains("error: opened 0/2 in broken action")
+            && message.contains("2 failed")
+            && message.contains("/tmp/one.rs")
+    }));
+}
+
+#[test]
+fn first_matching_enter_action_overrides_open() {
+    let mut app = test_app();
+    app.custom_actions = vec![
+        custom_action("unmatched", &["true"], &[], Some("doc"), true),
+        custom_action("first", &["true"], &[], Some("code"), true),
+        custom_action("second", &["true"], &[], Some("code"), true),
+    ];
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/main.rs")]);
+    assert!(app.activate_selected());
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|(message, _)| message == "opened in first: /tmp/main.rs")
+    );
+}
+
+#[test]
+fn custom_actions_are_disabled_in_pick_filter_and_directory_modes() {
+    let mut app = test_app();
+    app.custom_actions = vec![custom_action("always", &["true"], &[], None, true)];
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/dir/")]);
+    assert!(
+        !app.menu_entries()
+            .iter()
+            .any(|entry| entry.label == "always")
+    );
+    app.ui_mode = UiMode::Pick;
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/file.txt")]);
+    assert!(
+        !app.menu_entries()
+            .iter()
+            .any(|entry| entry.label == "always")
+    );
+    let mut filter = test_filter_app();
+    filter.custom_actions = vec![custom_action("always", &["true"], &[], None, false)];
+    tick_until(&mut filter, |a| a.engine.results().len() >= 3);
+    assert!(
+        !filter
+            .menu_entries()
+            .iter()
+            .any(|entry| entry.label == "always")
+    );
 }
 
 #[test]
@@ -1485,9 +1619,9 @@ fn hidden_marks_remain_clearable_without_batch_actions() {
         .inject_results_for_test(vec![file_row("/a/visible.txt")]);
     app.marks.insert("/hidden/file.txt".to_string());
     let entries = app.menu_entries();
-    assert!(entries.contains(&"clear marks"));
-    assert!(!entries.contains(&"open marked"));
-    assert!(!entries.contains(&"trash marked"));
+    assert!(entries.iter().any(|entry| entry.label == "clear marks"));
+    assert!(!entries.iter().any(|entry| entry.label == "open marked"));
+    assert!(!entries.iter().any(|entry| entry.label == "trash marked"));
 }
 
 #[test]

@@ -418,7 +418,13 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     let entries = app.menu_entries();
     let selected = selected.min(entries.len().saturating_sub(1));
     app.menu = Some(selected);
-    let width = 24u16.min(body.width);
+    let max_label = entries
+        .iter()
+        .map(|entry| entry.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = max_label.saturating_add(4).min(u16::MAX as usize) as u16;
+    let width = width.min(body.width);
     let height = (entries.len() as u16 + 2).min(body.height);
     let area = Rect {
         x: body.x + (body.width.saturating_sub(width)) / 2,
@@ -429,7 +435,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     frame.render_widget(ratatui::widgets::Clear, area);
     let items: Vec<ListItem> = entries
         .iter()
-        .map(|label| ListItem::new(format!(" {label}")))
+        .map(|entry| ListItem::new(format!(" {}", entry.label)))
         .collect();
     let block = themed_block("actions", &app.theme);
     let inner = block.inner(area);
@@ -637,6 +643,8 @@ pub(super) fn draw_toast(frame: &mut Frame, app: &mut App, body: Rect) {
     };
     let (color, content) = if text.starts_with("error") {
         (Color::Red, text.clone())
+    } else if text.starts_with("warning") {
+        (Color::Yellow, text.clone())
     } else {
         (Color::Green, format!("✓ {text}"))
     };

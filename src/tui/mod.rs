@@ -283,6 +283,31 @@ struct BatchOutcome {
     first_error: Option<(String, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltInAction {
+    Open,
+    Reveal,
+    Copy,
+    QuickLook,
+    Trash,
+    OpenMarked,
+    CopyMarked,
+    TrashMarked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuCommand {
+    BuiltIn(BuiltInAction),
+    Custom(usize),
+    ClearMarks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MenuEntry {
+    label: String,
+    command: MenuCommand,
+}
+
 fn run_batch<F>(paths: &[String], mut action: F) -> BatchOutcome
 where
     F: FnMut(&str) -> std::io::Result<()>,
@@ -367,6 +392,8 @@ pub struct App {
     /// the row indicators operate only on currently-visible marked rows.
     /// Never populated in filter mode (rows are arbitrary stdin lines).
     pub marks: HashSet<String>,
+    /// User-defined actions loaded from `[[actions]]`.
+    pub custom_actions: Vec<crate::config::CustomAction>,
 }
 
 impl App {
@@ -458,29 +485,68 @@ impl App {
                 area: Rect::default(),
             },
             marks: HashSet::new(),
+            custom_actions: Vec::new(),
         }
     }
 
-    const MENU: [&'static str; 5] = [
-        "open",
-        "reveal in finder",
-        "copy path",
-        "quick look",
-        "move to trash",
+    const MENU: [(BuiltInAction, &'static str); 5] = [
+        (BuiltInAction::Open, "open"),
+        (BuiltInAction::Reveal, "reveal in finder"),
+        (BuiltInAction::Copy, "copy path"),
+        (BuiltInAction::QuickLook, "quick look"),
+        (BuiltInAction::Trash, "move to trash"),
     ];
 
     /// Menu entries: the single-selection actions plus batch actions for
     /// visible marks. Clear remains available for marks hidden by a filter or
     /// the weaker-match fold.
-    fn menu_entries(&self) -> Vec<&'static str> {
-        let mut entries: Vec<&'static str> = Self::MENU.to_vec();
+    fn menu_entries(&self) -> Vec<MenuEntry> {
+        let mut entries = Vec::new();
+        if self.custom_actions_enabled()
+            && let Some(path) = self.visible_selected_row().map(|row| row.path.as_str())
+        {
+            entries.extend(
+                self.custom_actions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, action)| action.matches(path))
+                    .map(|(index, action)| MenuEntry {
+                        label: action.name.clone(),
+                        command: MenuCommand::Custom(index),
+                    }),
+            );
+        }
+        entries.extend(Self::MENU.into_iter().map(|(command, label)| MenuEntry {
+            label: label.to_string(),
+            command: MenuCommand::BuiltIn(command),
+        }));
         if self.marking_enabled() && self.visible_marked_count() > 0 {
-            entries.extend(["open marked", "copy marked paths", "trash marked"]);
+            entries.extend([
+                MenuEntry {
+                    label: "open marked".into(),
+                    command: MenuCommand::BuiltIn(BuiltInAction::OpenMarked),
+                },
+                MenuEntry {
+                    label: "copy marked paths".into(),
+                    command: MenuCommand::BuiltIn(BuiltInAction::CopyMarked),
+                },
+                MenuEntry {
+                    label: "trash marked".into(),
+                    command: MenuCommand::BuiltIn(BuiltInAction::TrashMarked),
+                },
+            ]);
         }
         if self.marking_enabled() && !self.marks.is_empty() {
-            entries.push("clear marks");
+            entries.push(MenuEntry {
+                label: "clear marks".into(),
+                command: MenuCommand::ClearMarks,
+            });
         }
         entries
+    }
+
+    fn custom_actions_enabled(&self) -> bool {
+        self.ui_mode == UiMode::Open && !self.engine.is_filter() && self.engine.mode() != Mode::Calc
     }
 
     /// The focused row only counts when it belongs to the currently visible
@@ -515,22 +581,24 @@ impl App {
     }
 
     fn run_menu_action(&mut self, entry: usize) {
-        let Some(action) = self.menu_entries().get(entry).copied() else {
+        let Some(action) = self.menu_entries().get(entry).cloned() else {
             self.menu = None;
             return;
         };
         self.menu = None;
-        match action {
-            "open" => self.open_selected(),
-            "reveal in finder" => self.act(actions::reveal, "revealed"),
-            "copy path" => self.act(actions::copy, "copied"),
-            "quick look" => self.act(actions::quick_look, "quick look"),
-            "move to trash" => self.act(actions::trash, "trashed"),
-            "open marked" => self.open_marked(),
-            "copy marked paths" => self.copy_marked(),
-            "trash marked" => self.trash_marked(),
-            "clear marks" => self.clear_marks(),
-            _ => {}
+        match action.command {
+            MenuCommand::BuiltIn(BuiltInAction::Open) => self.open_selected(),
+            MenuCommand::BuiltIn(BuiltInAction::Reveal) => self.act(actions::reveal, "revealed"),
+            MenuCommand::BuiltIn(BuiltInAction::Copy) => self.act(actions::copy, "copied"),
+            MenuCommand::BuiltIn(BuiltInAction::QuickLook) => {
+                self.act(actions::quick_look, "quick look")
+            }
+            MenuCommand::BuiltIn(BuiltInAction::Trash) => self.act(actions::trash, "trashed"),
+            MenuCommand::BuiltIn(BuiltInAction::OpenMarked) => self.open_marked(),
+            MenuCommand::BuiltIn(BuiltInAction::CopyMarked) => self.copy_marked(),
+            MenuCommand::BuiltIn(BuiltInAction::TrashMarked) => self.trash_marked(),
+            MenuCommand::Custom(index) => self.run_custom_action(index),
+            MenuCommand::ClearMarks => self.clear_marks(),
         }
     }
 
@@ -545,12 +613,100 @@ impl App {
         Ok(())
     }
 
+    fn matching_enter_action(&self, path: &str) -> Option<crate::config::CustomAction> {
+        self.custom_actions
+            .iter()
+            .find(|action| action.enter && action.matches(path))
+            .cloned()
+    }
+
+    fn open_path_with_enter(&mut self, path: &str) -> std::io::Result<()> {
+        if let Some(action) = self.matching_enter_action(path) {
+            actions::run_custom(&action, path, &[path.to_string()])?;
+            self.engine.record_open(path);
+            Ok(())
+        } else {
+            self.open_path(path)
+        }
+    }
+
     /// Batch-open every visible marked row, continuing after failures and
     /// reporting a partial result instead of silently dropping errors.
     fn open_marked(&mut self) {
         let paths = self.visible_marked();
-        let outcome = run_batch(&paths, |path| self.open_path(path));
+        let outcome = run_batch(&paths, |path| self.open_path_with_enter(path));
         self.set_message(batch_summary("opened", paths.len(), &outcome));
+    }
+
+    fn custom_marked_paths(&self, action: &crate::config::CustomAction) -> Vec<String> {
+        self.visible_marked()
+            .into_iter()
+            .filter(|path| action.matches(path))
+            .collect()
+    }
+
+    fn custom_batch_summary(
+        &self,
+        action: &crate::config::CustomAction,
+        paths: &[String],
+        outcome: &BatchOutcome,
+    ) -> String {
+        if paths.is_empty() {
+            return format!("no visible marked files matching {}", action.name);
+        }
+        let failed = paths.len() - outcome.succeeded;
+        match &outcome.first_error {
+            Some((path, error)) => format!(
+                "error: opened {}/{} in {}; {failed} failed ({path}: {error})",
+                outcome.succeeded,
+                paths.len(),
+                action.name
+            ),
+            None => format!("opened {} in {}", outcome.succeeded, action.name),
+        }
+    }
+
+    fn run_custom_action(&mut self, index: usize) {
+        let Some(action) = self.custom_actions.get(index).cloned() else {
+            return;
+        };
+        let marked = self.visible_marked();
+        let paths = if marked.is_empty() {
+            self.visible_selected_row()
+                .filter(|row| action.matches(&row.path))
+                .map(|row| vec![row.path.clone()])
+                .unwrap_or_default()
+        } else {
+            self.custom_marked_paths(&action)
+        };
+        if paths.is_empty() {
+            self.set_message(self.custom_batch_summary(
+                &action,
+                &paths,
+                &BatchOutcome {
+                    succeeded: 0,
+                    first_error: None,
+                },
+            ));
+            return;
+        }
+        let outcome = if actions::has_paths_placeholder(&action.cmd) {
+            match actions::run_custom(&action, &paths[0], &paths) {
+                Ok(()) => BatchOutcome {
+                    succeeded: paths.len(),
+                    first_error: None,
+                },
+                Err(error) => BatchOutcome {
+                    succeeded: 0,
+                    first_error: Some((paths[0].clone(), error.to_string())),
+                },
+            }
+        } else {
+            run_batch(&paths, |path| {
+                actions::run_custom(&action, path, &[path.to_string()])
+            })
+        };
+        self.set_message(self.custom_batch_summary(&action, &paths, &outcome));
     }
 
     /// Copies the visible marked paths to the clipboard, newline-joined.
@@ -832,6 +988,14 @@ impl App {
     }
 
     fn open_selected(&mut self) {
+        self.open_selected_with(false);
+    }
+
+    fn open_selected_with_enter(&mut self) {
+        self.open_selected_with(true);
+    }
+
+    fn open_selected_with(&mut self, use_enter_action: bool) {
         let Some(path) = self.visible_selected_row().map(|row| row.path.clone()) else {
             return;
         };
@@ -843,9 +1007,25 @@ impl App {
             });
             return;
         }
-        let message = match self.open_path(&path) {
-            Ok(()) => format!("opened: {path}"),
-            Err(error) => format!("error opening {path}: {error}"),
+        let enter_action = use_enter_action
+            .then(|| self.matching_enter_action(&path))
+            .flatten();
+        let result = if let Some(action) = &enter_action {
+            actions::run_custom(action, &path, std::slice::from_ref(&path)).map(|()| {
+                self.engine.record_open(&path);
+            })
+        } else {
+            self.open_path(&path)
+        };
+        let message = match result {
+            Ok(()) => enter_action.map_or_else(
+                || format!("opened: {path}"),
+                |action| format!("opened in {}: {path}", action.name),
+            ),
+            Err(error) => enter_action.map_or_else(
+                || format!("error opening {path}: {error}"),
+                |action| format!("error opening in {} {path}: {error}", action.name),
+            ),
         };
         self.set_message(message);
     }
@@ -857,7 +1037,7 @@ impl App {
         match self.ui_mode {
             UiMode::Open => {
                 self.push_history();
-                self.open_selected();
+                self.open_selected_with_enter();
                 true
             }
             UiMode::Pick => {
@@ -1170,6 +1350,8 @@ pub fn run(
     mouse: bool,
     icons: bool,
     remember_session: bool,
+    custom_actions: Vec<crate::config::CustomAction>,
+    action_warning: Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
@@ -1200,6 +1382,10 @@ pub fn run(
     app.appearance = traits.appearance;
     app.picker = picker;
     app.ui_mode = ui_mode;
+    app.custom_actions = custom_actions;
+    if let Some(warning) = action_warning {
+        app.message = Some((warning, Instant::now()));
+    }
     app.theme_cfg = theme_cfg;
     app.theme = crate::theme::resolve_config(&app.theme_cfg);
     app.icons = icons;

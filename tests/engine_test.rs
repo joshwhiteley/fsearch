@@ -29,6 +29,8 @@ fn config_for(root: &std::path::Path) -> Config {
         index_apps: false,
         icons: false,
         quiet: Vec::new(),
+        actions: Vec::new(),
+        action_warning: None,
     }
 }
 
