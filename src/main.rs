@@ -126,18 +126,19 @@ fn print_search(query: &str) {
         quiet: fsearch::quiet::Quiet::new(config.quiet.clone()),
         pdf_cache: fsearch::pdf::default_cache_dir(),
     };
+    // write_stdout survives broken pipes (`fsearch -p q | head` must exit 0)
     let result = fsearch::query::search(&store, query, &opts, &mut |hit| match hit {
-        fsearch::query::Hit::Path(path) => println!("{path}"),
+        fsearch::query::Hit::Path(path) => write_stdout(&format!("{path}\n")),
         fsearch::query::Hit::Line {
             path,
             line_number,
             line,
-        } => println!("{path}:{line_number}:{line}"),
+        } => write_stdout(&format!("{path}:{line_number}:{line}\n")),
         fsearch::query::Hit::Semantic {
             path,
             line_start,
             score,
-        } => println!("{path}:{line_start}:{score:.2}"),
+        } => write_stdout(&format!("{path}:{line_start}:{score:.2}\n")),
     });
     let matched = match result {
         Ok(any) => any,
