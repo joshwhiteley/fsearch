@@ -28,6 +28,7 @@ fn config_for(root: &std::path::Path) -> Config {
         remember_session: true,
         index_apps: false,
         icons: false,
+        unified: true,
         quiet: Vec::new(),
     }
 }

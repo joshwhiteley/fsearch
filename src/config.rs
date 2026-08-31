@@ -62,6 +62,8 @@ pub struct Config {
     pub index_apps: bool,
     /// Nerd-font glyphs before filenames in result rows.
     pub icons: bool,
+    /// Blend bare filename searches with semantic results when available.
+    pub unified: bool,
 }
 
 impl Default for Config {
@@ -80,6 +82,7 @@ impl Default for Config {
                 .collect(),
             index_apps: true,
             icons: false,
+            unified: true,
         }
     }
 }
@@ -96,6 +99,7 @@ struct RawConfig {
     quiet: Option<Vec<String>>,
     index_apps: Option<bool>,
     icons: Option<bool>,
+    unified: Option<bool>,
 }
 
 /// A `[keys]` value: either one spec string or a list of them.
@@ -156,6 +160,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #   (text editing keys - typing, backspace, cursor, ctrl-a/e/w/d - are fixed)
 # index_apps: include /Applications app bundles in the index (macOS)
 # icons: nerd-font glyphs before filenames (true/false; needs a nerd font)
+# unified: blend bare filename and semantic results (true/false)
 # quiet: substrings demoted in ranking (app internals); set [] to disable
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
 # remember_session: restore preview layout and row density between runs
@@ -215,6 +220,7 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
         quiet: raw.quiet.unwrap_or_else(|| d.quiet.clone()),
         index_apps: raw.index_apps.unwrap_or(true),
         icons: raw.icons.unwrap_or(false),
+        unified: raw.unified.unwrap_or(true),
     })
 }
 
@@ -373,6 +379,18 @@ mod tests {
         assert!(c.icons);
         // default is off
         assert!(!Config::default().icons);
+    }
+
+    #[test]
+    fn unified_flag_parses_and_defaults_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "unified = false\n").unwrap();
+        assert!(!load_or_create(&path).unwrap().unified);
+        assert!(Config::default().unified);
+        let path2 = dir.path().join("plain.toml");
+        std::fs::write(&path2, "roots = [\"/tmp\"]\n").unwrap();
+        assert!(load_or_create(&path2).unwrap().unified);
     }
 
     #[test]
