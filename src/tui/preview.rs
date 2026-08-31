@@ -52,6 +52,34 @@ pub enum PreviewPayload {
     Image(image::DynamicImage),
 }
 
+const ARCHIVE_PREVIEW_ENTRIES: usize = 200;
+// Match the Office ZIP guard: metadata parsing is bounded before opening the
+// central directory, while entry contents are never decompressed.
+const MAX_ZIP_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 4096;
+const MAX_TAR_ENTRIES: usize = 10_000;
+const MAX_TAR_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum ArchiveKind {
+    Zip,
+    Tar,
+    GzipTar,
+}
+
+struct ArchiveEntry {
+    name: String,
+    size: u64,
+    is_dir: bool,
+}
+
+struct ArchiveListing {
+    entries: Vec<ArchiveEntry>,
+    total_entries: usize,
+    total_size: u64,
+    capped: bool,
+}
+
 /// The expensive half of preview loading — read, syntax-highlight, PDF
 /// extract, image decode — runs on this worker thread so the UI thread only
 /// applies results. Mirrors the former synchronous load_preview logic.
@@ -122,6 +150,9 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
             Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(image: {e})"))]),
         };
     }
+    if let Some(kind) = archive_kind(&req.path) {
+        return PreviewPayload::Lines(archive_preview(&req.path, kind, req.gutter));
+    }
     match read_preview_bytes(&req.path) {
         Ok(bytes) if bytes.contains(&0) => PreviewPayload::Lines(vec![Line::from("(binary file)")]),
         Ok(bytes) => {
@@ -156,6 +187,219 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
         }
         Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(unreadable: {e})"))]),
     }
+}
+
+fn archive_kind(path: &str) -> Option<ArchiveKind> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some(ArchiveKind::GzipTar)
+    } else if lower.ends_with(".tar") {
+        Some(ArchiveKind::Tar)
+    } else if lower.ends_with(".zip") {
+        Some(ArchiveKind::Zip)
+    } else {
+        None
+    }
+}
+
+fn archive_preview(path: &str, kind: ArchiveKind, gutter: Color) -> Vec<Line<'static>> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+        ArchiveKind::Zip => zip_listing(path),
+        ArchiveKind::Tar => tar_listing(path, false),
+        ArchiveKind::GzipTar => tar_listing(path, true),
+    }));
+    match result {
+        Ok(Ok(listing)) => archive_lines(listing, gutter),
+        Ok(Err(())) | Err(_) => vec![Line::from("(unreadable archive)")],
+    }
+}
+
+fn zip_listing(path: &str) -> Result<ArchiveListing, ()> {
+    if std::fs::metadata(path).map_err(|_| ())?.len() > MAX_ZIP_BYTES {
+        return Err(());
+    }
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|_| ())?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(());
+    }
+
+    let mut entries = Vec::with_capacity(archive.len().min(ARCHIVE_PREVIEW_ENTRIES));
+    let mut total_size = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|_| ())?;
+        total_size = total_size.checked_add(entry.size()).ok_or(())?;
+        if entries.len() < ARCHIVE_PREVIEW_ENTRIES {
+            entries.push(ArchiveEntry {
+                name: entry.name().to_owned(),
+                size: entry.size(),
+                is_dir: entry.is_dir(),
+            });
+        }
+    }
+    Ok(ArchiveListing {
+        entries,
+        total_entries: archive.len(),
+        total_size,
+        capped: false,
+    })
+}
+
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+    capped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R> LimitedReader<R> {
+    fn new(inner: R, limit: u64, capped: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            capped,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            self.capped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(std::io::Error::other("archive read limit exceeded"));
+        }
+        let len = (buf.len() as u64).min(self.remaining) as usize;
+        let read = self.inner.read(&mut buf[..len])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+fn tar_listing(path: &str, gzip: bool) -> Result<ArchiveListing, ()> {
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let capped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if gzip {
+        let compressed = LimitedReader::new(file, MAX_TAR_INPUT_BYTES, capped.clone());
+        let decoded = flate2::read::MultiGzDecoder::new(compressed);
+        read_tar_entries(
+            LimitedReader::new(decoded, MAX_TAR_INPUT_BYTES, capped.clone()),
+            capped,
+        )
+    } else {
+        read_tar_entries(
+            LimitedReader::new(file, MAX_TAR_INPUT_BYTES, capped.clone()),
+            capped,
+        )
+    }
+}
+
+fn read_tar_entries<R: std::io::Read>(
+    reader: R,
+    capped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ArchiveListing, ()> {
+    let mut archive = tar::Archive::new(reader);
+    let (entries, total_entries, total_size, mut was_capped) = {
+        let mut entries = Vec::with_capacity(ARCHIVE_PREVIEW_ENTRIES);
+        let mut total_entries = 0;
+        let mut total_size = 0_u64;
+        let mut was_capped = false;
+        let mut archive_entries = archive.entries().map_err(|_| ())?;
+
+        loop {
+            match archive_entries.next() {
+                Some(Ok(entry)) => {
+                    total_entries += 1;
+                    let size = entry.header().size().map_err(|_| ())?;
+                    total_size = total_size.checked_add(size).ok_or(())?;
+                    if entries.len() < ARCHIVE_PREVIEW_ENTRIES {
+                        let is_dir = entry.header().entry_type().is_dir();
+                        let name = entry.path().map_err(|_| ())?.to_string_lossy().into_owned();
+                        entries.push(ArchiveEntry { name, size, is_dir });
+                    }
+                    if total_entries >= MAX_TAR_ENTRIES {
+                        match archive_entries.next() {
+                            Some(Ok(_)) => {
+                                capped.store(true, std::sync::atomic::Ordering::Relaxed);
+                                was_capped = true;
+                                break;
+                            }
+                            Some(Err(_)) if capped.load(std::sync::atomic::Ordering::Relaxed) => {
+                                was_capped = true;
+                                break;
+                            }
+                            Some(Err(_)) => return Err(()),
+                            None => {}
+                        }
+                    }
+                }
+                Some(Err(_)) if capped.load(std::sync::atomic::Ordering::Relaxed) => {
+                    was_capped = true;
+                    break;
+                }
+                Some(Err(_)) => return Err(()),
+                None => break,
+            }
+        }
+        (entries, total_entries, total_size, was_capped)
+    };
+    let mut reader = archive.into_inner();
+    if std::io::copy(&mut reader, &mut std::io::sink()).is_err()
+        && !capped.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(());
+    }
+    was_capped |= capped.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(ArchiveListing {
+        entries,
+        total_entries,
+        total_size,
+        capped: was_capped,
+    })
+}
+
+fn archive_lines(listing: ArchiveListing, gutter: Color) -> Vec<Line<'static>> {
+    let count = if listing.capped {
+        format!("at least {}", listing.total_entries)
+    } else {
+        listing.total_entries.to_string()
+    };
+    let total = if listing.capped {
+        format!("at least {}", human_size(listing.total_size))
+    } else {
+        human_size(listing.total_size)
+    };
+    let mut lines = Vec::with_capacity(listing.entries.len() + 2);
+    let accent = Style::default().fg(gutter);
+    lines.push(Line::from(Span::styled(
+        format!("archive · {count} entries · {total} total"),
+        accent.add_modifier(Modifier::BOLD),
+    )));
+    for entry in listing.entries {
+        let name = if entry.is_dir && !entry.name.ends_with('/') {
+            format!("{}/", entry.name)
+        } else {
+            entry.name
+        };
+        lines.push(Line::from(vec![
+            Span::raw(name),
+            Span::styled(format!(" · {}", human_size(entry.size)), accent),
+        ]));
+    }
+    let omitted = listing
+        .total_entries
+        .saturating_sub(ARCHIVE_PREVIEW_ENTRIES);
+    if omitted > 0 {
+        let more = if listing.capped {
+            format!("at least {omitted}")
+        } else {
+            omitted.to_string()
+        };
+        lines.push(Line::from(format!("… and {more} more")));
+    }
+    lines
 }
 
 /// Reads at most PREVIEW_BYTES (plus a one-byte truncation sentinel) from
@@ -363,6 +607,31 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
+    fn preview_text(payload: PreviewPayload) -> Vec<String> {
+        let PreviewPayload::Lines(lines) = payload else {
+            panic!("archive preview should be text");
+        };
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn request(path: &std::path::Path) -> PreviewRequest {
+        PreviewRequest {
+            generation: 0,
+            path: path.to_string_lossy().into_owned(),
+            line_number: None,
+            appearance: Appearance::Dark,
+            gutter: Color::Gray,
+        }
+    }
+
     #[test]
     fn office_text_is_available_to_preview() {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
@@ -391,6 +660,105 @@ mod tests {
                 .flat_map(|line| line.spans.iter())
                 .any(|span| span.content.contains("Preview Needle"))
         );
+    }
+
+    #[test]
+    fn zip_archive_preview_lists_entries_and_total() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        zip.add_directory("docs/", SimpleFileOptions::default())
+            .unwrap();
+        zip.start_file("docs/readme.md", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"hello").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.zip");
+        std::fs::write(&path, zip.finish().unwrap().into_inner()).unwrap();
+
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert_eq!(lines[0], "archive · 2 entries · 5 B total");
+        assert_eq!(lines[1], "docs/ · 0 B");
+        assert_eq!(lines[2], "docs/readme.md · 5 B");
+    }
+
+    #[test]
+    fn zip_archive_preview_truncates_after_200_entries() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..205 {
+            zip.start_file(format!("file-{index}.txt"), SimpleFileOptions::default())
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.zip");
+        std::fs::write(&path, zip.finish().unwrap().into_inner()).unwrap();
+
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert_eq!(lines.len(), 202);
+        assert_eq!(lines[0], "archive · 205 entries · 0 B total");
+        assert_eq!(lines[1], "file-0.txt · 0 B");
+        assert_eq!(lines[200], "file-199.txt · 0 B");
+        assert_eq!(lines[201], "… and 5 more");
+    }
+
+    #[test]
+    fn gzip_tar_archive_preview_lists_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.tar.gz");
+        let file = std::fs::File::create(&path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_size(0);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, "docs", Cursor::new(Vec::<u8>::new()))
+            .unwrap();
+
+        let mut readme = tar::Header::new_gnu();
+        readme.set_size(5);
+        readme.set_cksum();
+        builder
+            .append_data(&mut readme, "docs/readme.md", Cursor::new(b"hello"))
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert_eq!(lines[0], "archive · 2 entries · 5 B total");
+        assert_eq!(lines[1], "docs/ · 0 B");
+        assert_eq!(lines[2], "docs/readme.md · 5 B");
+    }
+
+    #[test]
+    fn tar_archive_preview_lists_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.tar");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut entry = tar::Header::new_gnu();
+        entry.set_size(5);
+        entry.set_cksum();
+        builder
+            .append_data(&mut entry, "readme.txt", Cursor::new(b"hello"))
+            .unwrap();
+        builder.finish().unwrap();
+
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert_eq!(
+            lines,
+            ["archive · 1 entries · 5 B total", "readme.txt · 5 B"]
+        );
+    }
+
+    #[test]
+    fn corrupt_archive_preview_is_friendly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.tgz");
+        std::fs::write(&path, b"not an archive").unwrap();
+
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert_eq!(lines, ["(unreadable archive)"]);
     }
 
     #[test]
