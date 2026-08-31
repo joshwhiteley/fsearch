@@ -73,6 +73,24 @@ fn passes(store: &PathStore, i: usize, filters: &Filters) -> bool {
     filters.matches(store.get(i)) && filters.matches_meta(&store.meta(i))
 }
 
+/// Fuzzy filename searches may surface directories, while every other mode
+/// keeps the filter's default file-only behavior. Extension filters still
+/// exclude directories, and metadata/path filters apply to them normally.
+fn passes_fuzzy(store: &PathStore, i: usize, filters: &Filters) -> bool {
+    if passes(store, i, filters) {
+        return true;
+    }
+    let path = store.get(i);
+    path.ends_with('/')
+        && !filters.dirs_only
+        && filters.exts.is_empty()
+        && filters
+            .path_terms
+            .iter()
+            .all(|term| crate::filters::contains_ignore_ascii_case(path, term))
+        && filters.matches_meta(&store.meta(i))
+}
+
 /// First `limit` entries (already newest-first), with boosted paths —
 /// wherever they sit in the full list — floated to the front.
 fn head_with_boosts(
@@ -169,6 +187,22 @@ const CHUNK: usize = 16_384;
 /// "best / 2" tail trim never empties the list of an only-match.
 const MIN_KEEP: usize = 8;
 
+fn last_segment(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// Returns the final two path components without a leading separator.
+fn last_two_segments(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
+    let last_separator = path.rfind('/')?;
+    let parent = &path[..last_separator];
+    let pair_start = parent.rfind('/').map_or(0, |separator| separator + 1);
+    Some(&path[pair_start..])
+}
+
 fn fuzzy(
     store: &PathStore,
     query: &str,
@@ -178,6 +212,7 @@ fn fuzzy(
     demote: Option<&Quiet>,
 ) -> Ranked {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let multi_word = query.split_whitespace().count() > 1;
     let mut scored: Vec<(u32, usize)> = (0..store.len())
         .into_par_iter()
         .with_min_len(CHUNK)
@@ -188,23 +223,42 @@ fn fuzzy(
                 (Matcher::new(cfg), Vec::new(), Vec::new())
             },
             |(mut matcher, mut buf, mut acc), i| {
-                if passes(store, i, filters) {
+                if passes_fuzzy(store, i, filters) {
                     let path = store.get(i);
+                    let is_dir = path.ends_with('/');
                     if let Some(score) = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)
                     {
+                        // A directory is useful only when its own name matches,
+                        // rather than merely inheriting a match from an ancestor.
+                        // Path-intent and dir: queries retain full-path matching.
+                        let name = last_segment(path);
+                        let name_score = pattern.score(Utf32Str::new(name, &mut buf), &mut matcher);
+                        if is_dir
+                            && !filters.dirs_only
+                            && filters.path_terms.is_empty()
+                            && !query.contains('/')
+                            && name_score.is_none()
+                        {
+                            return (matcher, buf, acc);
+                        }
                         // a query that also matches within the filename alone is far more
                         // likely what the user meant than letters scattered across the path;
                         // adding the basename score roughly doubles such results
-                        let name = path
-                            .trim_end_matches('/')
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(path);
-                        let fname_bonus = pattern
-                            .score(Utf32Str::new(name, &mut buf), &mut matcher)
-                            .unwrap_or(0);
+                        let fname_bonus = name_score.unwrap_or(0);
+                        // Multi-word queries can express intent split across a project
+                        // directory and its file name. Keep this bonus below the filename
+                        // bonus so single-component filename ranking stays unchanged.
+                        let pair_bonus = if multi_word && !is_dir {
+                            last_two_segments(path)
+                                .and_then(|pair| {
+                                    pattern.score(Utf32Str::new(pair, &mut buf), &mut matcher)
+                                })
+                                .map_or(0, |pair_score| pair_score / 2)
+                        } else {
+                            0
+                        };
                         let boost = boosts.get(path).copied().unwrap_or(0);
-                        let mut total = score + fname_bonus + boost;
+                        let mut total = score + fname_bonus + pair_bonus + boost;
                         // quiet paths score at 2/5: even with a filename
                         // match they land under the best/2 floor whenever a
                         // non-quiet candidate exists, i.e. behind the fold
@@ -605,6 +659,63 @@ mod tests {
         let p = paths(&["/passport/archive/list.txt", "/misc/passport.pdf"]);
         let r = search(&p, "passport", FilenameMode::Fuzzy, 10).unwrap();
         assert_eq!(r.indices[0], 1);
+    }
+
+    #[test]
+    fn project_queries_rank_directories_and_files_inside_them() {
+        let p = paths(&[
+            "/Users/j/Documents/sage-kc/",
+            "/Users/j/Documents/sage-kc/README.md",
+            "/Users/j/Documents/sage-kc/src/main.rs",
+            "/Users/j/Documents/Sage Kc.md",
+            "/Users/j/Documents/staging/keep/cache.txt",
+        ]);
+        let r = search(&p, "sage kc", FilenameMode::Fuzzy, 10).unwrap();
+        let directory = r.indices.iter().position(|&i| i == 0).unwrap();
+        assert!(directory < 3, "project directory ranked at {directory}");
+
+        let noise = r.indices.iter().position(|&i| i == 4).unwrap();
+        let inside = r.indices.iter().position(|&i| i == 1 || i == 2).unwrap();
+        assert!(inside < noise, "project file ranked above noise");
+    }
+
+    #[test]
+    fn fuzzy_directories_need_a_last_segment_match() {
+        let p = paths(&[
+            "/Users/j/Documents/sage-kc/",
+            "/Users/j/Documents/sage-kc/archive/",
+            "/Users/j/Documents/noise.txt",
+        ]);
+        let r = search(&p, "sage kc", FilenameMode::Fuzzy, 10).unwrap();
+        assert!(r.indices.contains(&0));
+        assert!(
+            !r.indices.contains(&1),
+            "nested directory matched only through its parent"
+        );
+    }
+
+    #[test]
+    fn path_intent_can_find_a_nested_directory() {
+        let p = paths(&["/Users/j/Documents/sage-kc/archive/"]);
+        let (filters, query) = crate::filters::parse("path:sage-kc archive", 0);
+        let r = search_boosted(
+            &p,
+            &query,
+            FilenameMode::Fuzzy,
+            10,
+            &HashMap::new(),
+            &filters,
+            &Quiet::new(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(r.indices, vec![0]);
+    }
+
+    #[test]
+    fn single_word_queries_keep_filename_ordering() {
+        let p = paths(&["/sage-kc/readme.txt", "/misc/readme.txt"]);
+        let r = search(&p, "readme", FilenameMode::Fuzzy, 10).unwrap();
+        assert_eq!(r.indices, vec![0, 1]);
     }
 
     #[test]
