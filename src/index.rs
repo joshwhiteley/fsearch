@@ -26,9 +26,11 @@ impl PathStore {
         }
     }
 
+    /// Panics if the combined path bytes exceed the u32 arena size limit.
     pub fn from_entries(entries: &[(String, FileMeta)]) -> PathStore {
-        let total: usize = entries.iter().map(|(p, _)| p.len()).sum();
-        let mut arena = Vec::with_capacity(total);
+        let total = checked_arena_size(entries.iter().map(|(p, _)| p.len()))
+            .expect("path arena exceeds u32 size limit");
+        let mut arena = Vec::with_capacity(total as usize);
         let mut spans = Vec::with_capacity(entries.len());
         let mut metas = Vec::with_capacity(entries.len());
         for (p, m) in entries {
@@ -53,7 +55,7 @@ impl PathStore {
 
     pub fn get(&self, i: usize) -> &str {
         let (off, len) = self.spans[i];
-        // the arena is validated as UTF-8 when constructed/loaded
+        // Construction/loading validates UTF-8 and every span boundary.
         unsafe { std::str::from_utf8_unchecked(&self.arena[off as usize..(off + len) as usize]) }
     }
 
@@ -64,6 +66,23 @@ impl PathStore {
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         (0..self.len()).map(|i| self.get(i))
     }
+}
+
+// Check both individual path lengths and their cumulative size before any
+// narrowing casts or allocations. Kept separate so limits can be tested without
+// allocating a multi-gigabyte arena.
+fn checked_arena_size(lengths: impl IntoIterator<Item = usize>) -> std::io::Result<u32> {
+    lengths.into_iter().try_fold(0u32, |total, len| {
+        u32::try_from(len)
+            .ok()
+            .and_then(|len| total.checked_add(len))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path arena exceeds u32 size limit",
+                )
+            })
+    })
 }
 
 pub fn default_cache_path() -> PathBuf {
@@ -87,6 +106,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 /// v3 layout: magic, version, count, then three contiguous tables —
 /// lengths (u32), metadata (i64 mtime + u64 size), and the path arena.
 pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> {
+    checked_arena_size(entries.iter().map(|(p, _)| p.len()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -122,7 +142,7 @@ pub fn load(path: &Path) -> Option<PathStore> {
     if u32::from_le_bytes(header[8..12].try_into().ok()?) != VERSION {
         return None;
     }
-    let count = u64::from_le_bytes(header[12..20].try_into().ok()?) as usize;
+    let count = usize::try_from(u64::from_le_bytes(header[12..20].try_into().ok()?)).ok()?;
     let lens_at = 20usize;
     let metas_at = lens_at.checked_add(count.checked_mul(4)?)?;
     let arena_at = metas_at.checked_add(count.checked_mul(16)?)?;
@@ -131,6 +151,9 @@ pub fn load(path: &Path) -> Option<PathStore> {
     let lens = data.get(lens_at..metas_at)?;
     let meta_bytes = data.get(metas_at..arena_at)?;
     let arena = data.get(arena_at..)?;
+    // A globally valid arena can still contain spans that split a codepoint.
+    // Validate UTF-8 once, then check each cumulative boundary below.
+    let arena_text = std::str::from_utf8(arena).ok()?;
 
     let mut spans = Vec::with_capacity(count);
     let mut offset: u32 = 0;
@@ -138,6 +161,9 @@ pub fn load(path: &Path) -> Option<PathStore> {
         let len = u32::from_le_bytes(chunk.try_into().ok()?);
         spans.push((offset, len));
         offset = offset.checked_add(len)?;
+        if !arena_text.is_char_boundary(offset as usize) {
+            return None;
+        }
     }
     if arena.len() != offset as usize {
         return None; // truncated or padded
@@ -150,8 +176,6 @@ pub fn load(path: &Path) -> Option<PathStore> {
             size: u64::from_le_bytes(<[u8; 8]>::try_from(&chunk[8..]).ok()?),
         });
     }
-    // one linear validation pass; from then on gets are zero-cost
-    std::str::from_utf8(arena).ok()?;
     Some(PathStore {
         arena: arena.to_vec().into_boxed_slice(),
         spans,
@@ -185,6 +209,80 @@ mod tests {
         assert_eq!(store.meta(0), meta(1000, 42));
         assert_eq!(store.meta(1), meta(2000, 7));
         assert_eq!(store.iter().count(), 3);
+    }
+
+    #[test]
+    fn from_entries_preserves_unicode_and_empty_paths() {
+        let entries = vec![
+            (String::new(), meta(0, 0)),
+            ("é/日本/🦀".to_string(), meta(1, 2)),
+            (String::new(), meta(3, 4)),
+            ("résumé".to_string(), meta(5, 6)),
+        ];
+        let store = PathStore::from_entries(&entries);
+        for (i, (path, metadata)) in entries.iter().enumerate() {
+            assert_eq!(store.get(i), path);
+            assert_eq!(store.meta(i), *metadata);
+        }
+        assert!(PathStore::from_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn arena_size_checks_individual_and_cumulative_limits() {
+        let max = u32::MAX as usize;
+        assert_eq!(checked_arena_size([]).unwrap(), 0);
+        assert_eq!(checked_arena_size([max]).unwrap(), u32::MAX);
+        assert_eq!(checked_arena_size([max - 1, 1, 0]).unwrap(), u32::MAX);
+        assert_eq!(
+            checked_arena_size([max, 1]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        if let Some(too_large) = max.checked_add(1) {
+            assert_eq!(
+                checked_arena_size([too_large]).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(checked_arena_size([usize::MAX, 1]).is_err());
+    }
+
+    #[test]
+    fn valid_utf8_arena_with_split_codepoints_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        for character in ["é", "日", "🦀"] {
+            save(
+                &[
+                    (character.to_string(), meta(1, 1)),
+                    (String::new(), meta(2, 2)),
+                ],
+                &file,
+            )
+            .unwrap();
+            let original = std::fs::read(&file).unwrap();
+            assert!(std::str::from_utf8(&original[60..]).is_ok());
+            for split in 1..character.len() {
+                let mut bytes = original.clone();
+                bytes[20..24].copy_from_slice(&(split as u32).to_le_bytes());
+                bytes[24..28].copy_from_slice(&((character.len() - split) as u32).to_le_bytes());
+                std::fs::write(&file, bytes).unwrap();
+                assert!(load(&file).is_none(), "{character} split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn span_lengths_outside_arena_are_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.bin");
+        save(&[("ab".to_string(), meta(1, 1))], &file).unwrap();
+        let original = std::fs::read(&file).unwrap();
+        for len in [0u32, 1, 3, u32::MAX] {
+            let mut bytes = original.clone();
+            bytes[20..24].copy_from_slice(&len.to_le_bytes());
+            std::fs::write(&file, bytes).unwrap();
+            assert!(load(&file).is_none());
+        }
     }
 
     #[test]

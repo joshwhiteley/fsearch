@@ -63,8 +63,11 @@ pub fn is_known_kind(kind: &str) -> bool {
 
 /// "7d", "12h", "30m", "2w" → seconds.
 fn parse_duration_secs(s: &str) -> Option<i64> {
-    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let (num, unit) = s.split_at_checked(s.len().checked_sub(1)?)?;
     let n: i64 = num.parse().ok()?;
+    if n < 0 {
+        return None;
+    }
     let mult = match unit {
         "m" => 60,
         "h" => 3600,
@@ -90,7 +93,9 @@ fn parse_size_bytes(s: &str) -> Option<u64> {
         (lower.as_str(), 1f64)
     };
     let v: f64 = num.parse().ok()?;
-    (v >= 0.0).then_some((v * mult) as u64)
+    let bytes = v * mult;
+    // u64::MAX rounds up to 2^64 as f64, so the upper bound is exclusive.
+    (bytes.is_finite() && bytes >= 0.0 && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 impl Filters {
@@ -155,11 +160,19 @@ pub fn contains_ignore_ascii_case(hay: &str, needle: &str) -> bool {
 }
 
 /// Splits filter tokens out of a query; returns the filters and the
-/// remaining pattern text. `now` (unix seconds) anchors relative dates.
+/// remaining pattern text. Whitespace is preserved except around removed
+/// filter tokens; separated pattern fragments are joined with one space.
+/// `now` (unix seconds) anchors relative dates.
 pub fn parse(query: &str, now: i64) -> (Filters, String) {
     let mut filters = Filters::default();
-    let mut rest: Vec<&str> = Vec::new();
+    let mut rest = String::with_capacity(query.len());
+    let mut cursor = 0;
+    let mut removed_previous = false;
     for token in query.split_whitespace() {
+        let gap_start = cursor;
+        let start = cursor + query[cursor..].find(token).unwrap();
+        cursor = start + token.len();
+        let mut removed = true;
         if let Some(ext) = token.strip_prefix("ext:") {
             let ext = ext.trim_start_matches('.');
             if !ext.is_empty() {
@@ -176,30 +189,42 @@ pub fn parse(query: &str, now: i64) -> (Filters, String) {
             {
                 filters.exts.extend(exts.iter().map(|e| e.to_string()));
             } else {
-                rest.push(token); // unknown kind: leave it visible in the query
+                removed = false; // unknown kind: leave it visible in the query
             }
         } else if let Some(dur) = token.strip_prefix("changed:") {
-            match parse_duration_secs(dur) {
-                Some(secs) => filters.changed_after = Some(now - secs),
-                None => rest.push(token),
+            match parse_duration_secs(dur).and_then(|secs| now.checked_sub(secs)) {
+                Some(after) => filters.changed_after = Some(after),
+                None => removed = false,
             }
         } else if let Some(sz) = token.strip_prefix("larger:") {
             match parse_size_bytes(sz) {
                 Some(b) => filters.min_size = Some(b),
-                None => rest.push(token),
+                None => removed = false,
             }
         } else if let Some(sz) = token.strip_prefix("smaller:") {
             match parse_size_bytes(sz) {
                 Some(b) => filters.max_size = Some(b),
-                None => rest.push(token),
+                None => removed = false,
             }
         } else if token == "dir:" {
             filters.dirs_only = true;
         } else {
-            rest.push(token);
+            removed = false;
         }
+        if !removed {
+            if !removed_previous {
+                rest.push_str(&query[gap_start..start]);
+            } else if !rest.is_empty() {
+                rest.push(' ');
+            }
+            rest.push_str(token);
+        }
+        removed_previous = removed;
     }
-    (filters, rest.join(" "))
+    if !removed_previous {
+        rest.push_str(&query[cursor..]);
+    }
+    (filters, rest)
 }
 
 #[cfg(test)]
@@ -211,6 +236,104 @@ mod tests {
         let (f, rest) = parse("meeting notes", 0);
         assert!(f.is_empty());
         assert_eq!(rest, "meeting notes");
+    }
+
+    #[test]
+    fn untouched_pattern_whitespace_is_preserved() {
+        for query in [
+            "",
+            " \t\n",
+            "  meeting  notes\t2026 ",
+            "é\u{2003}日\n🦀",
+            "  changed:é\t kind:unknown  larger:NaN ",
+        ] {
+            let (filters, rest) = parse(query, 0);
+            assert!(filters.is_empty());
+            assert_eq!(rest, query);
+        }
+        for (query, expected) in [
+            ("ext:pdf  meeting  notes\t2026 ", "meeting  notes\t2026 "),
+            ("  meeting  notes\text:pdf", "  meeting  notes"),
+            ("a\tb  ext:pdf path:docs\nc  d", "a\tb c  d"),
+            ("ext:pdf\u{2003}é\u{2003}日\t", "é\u{2003}日\t"),
+            (" ext:pdf\tpath:docs ", ""),
+        ] {
+            let (filters, rest) = parse(query, 0);
+            assert!(!filters.is_empty());
+            assert_eq!(rest, expected, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_durations_remain_in_pattern() {
+        for duration in [
+            "",
+            "é",
+            "1é",
+            "🦀",
+            "-1d",
+            "soon",
+            "1",
+            "1.5h",
+            "9223372036854775808m",
+            "9223372036854775807w",
+        ] {
+            assert_eq!(parse_duration_secs(duration), None, "{duration}");
+            let query = format!("changed:{duration}");
+            let (filters, rest) = parse(&query, 0);
+            assert!(filters.is_empty(), "{query}");
+            assert_eq!(rest, query);
+        }
+        let (filters, rest) = parse("changed:1m", i64::MIN);
+        assert!(filters.is_empty());
+        assert_eq!(rest, "changed:1m");
+        assert_eq!(parse_duration_secs("0m"), Some(0));
+        assert_eq!(parse_duration_secs("12h"), Some(43_200));
+        assert_eq!(
+            parse("changed:0m", i64::MIN).0.changed_after,
+            Some(i64::MIN)
+        );
+        let max_minutes = i64::MAX / 60;
+        assert_eq!(
+            parse_duration_secs(&format!("{max_minutes}m")),
+            Some(max_minutes * 60)
+        );
+        assert_eq!(parse_duration_secs(&format!("{}m", max_minutes + 1)), None);
+    }
+
+    #[test]
+    fn invalid_sizes_remain_in_pattern() {
+        for size in [
+            "",
+            "-1b",
+            "NaN",
+            "NaNgb",
+            "inf",
+            "infinitymb",
+            "-inf",
+            "1e309",
+            "1e308gb",
+            "18446744073709551616b",
+            "18446744074gb",
+        ] {
+            assert_eq!(parse_size_bytes(size), None, "{size}");
+            for prefix in ["larger:", "smaller:"] {
+                let query = format!("{prefix}{size}");
+                let (filters, rest) = parse(&query, 0);
+                assert!(filters.is_empty(), "{query}");
+                assert_eq!(rest, query);
+            }
+        }
+        for (size, bytes) in [
+            ("0b", 0),
+            ("512", 512),
+            ("1.5GB", 1_500_000_000),
+            ("0.5kb", 500),
+            ("1.9b", 1),
+            ("18446744073709549568b", 18_446_744_073_709_549_568),
+        ] {
+            assert_eq!(parse_size_bytes(size), Some(bytes), "{size}");
+        }
     }
 
     #[test]
