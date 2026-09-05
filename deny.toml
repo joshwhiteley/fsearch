@@ -1,4 +1,4 @@
-# cargo-deny configuration (CI runs `cargo deny check advisories sources`).
+# cargo-deny configuration (CI runs `cargo deny --all-features check advisories sources`).
 # Only unmaintained transitive crates are ignored; real vulnerabilities must
 # be fixed, not listed here.
 
@@ -10,8 +10,8 @@ id = "RUSTSEC-2025-0141" # bincode: unmaintained, transitive via syntect
 reason = "Unmaintained but not vulnerable; waiting on syntect to drop it."
 
 [[advisories.ignore]]
-id = "RUSTSEC-2024-0436" # paste: unmaintained, transitive
-reason = "Unmaintained but not vulnerable; no vulnerability signal."
+id = "RUSTSEC-2024-0436" # paste: unmaintained, via tokenizers/fastembed (semantic)
+reason = "Unmaintained but not vulnerable; tokenizers still uses paste in the optional semantic dependency graph."
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0192" # ttf-parser: unmaintained, transitive via lopdf

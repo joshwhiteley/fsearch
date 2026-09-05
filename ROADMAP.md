@@ -1,5 +1,29 @@
 # Roadmap
 
+Implemented for the next release:
+
+- Snapshot health diagnostics (`--status`), typed NDJSON (`--json`) and
+  NUL-delimited input/output (`--read0`, `--print0`)
+- CLI named queries/scopes (`[searches]`, `--saved`, `--searches`)
+- Separate history/layout controls, `--no-history`, private cache/state
+  permissions, and explicit cache/history cleanup
+- Foreground Neovim and matched-line custom actions; responsive transfer
+  progress/cancellation and no-replace moves/copies
+- Watcher access-event suppression, rescan/error recovery, sorted unique
+  snapshots, empty-query debounce cancellation, and semantic filtering
+  before truncation
+- Fresh discovery for semantic refresh, safe explicit ONNX Runtime loading,
+  and exact Rust 1.90.0 checks for default and semantic builds
+
+Shipped in v0.10.0:
+
+- Unified filename/semantic ranking, configurable with `unified = false`
+- Custom argv actions and detected GUI-editor defaults
+- Marked-file move/copy with a destination picker
+- Bounded ZIP/TAR/TAR.GZ/TGZ content listings in previews
+- Project-directory matches and path-segment ranking bonuses
+- `forge` theme; marking on `ctrl-s` / `alt-s`
+
 Shipped in v0.9.0:
 
 - DOCX/XLSX content search, semantic indexing, and previews
@@ -51,7 +75,8 @@ Shipped in v0.2.0:
   with halfblock fallback
 - Match-character highlighting in results
 - Frecency: files you open rank higher
-- Live index updates from filesystem events (no staleness between launches)
+- Live index updates from filesystem events (cached snapshots can still be
+  stale; explicit reindexing remains available)
 - `-p` print mode for scripting
 - Linux support (xdg-open, wl-copy/xclip)
 - CI, multi-platform release builds, shell installer

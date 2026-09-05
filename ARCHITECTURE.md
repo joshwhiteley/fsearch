@@ -21,9 +21,11 @@ no daemon.
 
 ```
 src/
-  main.rs      CLI entry: dispatch flags, filter mode, --reindex, -p
+  main.rs      CLI dispatch, bounded stdin, saved scopes, semantic refresh
   cli.rs       argv parsing + help text (pure, no I/O)
-  config.rs    config.toml: roots, excludes, theme, keymap, quiet, caps
+  output.rs    text / NDJSON / NUL result and selection records
+  health.rs    snapshot diagnostics and narrowly scoped cleanup
+  config.rs    config.toml: roots, excludes, actions, saved searches, UI options
   walker.rs    parallel walk (ignore crate), excludes, .app bundles, mtimes
   index.rs     versioned binary cache of the path list
   matcher.rs   filename matching: nucleo fuzzy/regex, ranking, quiet demotion
@@ -37,12 +39,12 @@ src/
   pdf.rs       PDF text extraction (cached, panic-guarded)
   office.rs    docx/xlsx text extraction (cached)
   engine.rs    orchestration: threads, generations, debounce, result state
-  query.rs     headless one-shot search shared by -p / --big script mode
+  query.rs     headless filename/content/semantic search for -p
   highlight.rs syntax highlighting (syntect + two-face)
   images.rs    image decoding (image crate + resvg)
   theme.rs     UI color presets + tokens
-  actions.rs   open / reveal / copy / trash
-  util.rs      tiny shared helpers (human sizes, unix time)
+  actions.rs   open/reveal/trash, custom argv expansion, safe file transfers
+  util.rs      private directory/file creation, human sizes, unix time
   tui/
     mod.rs     App state, event loop, terminal probe
     rows.rs    result row rendering
@@ -80,18 +82,41 @@ redundant searches.
 
 **The watcher is armed before the walk.** Filesystem events (FSEvents /
 inotify via the notify crate) start buffering *before* the initial walk
-begins, then fold into fresh snapshots afterwards — changed files
-front-insert (they're the newest), deletions filter out, and re-statting
-each touched path makes replayed events idempotent. Without this ordering
-there's an unfixable race between "walk finished" and "stream started".
+begins, then fold into fresh snapshots afterwards. Access events are ignored
+so reading previews does not trigger another walk. Changed paths are
+re-statted; replaced and deleted subtrees are pruned. Overlapping events
+and roots are coalesced, paths are deduplicated, and snapshots are sorted
+by actual mtime with path-order ties. A copied old file is not necessarily
+the newest file.
+
+Rescan flags and watcher errors rebuild configured roots with the same
+excludes and app policy as startup. Watcher and save errors remain visible
+across successful queries. This reduces missed-update windows; it is not a
+freshness guarantee. Headless searches use the cached path snapshot when
+available. `--reindex` explicitly refreshes it.
 
 **Frecency lives beside the index, not in it.** Opens append to a small
 history file; at search time they become per-path score boosts.
+`remember_history = false` bypasses both history loading and recording.
+Layout persistence is controlled separately by `remember_session`.
 
 **Semantic vectors are f16 and memory-mapped.** Loads parse document metadata
 but map the vector tail read-only. Legacy f32 stores migrate without
 re-embedding. Embedding calls are capped at 64 chunks, and very large
-documents are sampled across at most 256 chunks.
+documents are sampled across at most 256 chunks. `SemStore::query_filtered`
+checks document predicates before scoring and truncation; `query` remains
+an unfiltered wrapper. Interactive and headless semantic queries use the
+filtered API, so restrictive filters do not depend on fixed over-fetching.
+
+Normal `--index-semantic` runs walk roots and refresh path metadata before
+reuse decisions. Additional source timestamp checks catch edits newer than
+the previous semantic store, including same-second changes. Reuse still
+relies on metadata rather than content hashes. Legacy migration is a
+separate first invocation: it converts vectors without loading the model,
+then exits. A subsequent invocation refreshes documents. The semantic
+worker notices store replacements on later queries, but the path watcher
+does not rebuild embeddings. ONNX Runtime is selected with safe explicit
+`ort::init_from` calls, not a runtime environment mutation.
 
 **The terminal is probed once, before raw mode.** Background color (for
 light/dark preview themes) and the graphics protocol (Kitty/iTerm2/halfblock
@@ -110,10 +135,14 @@ Engine ──── job_tx ────▶ search worker (latest job wins) ─�
   │                                                                     ▲
   ├─ indexer thread: load cache → publish → walk roots → publish fresh ─┤
   │     └─ then folds fs events (notify) into new snapshots, forever    │
-  └─ content thread (per query, debounced 300 ms, cancel flag) ────────┘
+  ├─ content thread (per query, debounced 300 ms, cancel flag) ────────┤
+  └─ semantic worker (lazy model, debounced queries, store reload) ────┘
 ```
 
-All communication is `std::sync::mpsc`; the UI never blocks on a search.
+Communication uses `std::sync::mpsc`; the UI does not wait for search
+workers. Empty content and semantic queries clear pending debounce jobs.
+File transfers use a separate UI-owned worker with progress and cancellation
+between files. Foreground Neovim intentionally suspends the TUI until exit.
 
 ## Search behavior
 
@@ -121,7 +150,12 @@ All communication is `std::sync::mpsc`; the UI never blocks on a search.
   parallel, plus a basename re-score so filename matches dominate, a
   best/2 floor that folds scattered-letter junk behind "weaker matches",
   and a quiet-path penalty that sinks `~/Library/`-style churn below the
-  fold (path-intent queries skip the penalty).
+  fold (path-intent queries skip the penalty). Project directories can
+  match their own names; a final-two-segment bonus helps files inside matching
+  projects. When a semantic store exists, bare fuzzy queries also request
+  semantic results and merge them using reciprocal rank fusion. Filename
+  metadata is retained for shared paths, with semantic context added.
+  `unified = false` disables blending.
 - **Regex** (`ctrl-r`): the regex crate against full paths, smart-case,
   recency order.
 - **Content** (`> pattern`): ripgrep's engine, binary/oversize-skipped,
@@ -130,10 +164,13 @@ All communication is `std::sync::mpsc`; the UI never blocks on a search.
   scored in parallel from a read-only mmap; unchanged files reuse vectors.
 - **Calc** (`= expr`): evaluated synchronously; enter copies the result.
 - **Apps**: .app bundles are indexed and launch via `open` on macOS.
-- **Filter mode**: piped stdin lines run through fuzzy/regex and print the
-  pick (`--filter`).
+- **Filter mode**: piped stdin records run through fuzzy/regex and print the
+  pick (`--filter`). `matcher::search_lines` keeps arbitrary slash-ending
+  records rather than applying default filesystem-directory suppression.
+  Explicit filters still apply; `>`/`?`/`=` are ordinary input text.
 - **Filters** (`ext:`, `path:`, `dir:`, `kind:`, `changed:`, `larger:`):
-  parsed from any query and applied in every mode.
+  parsed from search queries and applied in filename, content and semantic
+  modes. Calculator expressions bypass filter parsing.
 
 ## Previews
 
@@ -141,7 +178,68 @@ Text files are syntax-highlighted (syntect + two-face, dark/light by
 terminal background). PDFs, docx and xlsx show extracted text; .app bundles
 show their directory contents. Images (PNG/JPEG/TIFF/GIF/WebP/BMP/SVG)
 render through ratatui-image's best protocol, with a halfblock fallback.
-Preview loading runs on a worker thread so large files never block the UI.
+ZIP, TAR and gzip-compressed TAR previews list bounded archive contents
+without extracting files. Preview loading runs on a worker thread. Raster previews limit each dimension
+to 16,384 pixels, total pixels to 32 Mi pixels, and decoder allocation to
+128 MiB. Parsed and displayed text is capped; failures and guarded parser
+panics become error previews instead of terminating the UI.
+
+## Actions and transfer boundaries
+
+Custom actions are argv arrays. `{path}`, `{dir}`, `{line}` and standalone
+`{paths}` expand from the original template, so placeholder-like text inside
+a filename stays literal. No shell is invoked implicitly. Optional extension
+and kind checks are shared by menu actions and Enter overrides; directory
+rows do not match. Detected GUI-editor actions are defaults only when the
+configured action list is empty. Neovim opens content/semantic hits at the
+matched line and restores the terminal on exit.
+
+Transfers operate on regular files only. They skip directories and reject
+source symlinks and special files. macOS/Linux moves first use native atomic
+no-replace rename, preserving inode identity and metadata. Only a
+cross-device error falls back to staged copy and source removal. Copies
+are written and synced to an exclusive destination-local staging file,
+then published with native atomic no-replace rename. If the destination
+filesystem does not support this publication operation, the transfer fails
+closed and leaves the source untouched.
+
+The copy path preserves data and permission bits, not timestamps, ownership,
+ACLs or extended attributes. A failed source removal leaves both copies and
+reports failure. Source paths must not be concurrently changed or replaced:
+the identity check before cross-device unlink cannot make pathname unlink
+atomic with that check. Cancellation takes effect between files.
+
+## CLI records, local state and diagnostics
+
+CLI options precede the command; the rest of `-p`/`--pick`/`--filter` is query
+text. `[searches]` supplies named queries/scopes through `--saved NAME`;
+`--searches` lists them. There is no interactive saved-search picker.
+
+`output.rs` separates records from display formatting. `--json` emits typed
+NDJSON hits/selections (`--big` emits file metadata); `--json --status` emits
+one health object. `--print0` emits a NUL-terminated path per hit, including
+content hits that share a path. It does not include line/score text.
+`--read0` selects NUL-delimited filter input. Stdin is UTF-8 only, bounded
+at 64 MiB total, 1 MiB per record and 500,000 records. Byte-limit or UTF-8
+violations fail; record-count overflow warns and truncates.
+
+Private helpers create app cache/state directories with Unix mode 0700 and
+files with mode 0600. Atomic publication uses exclusive staging files and
+fsync; history appends reject final symlinks and non-regular files. Existing
+ancestor directories are not chmod'd. This is local permission protection,
+not encryption or a guarantee against concurrently hostile path mutation.
+
+`--no-history` disables open/query history and remembered layout for a run,
+not index, model or extracted-text caches. `--clear-cache` removes known
+path/semantic indexes and extraction caches. `--clear-history` removes
+open/query history and layout. Cleanup does not delete models, configuration
+or source documents. Other running instances can recreate cleared data.
+
+`health.rs` inspects root readability and persisted cache validity, size,
+age and counts without starting an indexer, watcher, model or terminal
+probe. Extracted-cache file/byte counts inspect at most 8,192 entries per
+directory and report truncation. `--status` reports a snapshot, not live watcher health or semantic
+freshness. `--doctor` remains the terminal-probe diagnostic.
 
 ## Testing strategy
 
@@ -149,7 +247,9 @@ Preview loading runs on a worker thread so large files never block the UI.
   ranking, cache format, exclude globs, color conversion).
 - `tests/engine_test.rs` runs the real engine headlessly against temp
   directory trees — index build, filename/content/semantic search, cache
-  reuse, mtime ordering, invalid patterns.
+  reuse, mtime ordering, invalid patterns, disabled history and restrictive
+  semantic filters beyond 400 documents. Unit tests inject watcher events
+  and due debounce timestamps without relying on OS event timing.
 - `tests/cli_test.rs` executes the actual binary (`--version`, `--help`,
   `--config`, `--reindex`, `-p`) and asserts stdout/exit codes.
 - `tests/perf_test.rs` (ignored by default) asserts the 1M-path latency
@@ -157,4 +257,8 @@ Preview loading runs on a worker thread so large files never block the UI.
 - `tests/load_fuzz.rs` mutates valid index/semantic stores and feeds
   arbitrary bytes to the loaders, asserting they never panic.
 - `tests/smoke.exp` drives the real TUI in a PTY (typing, results, clean
-  exit) and runs in CI on macOS.
+  exit and `--no-history --pick` state isolation). CI runs it on macOS and
+  Linux, alongside the engine's real watcher integration.
+- CI checks the locked default and semantic builds with exactly Rust 1.90.0,
+  in addition to current-stable tests, clippy, formatting and all-feature
+  cargo-deny advisory/source checks.

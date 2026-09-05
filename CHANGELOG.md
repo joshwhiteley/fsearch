@@ -4,7 +4,49 @@
 
 - Source files gain an "open in nvim" action. fsearch temporarily leaves its
   terminal screen, runs Neovim in the foreground, then restores the same
-  search session when Neovim exits
+  search session when Neovim exits. Content/semantic hits open at their
+  matched line; custom action templates also accept `{line}` (default 1)
+- `--status` reports root readability, persisted index health and enabled
+  build features without probing the terminal or starting a watcher/model.
+  Snapshot age is not a path or semantic freshness guarantee
+- `--json` emits typed NDJSON search/selection records and structured status;
+  `--print0` emits NUL-terminated paths/selections, and `--read0` accepts
+  NUL-separated UTF-8 filter input. Options must precede the command.
+  Stdin is bounded to 64 MiB total, 1 MiB per record and 500,000 records
+- `[searches]` configures CLI named queries/scopes, selected with
+  `--saved NAME` and listed with `--searches`
+- `remember_history` controls history independently of `remember_session`.
+  `--no-history` disables history and remembered layout for one run, not
+  search or extraction caches. `--clear-cache` and `--clear-history` remove
+  known local data while keeping models, configuration and source documents;
+  close concurrent instances first to prevent recreation
+- New app-managed cache/state directories and files use private Unix modes
+  0700 and 0600. Staging files are created exclusively; history appends reject
+  final symlinks and special files
+- Watcher reads no longer trigger reindexing. Rescan flags and errors rebuild
+  configured roots with excludes/apps; runtime errors remain visible.
+  Snapshots preserve mtime order and deduplicate overlapping paths/work
+- Clearing a content or semantic query cancels its pending debounce job.
+  Restrictive semantic filters now run before truncation in both interactive
+  and headless searches; arbitrary stdin lines ending in `/` remain searchable
+- Normal semantic refresh walks roots and rechecks metadata before vector
+  reuse. Legacy f32 migration remains a separate first invocation.
+  ONNX Runtime loads through an explicit safe API without mutating the
+  running process environment
+- File transfers run in a worker with progress and cancellation between
+  files. macOS/Linux same-filesystem moves use native no-replace rename;
+  cross-device moves stage a copy before deleting the source. Collisions
+  never overwrite destinations, and source symlinks/special files are
+  rejected. Copy fallback preserves bytes/permissions, not timestamps or
+  extended filesystem metadata
+- Custom actions consistently apply extension/kind filters and exclude
+  directory rows. Template expansion does not reinterpret placeholders
+  embedded in filenames
+- Minimum supported Rust is now 1.90. CI checks locked default and semantic
+  builds with exactly 1.90.0. Advisory checks now include optional features;
+  the unmaintained `paste` exception remains for tokenizers/fastembed.
+  Portable PTY smoke coverage now runs on Linux as well as macOS, including
+  a no-history pick session
 
 ## 0.10.0 — 2026-08-31
 
