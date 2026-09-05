@@ -45,7 +45,7 @@ nucleo-matcher = "0.3"
 pdf-extract = "0.12.0"
 # Explicit dynamic-library initialization avoids mutating process environment.
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["load-dynamic"] }
-quick-xml = "0.41"
+quick-xml = "0.42"
 ratatui = "0.30"
 # no image-defaults: it re-enables every image codec behind our back
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
