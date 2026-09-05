@@ -295,6 +295,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #   (true/false)
 # Custom actions run argv directly (never through a shell). Paths support
 # {path}, {paths} (one argv element spliced per marked file), and {dir}.
+# {line} is the matched line number, or 1 for a filename-only result.
 # Until you define any [[actions]], fsearch offers built-in defaults:
 # \"open in <editor>\" menu entries for installed GUI code editors
 # (Cursor, VS Code, Zed, Sublime Text). Defining your own replaces them.
