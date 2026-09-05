@@ -2,7 +2,7 @@
 name = "fsearch"
 version = "0.10.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.90"
 license = "MIT"
 description = "Fast Alfred-style file search for the terminal"
 repository = "https://github.com/joshwhiteley/fsearch"
@@ -37,10 +37,14 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+# Already transitive; used directly for no-follow private file opens on Unix.
+libc = "0.2"
 memmap2 = "0.9"
 notify = "8"
 nucleo-matcher = "0.3"
 pdf-extract = "0.12.0"
+# Explicit dynamic-library initialization avoids mutating process environment.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["load-dynamic"] }
 quick-xml = "0.41"
 ratatui = "0.30"
 # no image-defaults: it re-enables every image codec behind our back
@@ -49,6 +53,9 @@ rayon = "1"
 regex = "1"
 resvg = { version = "0.48", default-features = false, features = ["raster-images"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Parse $VISUAL/$EDITOR as argv without executing a shell.
+shlex = "1"
 syntect = "5"
 tar = { version = "0.4", default-features = false }
 terminal-colorsaurus = "1"
@@ -65,7 +72,7 @@ chafa = ["ratatui-image/chafa-dyn"]
 # Semantic search (`? query`): local ONNX embeddings via fastembed.
 # Heavy build (onnxruntime); the model (~90 MB) downloads on first index.
 #   cargo install --path . --features semantic
-semantic = ["dep:fastembed"]
+semantic = ["dep:fastembed", "dep:ort"]
 
 [dev-dependencies]
 tempfile = "3"

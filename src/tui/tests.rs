@@ -27,6 +27,8 @@ fn test_app() -> App {
         keys: Default::default(),
         mouse: true,
         remember_session: true,
+        remember_history: true,
+        searches: Default::default(),
         index_apps: false,
         icons: false,
         unified: true,
@@ -53,6 +55,187 @@ fn test_filter_app() -> App {
     app.ui_mode = UiMode::Pick;
     app.preview_layout = PreviewLayout::Hidden;
     app
+}
+
+fn wait_for_transfer(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.transfer_job.is_some() && Instant::now() < deadline {
+        app.poll_transfer();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.transfer_job.is_none(), "transfer did not complete");
+}
+
+#[test]
+fn terminal_guard_restores_on_early_error_after_partial_setup() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut output = tempfile::tempfile().unwrap();
+    let result: std::io::Result<()> = (|| {
+        let mut guard = super::TerminalGuard::new(output.try_clone()?, true);
+        // Model setup succeeding only through alternate-screen entry. Do not
+        // change the test runner's real terminal modes or global panic hook.
+        guard.active = true;
+        guard.tty.write_all(b"\x1b[?1049h")?;
+        Err(std::io::Error::other("later setup/Terminal::new failed"))
+    })();
+    assert!(result.is_err());
+    output.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = String::new();
+    output.read_to_string(&mut bytes).unwrap();
+    assert!(bytes.contains("\x1b[?1000l"), "mouse capture disabled");
+    assert!(bytes.contains("\x1b[?1049l"), "alternate screen left");
+    assert!(bytes.contains("\x1b[?25h"), "cursor restored");
+}
+
+#[test]
+fn terminal_cleanup_continues_after_a_write_failure() {
+    #[derive(Default)]
+    struct FailFirstWrite {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+    impl std::io::Write for FailFirstWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                return Err(std::io::Error::other("injected failure"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = FailFirstWrite::default();
+    super::cleanup_terminal(&mut output, true);
+    let bytes = String::from_utf8(output.bytes).unwrap();
+    assert!(bytes.contains("\x1b[?1049l"));
+    assert!(bytes.contains("\x1b[?25h"));
+}
+
+#[test]
+fn private_history_policy_clears_and_disables_memory_and_disk_history() {
+    let mut app = test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queries");
+    std::fs::write(&path, "existing\n").unwrap();
+    app.history.file = Some(path.clone());
+    app.history.entries = vec!["existing".into()];
+    app.configure_history(false);
+    app.editor.input = "private needle".into();
+    app.push_history();
+    app.history_step(true);
+    assert!(app.history.entries.is_empty());
+    assert!(app.history.file.is_none());
+    assert_eq!(app.editor.input, "private needle");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "existing\n");
+}
+
+#[test]
+fn hidden_previews_do_not_queue_and_hide_invalidates_pending_work() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.preview.tx = tx;
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/directory/")]);
+    app.preview_layout = PreviewLayout::Hidden;
+    app.load_preview();
+    assert!(rx.try_recv().is_err());
+    app.preview_layout = PreviewLayout::Side;
+    app.load_preview();
+    let req = rx.try_recv().unwrap();
+    assert_eq!(req.path, "/tmp/directory/");
+    assert!(
+        matches!(&app.preview.content, PreviewContent::Lines(lines) if lines[0] == Line::from("loading..."))
+    );
+    app.preview_layout = PreviewLayout::Hidden;
+    app.load_preview();
+    assert!(app.preview.generation > req.generation);
+    assert!(app.preview.for_key.is_none());
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn latest_queued_preview_wins() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for generation in 1..=100 {
+        tx.send(super::PreviewRequest {
+            generation,
+            path: generation.to_string(),
+            line_number: None,
+            appearance: crate::highlight::Appearance::Dark,
+            gutter: Color::Gray,
+        })
+        .unwrap();
+    }
+    let request = super::latest_preview_request(&rx).unwrap();
+    assert_eq!(request.generation, 100);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn nvim_matched_line_is_before_option_terminator_and_path() {
+    assert_eq!(
+        super::nvim_args("/tmp/-danger.rs", Some(27)),
+        ["+27", "--", "/tmp/-danger.rs"]
+    );
+    assert_eq!(
+        super::nvim_args("/tmp/plain.rs", None),
+        ["--", "/tmp/plain.rs"]
+    );
+    let mut app = test_app();
+    let mut row = file_row("/tmp/main.rs");
+    row.line_number = Some(27);
+    app.engine.inject_results_for_test(vec![row]);
+    let entry = app
+        .menu_entries()
+        .iter()
+        .position(|entry| entry.label == "open in nvim")
+        .unwrap();
+    app.run_menu_action(entry);
+    assert_eq!(app.nvim_request, Some(("/tmp/main.rs".into(), Some(27))));
+    assert_eq!(app.matched_line("/tmp/main.rs"), Some(27));
+}
+
+#[test]
+fn transfer_busy_state_blocks_duplicate_jobs_and_esc_cancels() {
+    // Keep completion pending without relying on file size or timing.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.transfer_job = Some(super::TransferJob {
+        kind: crate::actions::TransferKind::Copy,
+        total: 3,
+        done: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        cancel: cancel.clone(),
+        rx,
+        worker: None,
+    });
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/marked.rs")]);
+    app.marks.insert("/tmp/marked.rs".into());
+    app.enter_destination_picker(crate::actions::TransferKind::Move);
+    assert!(app.destination_picker.is_none());
+    app.start_transfer(
+        Vec::new(),
+        "/tmp".into(),
+        crate::actions::TransferKind::Move,
+    );
+    assert_eq!(app.transfer_job.as_ref().unwrap().total, 3);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("transferring 1/3 files"));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    tx.send(crate::actions::TransferOutcome {
+        cancelled: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    app.poll_transfer();
+    assert!(app.transfer_job.is_none());
+    assert!(app.message.as_ref().unwrap().0.contains("cancelled 2"));
 }
 
 /// Ticks the engine until `pred` holds or we time out, so filter tests can
@@ -706,6 +889,31 @@ fn selection_anchor_survives_result_reranking() {
     app.restore_selection_anchor();
     assert_eq!(app.selected, 0);
     assert_eq!(app.engine.results()[app.selected].path, "/b");
+}
+
+#[test]
+fn second_content_hit_stays_selected_and_opens_at_its_line() {
+    let mut app = test_app();
+    app.engine.set_query(">needle", false);
+    assert_eq!(app.engine.mode(), crate::engine::Mode::Content);
+    let mut first = file_row("/tmp/main.rs");
+    first.line_number = Some(1);
+    let mut second = first.clone();
+    second.line_number = Some(20);
+    app.engine.inject_results_for_test(vec![first, second]);
+    app.move_selection(1);
+    app.engine.tick();
+    app.restore_selection_anchor();
+    assert_eq!(app.selected, 1);
+    assert!(app.selection_anchor.is_none());
+    assert_eq!(app.matched_line("/tmp/main.rs"), Some(20));
+    let entry = app
+        .menu_entries()
+        .iter()
+        .position(|entry| entry.label == "open in nvim")
+        .unwrap();
+    app.run_menu_action(entry);
+    assert_eq!(app.nvim_request, Some(("/tmp/main.rs".into(), Some(20))));
 }
 
 fn mouse_state() -> App {
@@ -1442,7 +1650,7 @@ fn nvim_action_is_source_only_and_queues_the_selected_path() {
         .position(|entry| entry.label == "open in nvim")
         .expect("source files offer nvim");
     app.run_menu_action(entry);
-    assert_eq!(app.nvim_request.as_deref(), Some("/tmp/main.rs"));
+    assert_eq!(app.nvim_request, Some(("/tmp/main.rs".into(), None)));
 
     app.engine
         .inject_results_for_test(vec![file_row("/tmp/manual.pdf")]);
@@ -1623,6 +1831,8 @@ fn choosing_move_destination_removes_only_moved_marks() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(app.destination_picker.is_none());
+    assert!(app.transfer_job.is_some());
+    wait_for_transfer(&mut app);
     assert_eq!(app.marks, [collision_source.clone()].into());
     assert!(!std::path::Path::new(&source).exists());
     assert!(std::path::Path::new(&collision_source).exists());
@@ -1696,6 +1906,8 @@ fn choosing_copy_destination_keeps_marks() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(app.destination_picker.is_none());
+    assert!(app.transfer_job.is_some());
+    wait_for_transfer(&mut app);
     assert_eq!(app.marks, [source.clone()].into());
     assert!(std::path::Path::new(&source).exists());
     assert_eq!(

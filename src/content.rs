@@ -77,7 +77,13 @@ pub fn search<'a>(
             };
             let _ = searcher.search_slice(&matcher, text.as_bytes(), UTF8(&mut on_line));
         } else {
-            let _ = searcher.search_path(&matcher, path, UTF8(&mut on_line));
+            use std::io::Read;
+            if let Ok(file) = crate::util::open_regular_file(Path::new(path))
+                && file.metadata().is_ok_and(|meta| meta.len() <= max_filesize)
+            {
+                let _ =
+                    searcher.search_reader(&matcher, file.take(max_filesize), UTF8(&mut on_line));
+            }
         }
     });
     Ok(())

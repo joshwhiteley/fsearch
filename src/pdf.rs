@@ -28,7 +28,11 @@ pub fn default_cache_dir() -> PathBuf {
 /// Extracted text for a PDF, cached on disk keyed by path + mtime + size so
 /// repeat searches don't re-parse. Errors are strings suitable for the UI.
 pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
+    crate::util::create_private_dir(cache_dir).map_err(|e| format!("private PDF cache: {e}"))?;
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular PDF file".into());
+    }
     if meta.len() > MAX_PDF_BYTES {
         return Err(format!(
             "pdf larger than {} MiB",
@@ -39,7 +43,7 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
+        .map_or(0, |d| d.as_nanos());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     let key = format!("{:016x}-{mtime}-{}.txt", hasher.finish(), meta.len());
@@ -54,7 +58,6 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
         return Err(msg);
     }
     let result = extract(path);
-    let _ = std::fs::create_dir_all(cache_dir);
     let (target, body) = match &result {
         Ok(text) => (&cached, text.as_str()),
         Err(e) => (&cached_err, e.as_str()),
@@ -65,10 +68,14 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     // event can't publish truncated text as a cache hit
     let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = cache_dir.join(format!(".{key}.{}-{nonce}.tmp", std::process::id()));
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, target);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+    if let Ok(mut file) = crate::util::create_private_file(&tmp) {
+        use std::io::Write;
+        let written = file
+            .write_all(body.as_bytes())
+            .and_then(|_| std::fs::rename(&tmp, target));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
     evict_oldest(cache_dir);
     result
@@ -113,10 +120,18 @@ fn evict_oldest(cache_dir: &Path) {
 
 /// pdf-extract is known to panic on malformed files; contain that.
 fn extract(path: &str) -> Result<String, String> {
-    let path = path.to_string();
+    use std::io::Read;
+    let file = crate::util::open_regular_file(Path::new(path)).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PDF_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_PDF_BYTES {
+        return Err("PDF grew beyond the input-size limit".into());
+    }
     IN_GUARD.with(|g| g.set(true));
     let result = std::panic::catch_unwind(move || {
-        pdf_extract::extract_text(&path).map_err(|e| e.to_string())
+        pdf_extract::extract_text_from_mem(&bytes).map_err(|e| e.to_string())
     });
     IN_GUARD.with(|g| g.set(false));
     result.unwrap_or_else(|_| Err("pdf parser crashed on this file".to_string()))
@@ -254,6 +269,37 @@ mod tests {
         let f = std::fs::File::create(&file).unwrap();
         f.set_len(MAX_PDF_BYTES + 1).unwrap();
         assert!(extract_cached(file.to_str().unwrap(), dir.path()).is_err());
+    }
+
+    #[test]
+    fn same_second_equal_size_edits_invalidate_cached_text() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.pdf");
+        let cache = dir.path().join("cache");
+        let save = |text, nanos| {
+            std::fs::write(&file, minimal_pdf(text)).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(
+                    UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_nanos(nanos),
+                )
+                .unwrap();
+        };
+        save("First", 100_000_000);
+        assert!(
+            extract_cached(file.to_str().unwrap(), &cache)
+                .unwrap()
+                .contains("First")
+        );
+        save("Other", 900_000_000);
+        assert!(
+            extract_cached(file.to_str().unwrap(), &cache)
+                .unwrap()
+                .contains("Other")
+        );
     }
 
     #[cfg(unix)]

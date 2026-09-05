@@ -7,7 +7,7 @@ if {$argc != 1} {
 }
 
 set bin [file normalize [lindex $argv 0]]
-set tmp [exec mktemp -d -t fsearch-smoke]
+set tmp [exec mktemp -d /tmp/fsearch-smoke.XXXXXX]
 set home "$tmp/home"
 set config "$tmp/config/fsearch"
 set cache "$tmp/cache"
@@ -26,7 +26,7 @@ puts $cfg "quiet = \[\]"
 close $cfg
 
 log_user 0
-spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache TERM=xterm-256color $bin"
+spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache XDG_STATE_HOME=$tmp/state TERM=xterm-256color $bin"
 expect {
     -re {fsearch} {}
     timeout {
@@ -56,5 +56,27 @@ expect {
 }
 
 set status [wait]
+if {[lindex $status 3] != 0} {
+    file delete -force $tmp
+    exit [lindex $status 3]
+}
+
+# No-history still provides the UI but creates no history/session files.
+spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache XDG_STATE_HOME=$tmp/private-state TERM=xterm-256color $bin --no-history --pick meeting"
+expect {
+    -re {meeting-notes\.md} {}
+    timeout { puts stderr "private pick UI did not show results"; exit 1 }
+}
+send -- "\r"
+expect {
+    eof {}
+    timeout { puts stderr "private pick UI did not exit"; send -- "\003"; exit 1 }
+}
+set status [wait]
+if {[file exists "$tmp/private-state"]} {
+    puts stderr "--no-history wrote state"
+    file delete -force $tmp
+    exit 1
+}
 file delete -force $tmp
 exit [lindex $status 3]

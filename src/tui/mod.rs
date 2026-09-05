@@ -17,7 +17,8 @@ use ratatui::{Terminal, backend::CrosstermBackend, crossterm::execute};
 use ratatui_image::picker::Picker;
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 const PREVIEW_BYTES: usize = 64 * 1024;
@@ -112,6 +113,27 @@ pub struct DestinationPicker {
     pub previous_query: String,
     pub previous_selected: usize,
     pub previous_show_weak: bool,
+}
+
+/// At most one transfer runs. Progress is per completed file; Esc requests
+/// cancellation before the next file. Shutdown waits for the current file so
+/// temporary files are cleaned and moves are not interrupted between steps.
+pub struct TransferJob {
+    kind: actions::TransferKind,
+    total: usize,
+    done: Arc<AtomicUsize>,
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<actions::TransferOutcome>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TransferJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// One entry of the results list as laid out on screen, for mouse hit
@@ -233,6 +255,7 @@ pub struct History {
     /// newest", i.e. on a blank query.
     pos: Option<usize>,
     file: Option<std::path::PathBuf>,
+    enabled: bool,
 }
 
 /// The preview pipeline: what is shown, for which row, the worker channel,
@@ -245,6 +268,7 @@ pub struct Preview {
     pub tx: mpsc::Sender<PreviewRequest>,
     pub rx: mpsc::Receiver<PreviewResult>,
     pub generation: u64,
+    latest_generation: Arc<AtomicU64>,
     /// First line shown in the text preview; reset on selection change.
     pub scroll: usize,
     /// Pixel dimensions of the image preview, from the decode on the worker.
@@ -413,21 +437,27 @@ pub struct App {
     /// User-defined actions loaded from `[[actions]]`.
     pub custom_actions: Vec<crate::config::CustomAction>,
     /// Selected source file waiting to open in foreground Neovim.
-    pub nvim_request: Option<String>,
+    pub nvim_request: Option<(String, Option<u64>)>,
     /// Temporarily replaces the normal query with a directory-only search.
     pub destination_picker: Option<DestinationPicker>,
+    pub transfer_job: Option<TransferJob>,
 }
 
 impl App {
     pub fn new(engine: Engine) -> App {
         let (preview_tx, preview_rx) = mpsc::channel::<PreviewRequest>();
         let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
+        let latest_generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = latest_generation.clone();
         // one preview worker for the app's lifetime; exits when the app
         // (and thus preview_tx) is dropped. Per-request work is panic-guarded:
         // image decoding, SVG rendering, and syntect highlighting all run in
         // here, and a dead worker would leave previews stuck on "loading..."
         std::thread::spawn(move || {
-            while let Ok(req) = preview_rx.recv() {
+            while let Ok(req) = latest_preview_request(&preview_rx) {
+                if req.generation != worker_generation.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     preview_payload(&req)
                 }))
@@ -476,6 +506,7 @@ impl App {
                 entries: Vec::new(),
                 pos: None,
                 file: None,
+                enabled: true,
             },
             preview: Preview {
                 for_key: None,
@@ -483,6 +514,7 @@ impl App {
                 tx: preview_tx,
                 rx: result_rx,
                 generation: 0,
+                latest_generation,
                 scroll: 0,
                 image_dims: None,
             },
@@ -511,6 +543,7 @@ impl App {
             custom_actions: Vec::new(),
             nvim_request: None,
             destination_picker: None,
+            transfer_job: None,
         }
     }
 
@@ -635,7 +668,9 @@ impl App {
         match action.command {
             MenuCommand::BuiltIn(BuiltInAction::Open) => self.open_selected(),
             MenuCommand::BuiltIn(BuiltInAction::Nvim) => {
-                self.nvim_request = self.visible_selected_row().map(|row| row.path.clone());
+                self.nvim_request = self
+                    .visible_selected_row()
+                    .map(|row| (row.path.clone(), row.line_number));
             }
             MenuCommand::BuiltIn(BuiltInAction::Reveal) => self.act(actions::reveal, "revealed"),
             MenuCommand::BuiltIn(BuiltInAction::Copy) => self.act(actions::copy, "copied"),
@@ -675,9 +710,27 @@ impl App {
             .cloned()
     }
 
+    fn matched_line(&self, path: &str) -> Option<u64> {
+        self.visible_selected_row()
+            .filter(|row| row.path == path)
+            .or_else(|| {
+                self.engine
+                    .results()
+                    .iter()
+                    .take(self.visible_len())
+                    .find(|row| row.path == path)
+            })
+            .and_then(|row| row.line_number)
+    }
+
     fn open_path_with_enter(&mut self, path: &str) -> std::io::Result<()> {
         if let Some(action) = self.matching_enter_action(path) {
-            actions::run_custom(&action, path, &[path.to_string()])?;
+            actions::run_custom_with_line(
+                &action,
+                path,
+                &[path.to_string()],
+                self.matched_line(path),
+            )?;
             self.engine.record_open(path);
             Ok(())
         } else {
@@ -746,7 +799,12 @@ impl App {
             return;
         }
         let outcome = if actions::has_paths_placeholder(&action.cmd) {
-            match actions::run_custom(&action, &paths[0], &paths) {
+            match actions::run_custom_with_line(
+                &action,
+                &paths[0],
+                &paths,
+                self.matched_line(&paths[0]),
+            ) {
                 Ok(()) => BatchOutcome {
                     succeeded: paths.len(),
                     first_error: None,
@@ -758,7 +816,12 @@ impl App {
             }
         } else {
             run_batch(&paths, |path| {
-                actions::run_custom(&action, path, &[path.to_string()])
+                actions::run_custom_with_line(
+                    &action,
+                    path,
+                    &[path.to_string()],
+                    self.matched_line(path),
+                )
             })
         };
         self.set_message(self.custom_batch_summary(&action, &paths, &outcome));
@@ -799,6 +862,9 @@ impl App {
             };
             summary.push_str(&format!(", skipped {} ({reason})", outcome.skipped));
         }
+        if outcome.cancelled > 0 {
+            summary.push_str(&format!(", cancelled {}", outcome.cancelled));
+        }
         if outcome.failed > 0 {
             if let Some((path, error)) = &outcome.first_error {
                 format!(
@@ -808,7 +874,7 @@ impl App {
             } else {
                 format!("error: {summary}; {} failed", outcome.failed)
             }
-        } else if outcome.skipped == 0 {
+        } else if outcome.skipped == 0 && outcome.cancelled == 0 {
             summary.push_str(if outcome.succeeded == 1 {
                 " file"
             } else {
@@ -821,6 +887,10 @@ impl App {
     }
 
     fn enter_destination_picker(&mut self, kind: actions::TransferKind) {
+        if self.transfer_job.is_some() {
+            self.set_message("transfer already running (Esc to cancel)".into());
+            return;
+        }
         let paths = self.visible_marked();
         if paths.is_empty() {
             return;
@@ -854,6 +924,10 @@ impl App {
     }
 
     fn choose_destination(&mut self) {
+        if self.transfer_job.is_some() {
+            self.set_message("transfer already running (Esc to cancel)".into());
+            return;
+        }
         let Some(destination) = self
             .visible_selected_row()
             .filter(|row| row.path.ends_with('/'))
@@ -867,22 +941,95 @@ impl App {
         };
         let paths = picker.paths.clone();
         let kind = picker.kind;
-        let destination = std::path::Path::new(&destination);
-        let outcome = match kind {
-            actions::TransferKind::Move => actions::move_files(&paths, destination),
-            actions::TransferKind::Copy => actions::copy_files(&paths, destination),
-        };
-        if kind == actions::TransferKind::Move {
-            for path in &outcome.succeeded_paths {
-                self.marks.remove(path);
-            }
-        }
-        let verb = match kind {
-            actions::TransferKind::Move => "moved",
-            actions::TransferKind::Copy => "copied",
-        };
         self.restore_destination_picker(picker);
-        self.set_message(Self::transfer_summary(verb, &outcome, paths.len()));
+        self.start_transfer(paths, destination.into(), kind);
+    }
+
+    fn start_transfer(
+        &mut self,
+        paths: Vec<String>,
+        destination: std::path::PathBuf,
+        kind: actions::TransferKind,
+    ) {
+        if self.transfer_job.is_some() {
+            self.set_message("transfer already running (Esc to cancel)".into());
+            return;
+        }
+        let total = paths.len();
+        let done = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker_done = done.clone();
+        let worker_cancel = cancel.clone();
+        match std::thread::Builder::new()
+            .name("file-transfer".into())
+            .spawn(move || {
+                let outcome = actions::transfer_with_progress(
+                    &paths,
+                    &destination,
+                    kind,
+                    &worker_cancel,
+                    |n| {
+                        worker_done.store(n, Ordering::Relaxed);
+                    },
+                );
+                let _ = tx.send(outcome);
+            }) {
+            Ok(worker) => {
+                self.transfer_job = Some(TransferJob {
+                    kind,
+                    total,
+                    done,
+                    cancel,
+                    rx,
+                    worker: Some(worker),
+                });
+                self.set_message(format!("transferring {total} files (Esc to cancel)"));
+            }
+            Err(error) => self.set_message(format!("error starting transfer: {error}")),
+        }
+    }
+
+    fn poll_transfer(&mut self) {
+        let Some(job) = &self.transfer_job else {
+            return;
+        };
+        let result = match job.rx.try_recv() {
+            Ok(outcome) => Ok(outcome),
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(()),
+        };
+        let job = self.transfer_job.take().unwrap();
+        match result {
+            Ok(outcome) => {
+                if job.kind == actions::TransferKind::Move {
+                    for path in &outcome.succeeded_paths {
+                        self.marks.remove(path);
+                    }
+                }
+                let verb = if job.kind == actions::TransferKind::Move {
+                    "moved"
+                } else {
+                    "copied"
+                };
+                self.set_message(Self::transfer_summary(verb, &outcome, job.total));
+            }
+            Err(()) => self.set_message(
+                "error: transfer worker stopped; check destination for partial results".into(),
+            ),
+        }
+    }
+
+    fn configure_history(&mut self, enabled: bool) {
+        self.history.enabled = enabled;
+        self.history.pos = None;
+        self.history.entries.clear();
+        self.history.file = None;
+        if enabled {
+            let path = crate::frecency::default_queries_path();
+            self.history.entries = crate::frecency::load_queries(&path);
+            self.history.file = Some(path);
+        }
     }
 
     fn clear_marks(&mut self) {
@@ -894,7 +1041,7 @@ impl App {
     }
 
     fn history_step(&mut self, back: bool) {
-        if self.history.entries.is_empty() {
+        if !self.history.enabled || self.history.entries.is_empty() {
             return;
         }
         let next = match (self.history.pos, back) {
@@ -920,6 +1067,9 @@ impl App {
     }
 
     fn push_history(&mut self) {
+        if !self.history.enabled {
+            return;
+        }
         let q = self.editor.input.trim().to_string();
         if q.is_empty() {
             return;
@@ -974,6 +1124,13 @@ impl App {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 return true;
             }
+        }
+        if key.code == KeyCode::Esc
+            && let Some(job) = &self.transfer_job
+        {
+            job.cancel.store(true, Ordering::Relaxed);
+            self.set_message("cancelling transfer after current file".into());
+            return true;
         }
         // text editing is fixed and handled before the keymap, so those keys
         // can never be rebound (see fsearch::keymap::is_editing_key)
@@ -1055,7 +1212,10 @@ impl App {
             crate::keymap::Action::MoveUp => self.move_selection(-1),
             crate::keymap::Action::MoveDown => self.move_selection(1),
             crate::keymap::Action::PreviewLayout => {
-                self.preview_layout = self.preview_layout.next()
+                self.preview_layout = self.preview_layout.next();
+                if self.preview_layout == PreviewLayout::Hidden {
+                    self.load_preview();
+                }
             }
             crate::keymap::Action::DensityToggle => self.density = self.density.toggle(),
             crate::keymap::Action::FoldToggle => {
@@ -1168,6 +1328,12 @@ impl App {
     }
 
     fn restore_selection_anchor(&mut self) {
+        // Content results append without reranking and can contain several
+        // lines from one path. Path-only anchoring would jump to its first hit.
+        if self.engine.mode() == Mode::Content {
+            self.selection_anchor = None;
+            return;
+        }
         let Some(path) = self.selection_anchor.clone() else {
             return;
         };
@@ -1206,7 +1372,13 @@ impl App {
             .then(|| self.matching_enter_action(&path))
             .flatten();
         let result = if let Some(action) = &enter_action {
-            actions::run_custom(action, &path, std::slice::from_ref(&path)).map(|()| {
+            actions::run_custom_with_line(
+                action,
+                &path,
+                std::slice::from_ref(&path),
+                self.matched_line(&path),
+            )
+            .map(|()| {
                 self.engine.record_open(&path);
             })
         } else {
@@ -1369,11 +1541,25 @@ impl App {
     }
 
     fn load_preview(&mut self) {
+        if self.preview_layout == PreviewLayout::Hidden || self.engine.mode() == Mode::Calc {
+            if self.preview.for_key.take().is_some() {
+                self.preview.generation += 1;
+                self.preview
+                    .latest_generation
+                    .store(self.preview.generation, Ordering::Relaxed);
+            }
+            return;
+        }
         let Some((path, line_number)) = self
             .visible_selected_row()
             .map(|row| (row.path.clone(), row.line_number))
         else {
-            self.preview.for_key = None;
+            if self.preview.for_key.take().is_some() {
+                self.preview.generation += 1;
+                self.preview
+                    .latest_generation
+                    .store(self.preview.generation, Ordering::Relaxed);
+            }
             self.preview.content = PreviewContent::Lines(vec![Line::from("no selection")]);
             self.preview.image_dims = None;
             return;
@@ -1385,19 +1571,14 @@ impl App {
         self.preview.for_key = Some(key);
         self.preview.scroll = 0;
         self.preview.image_dims = None;
-        // directories (trailing '/') and macOS .app bundles are both
-        // directories without a text preview
-        if path.ends_with('/') || path.to_ascii_lowercase().ends_with(".app") {
-            // cheap; stays on the UI thread
-            self.preview.content =
-                PreviewContent::Lines(directory_listing(&path, self.theme.accent));
-            return;
-        }
         // expensive loading (file read, highlight, PDF/image decode) happens
         // on the preview worker; show a placeholder until poll_preview
         // delivers the result on a later tick
         self.preview.content = PreviewContent::Lines(vec![Line::from("loading...")]);
         self.preview.generation += 1;
+        self.preview
+            .latest_generation
+            .store(self.preview.generation, Ordering::Relaxed);
         let _ = self.preview.tx.send(PreviewRequest {
             generation: self.preview.generation,
             path,
@@ -1411,6 +1592,9 @@ impl App {
     /// generations and superseded selections are dropped.
     fn poll_preview(&mut self) {
         while let Ok(result) = self.preview.rx.try_recv() {
+            if self.preview_layout == PreviewLayout::Hidden || self.engine.mode() == Mode::Calc {
+                continue;
+            }
             if result.generation != self.preview.generation {
                 continue;
             }
@@ -1466,6 +1650,18 @@ impl App {
                 .map(|meta| (meta.is_file(), meta.len(), meta.modified().ok()));
         }
     }
+}
+
+/// Coalesce pending work before decoding. Already-running decoding is not
+/// interrupted, but stale queued requests never form a long preview backlog.
+fn latest_preview_request(
+    rx: &mpsc::Receiver<PreviewRequest>,
+) -> Result<PreviewRequest, mpsc::RecvError> {
+    let mut request = rx.recv()?;
+    while let Ok(newer) = rx.try_recv() {
+        request = newer;
+    }
+    Ok(request)
 }
 
 /// A generous cell-size guess for terminals that support a graphics protocol
@@ -1538,7 +1734,16 @@ fn open_tty() -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open("/dev/tty")
 }
 
-fn run_nvim_foreground(path: &str) -> std::io::Result<()> {
+fn nvim_args(path: &str, line: Option<u64>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(line) = line {
+        args.push(format!("+{}", line.max(1)));
+    }
+    args.extend(["--".into(), actions::absolute_path(path)]);
+    args
+}
+
+fn run_nvim_foreground(path: &str, line: Option<u64>) -> std::io::Result<()> {
     let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1546,8 +1751,7 @@ fn run_nvim_foreground(path: &str) -> std::io::Result<()> {
     let stdin = tty.try_clone()?;
     let stdout = tty.try_clone()?;
     let status = Command::new("nvim")
-        .arg("--")
-        .arg(path)
+        .args(nvim_args(path, line))
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(tty))
@@ -1559,42 +1763,123 @@ fn run_nvim_foreground(path: &str) -> std::io::Result<()> {
     }
 }
 
-fn resume_terminal(
-    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static;
+
+/// Armed before the first terminal mutation, not after successful setup.
+/// Owns a duplicate TTY descriptor so cleanup does not depend on reopening it.
+struct TerminalGuard {
+    tty: std::fs::File,
     mouse: bool,
-) -> std::io::Result<()> {
-    enable_raw_mode()?;
-    if mouse {
-        execute!(
-            terminal.backend_mut(),
-            EnterAlternateScreen,
-            EnableMouseCapture
-        )?;
-    } else {
-        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    active: bool,
+    previous_hook: Option<Arc<PanicHook>>,
+}
+
+impl TerminalGuard {
+    fn new(tty: std::fs::File, mouse: bool) -> Self {
+        Self {
+            tty,
+            mouse,
+            active: false,
+            previous_hook: None,
+        }
     }
-    terminal.clear()
+
+    fn install_hook(&mut self) {
+        let previous: Arc<PanicHook> = std::panic::take_hook().into();
+        let forward = previous.clone();
+        let ui_thread = std::thread::current().id();
+        let mouse = self.mouse;
+        std::panic::set_hook(Box::new(move |info| {
+            if crate::in_parser_guard() {
+                return;
+            }
+            if std::thread::current().id() == ui_thread {
+                restore_terminal(mouse);
+            }
+            forward(info);
+        }));
+        self.previous_hook = Some(previous);
+    }
+
+    fn enter(&mut self) -> std::io::Result<()> {
+        self.active = true;
+        let result = (|| {
+            enable_raw_mode()?;
+            execute!(self.tty, EnterAlternateScreen)?;
+            if self.mouse {
+                execute!(self.tty, EnableMouseCapture)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore();
+        }
+        result
+    }
+
+    fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
+        cleanup_terminal(&mut self.tty, self.mouse);
+        self.active = false;
+    }
+
+    fn resume(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+    ) -> std::io::Result<()> {
+        self.enter()?;
+        if let Err(error) = terminal.clear() {
+            self.restore();
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
+        // Rust forbids changing panic hooks while unwinding. On normal error
+        // returns (including setup/new/resume failure), restore the caller's hook.
+        if !std::thread::panicking()
+            && let Some(previous) = self.previous_hook.take()
+        {
+            std::panic::set_hook(Box::new(move |info| previous(info)));
+        }
+    }
 }
 
 fn open_in_nvim(
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+    guard: &mut TerminalGuard,
     path: &str,
-    mouse: bool,
-) -> std::io::Result<()> {
-    restore_terminal(mouse);
-    let result = run_nvim_foreground(path);
-    let resumed = resume_terminal(terminal, mouse);
-    resumed.and(result)
+    line: Option<u64>,
+) -> std::io::Result<std::io::Result<()>> {
+    guard.restore();
+    let result = run_nvim_foreground(path, line);
+    // An editor failure is recoverable; a resume failure must end the UI.
+    guard.resume(terminal)?;
+    Ok(result)
+}
+
+fn cleanup_terminal(tty: &mut impl std::io::Write, mouse: bool) {
+    // Separate commands: a partial failure must not suppress later cleanup.
+    if mouse {
+        let _ = execute!(tty, DisableMouseCapture);
+    }
+    let _ = execute!(tty, LeaveAlternateScreen);
+    let _ = execute!(tty, ratatui::crossterm::cursor::Show);
+    let _ = disable_raw_mode();
 }
 
 fn restore_terminal(mouse: bool) {
     if let Ok(mut tty) = open_tty() {
-        if mouse {
-            let _ = execute!(tty, DisableMouseCapture);
-        }
-        let _ = execute!(tty, LeaveAlternateScreen);
+        cleanup_terminal(&mut tty, mouse);
+    } else {
+        let _ = disable_raw_mode();
     }
-    let _ = disable_raw_mode();
 }
 
 /// Runs the UI. Draws on /dev/tty (not stdout), so `--pick` works inside
@@ -1611,32 +1896,16 @@ pub fn run(
     mouse: bool,
     icons: bool,
     remember_session: bool,
+    remember_history: bool,
     custom_actions: Vec<crate::config::CustomAction>,
     action_warning: Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
-    let mut tty = open_tty()?;
-    enable_raw_mode()?;
-    if mouse {
-        execute!(tty, EnterAlternateScreen, EnableMouseCapture)?;
-    } else {
-        execute!(tty, EnterAlternateScreen)?;
-    }
-    // Restore the terminal only for a real crash on the UI thread. Worker
-    // threads contain their own panics (a guarded pdf-extract panic is
-    // suppressed entirely), and yanking the alternate screen out from under
-    // a still-running UI is far worse than a garbled message.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if crate::in_parser_guard() {
-            return;
-        }
-        if std::thread::current().name() == Some("main") {
-            restore_terminal(mouse);
-        }
-        default_hook(info);
-    }));
+    let tty = open_tty()?;
+    let mut guard = TerminalGuard::new(tty.try_clone()?, mouse);
+    guard.install_hook();
+    guard.enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(tty))?;
     let mut app = App::new(engine);
     app.keymap = keymap;
@@ -1669,9 +1938,7 @@ pub fn run(
             app.density = density;
         }
     }
-    let queries_path = crate::frecency::default_queries_path();
-    app.history.entries = crate::frecency::load_queries(&queries_path);
-    app.history.file = Some(queries_path);
+    app.configure_history(remember_history);
     if !initial_query.is_empty() {
         app.editor.input = initial_query.to_string();
         app.editor.input_cursor = app.editor.input.len();
@@ -1682,6 +1949,7 @@ pub fn run(
         app.restore_selection_anchor();
         // side effects stay out of the draw pass: apply worker results,
         // issue new preview loads, and stat the selected path here
+        app.poll_transfer();
         app.poll_preview();
         app.load_preview();
         app.refresh_status();
@@ -1713,18 +1981,20 @@ pub fn run(
             Ok(false) => {}
             Err(e) => break Err(e.into()),
         }
-        if let Some(path) = app.nvim_request.take() {
-            match open_in_nvim(&mut terminal, &path, mouse) {
-                Ok(()) => {
+        if let Some((path, line)) = app.nvim_request.take() {
+            match open_in_nvim(&mut terminal, &mut guard, &path, line) {
+                Ok(Ok(())) => {
                     app.engine.record_open(&path);
                     app.set_message("returned from nvim".into());
                 }
-                Err(error) => app.set_message(format!("error opening nvim: {error}")),
+                Ok(Err(error)) => app.set_message(format!("error opening nvim: {error}")),
+                Err(error) => break Err(error.into()),
             }
         }
     };
-    restore_terminal(mouse);
-    let _ = std::panic::take_hook(); // drop the restoring hook
+    // Cancel before dropping the job; join only waits for the current file.
+    drop(app.transfer_job.take());
+    guard.restore();
     if remember_session && result.is_ok() {
         // only a clean quit updates the saved settings; errors leave them alone
         crate::session::save(
@@ -1743,6 +2013,5 @@ mod rows;
 mod tests;
 use self::chrome::draw;
 use self::preview::{
-    PreviewContent, PreviewPayload, PreviewRequest, PreviewResult, directory_listing,
-    preview_payload,
+    PreviewContent, PreviewPayload, PreviewRequest, PreviewResult, preview_payload,
 };

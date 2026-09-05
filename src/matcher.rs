@@ -56,28 +56,91 @@ pub fn search_boosted(
     filters: &Filters,
     quiet: &Quiet,
 ) -> Result<Ranked, String> {
+    search_with_scope(
+        store,
+        query,
+        mode,
+        limit,
+        boosts,
+        MatchScope {
+            filters,
+            lines: false,
+        },
+        quiet,
+    )
+}
+
+/// Match arbitrary stdin lines without interpreting a trailing slash as a
+/// filesystem directory. Explicit filters keep their normal meaning.
+pub fn search_lines(
+    store: &PathStore,
+    query: &str,
+    mode: FilenameMode,
+    limit: usize,
+    filters: &Filters,
+) -> Result<Ranked, String> {
+    search_with_scope(
+        store,
+        query,
+        mode,
+        limit,
+        &HashMap::new(),
+        MatchScope {
+            filters,
+            lines: true,
+        },
+        &Quiet::new(Vec::new()),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct MatchScope<'a> {
+    filters: &'a Filters,
+    lines: bool,
+}
+
+fn search_with_scope(
+    store: &PathStore,
+    query: &str,
+    mode: FilenameMode,
+    limit: usize,
+    boosts: &HashMap<String, u32>,
+    scope: MatchScope<'_>,
+    quiet: &Quiet,
+) -> Result<Ranked, String> {
+    let filters = scope.filters;
     // a `/` in the query, a path: filter, or dir: means the user is
     // navigating paths on purpose — quiet demotion switches off
     let path_intent = query.contains('/') || !filters.path_terms.is_empty() || filters.dirs_only;
     let demote = (!quiet.is_empty() && !path_intent).then_some(quiet);
     if query.is_empty() {
-        return Ok(head_with_boosts(store, limit, boosts, filters, demote));
+        return Ok(head_with_boosts(store, limit, boosts, scope, demote));
     }
     match mode {
-        FilenameMode::Fuzzy => Ok(fuzzy(store, query, limit, boosts, filters, demote)),
-        FilenameMode::Regex => regex_filter(store, query, limit, boosts, filters),
+        FilenameMode::Fuzzy => Ok(fuzzy(store, query, limit, boosts, scope, demote)),
+        FilenameMode::Regex => regex_filter(store, query, limit, boosts, scope),
     }
 }
 
-fn passes(store: &PathStore, i: usize, filters: &Filters) -> bool {
-    filters.matches(store.get(i)) && filters.matches_meta(&store.meta(i))
+fn passes(store: &PathStore, i: usize, scope: MatchScope<'_>) -> bool {
+    let filters = scope.filters;
+    let path = store.get(i);
+    let line_matches = scope.lines
+        && !filters.dirs_only
+        && filters.exts.is_empty()
+        && filters
+            .path_terms
+            .iter()
+            .all(|term| crate::filters::contains_ignore_ascii_case(path, term));
+    (line_matches || filters.matches(path)) && filters.matches_meta(&store.meta(i))
 }
 
 /// Fuzzy filename searches may surface directories, while every other mode
 /// keeps the filter's default file-only behavior. Extension filters still
 /// exclude directories, and metadata/path filters apply to them normally.
-fn passes_fuzzy(store: &PathStore, i: usize, filters: &Filters) -> bool {
-    if passes(store, i, filters) {
+fn passes_fuzzy(store: &PathStore, i: usize, scope: MatchScope<'_>) -> bool {
+    let filters = scope.filters;
+    if passes(store, i, scope) {
         return true;
     }
     let path = store.get(i);
@@ -97,7 +160,7 @@ fn head_with_boosts(
     store: &PathStore,
     limit: usize,
     boosts: &HashMap<String, u32>,
-    filters: &Filters,
+    scope: MatchScope<'_>,
     demote: Option<&Quiet>,
 ) -> Ranked {
     // frecency-boosted entries first (opening something is an explicit
@@ -108,7 +171,7 @@ fn head_with_boosts(
     let mut in_boosted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if !boosts.is_empty() {
         let mut boosted: Vec<(u32, usize)> = (0..store.len())
-            .filter(|&i| passes(store, i, filters))
+            .filter(|&i| passes(store, i, scope))
             .filter_map(|i| boosts.get(store.get(i)).map(|&b| (b, i)))
             .collect();
         boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
@@ -121,7 +184,7 @@ fn head_with_boosts(
         if normal.len() >= limit {
             break;
         }
-        if in_boosted.contains(&i) || !passes(store, i, filters) {
+        if in_boosted.contains(&i) || !passes(store, i, scope) {
             continue;
         }
         if demote.is_some_and(|q| q.is_quiet(store.get(i))) {
@@ -208,9 +271,10 @@ fn fuzzy(
     query: &str,
     limit: usize,
     boosts: &HashMap<String, u32>,
-    filters: &Filters,
+    scope: MatchScope<'_>,
     demote: Option<&Quiet>,
 ) -> Ranked {
+    let filters = scope.filters;
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let multi_word = query.split_whitespace().count() > 1;
     let mut scored: Vec<(u32, usize)> = (0..store.len())
@@ -223,9 +287,9 @@ fn fuzzy(
                 (Matcher::new(cfg), Vec::new(), Vec::new())
             },
             |(mut matcher, mut buf, mut acc), i| {
-                if passes_fuzzy(store, i, filters) {
+                if passes_fuzzy(store, i, scope) {
                     let path = store.get(i);
-                    let is_dir = path.ends_with('/');
+                    let is_dir = !scope.lines && path.ends_with('/');
                     if let Some(score) = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)
                     {
                         // A directory is useful only when its own name matches,
@@ -318,7 +382,7 @@ fn regex_filter(
     query: &str,
     limit: usize,
     boosts: &HashMap<String, u32>,
-    filters: &Filters,
+    scope: MatchScope<'_>,
 ) -> Result<Ranked, String> {
     let smart_case_insensitive = !query.chars().any(|c| c.is_uppercase());
     let re = regex::RegexBuilder::new(query)
@@ -328,7 +392,7 @@ fn regex_filter(
     let mut hits: Vec<usize> = (0..store.len())
         .into_par_iter()
         .with_min_len(CHUNK)
-        .filter(|&i| passes(store, i, filters) && re.is_match(store.get(i)))
+        .filter(|&i| passes(store, i, scope) && re.is_match(store.get(i)))
         .collect();
     hits.sort_unstable();
     apply_boost_order(&mut hits, store, boosts);
@@ -350,6 +414,38 @@ mod tests {
             .map(|s| (s.to_string(), Default::default()))
             .collect();
         PathStore::from_entries(&entries)
+    }
+
+    #[test]
+    fn arbitrary_lines_with_trailing_slashes_match_in_all_modes() {
+        let store = paths(&["alpha/nested/", "alpha.txt", "beta/"]);
+        for mode in [FilenameMode::Fuzzy, FilenameMode::Regex] {
+            assert_eq!(
+                search_lines(&store, "", mode, 10, &Filters::default())
+                    .unwrap()
+                    .indices,
+                [0, 1, 2]
+            );
+            let hits = search_lines(&store, "alpha", mode, 10, &Filters::default()).unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(
+                hits.indices.contains(&0),
+                "full-line match, not just basename"
+            );
+            for (input, expected) in [
+                ("path:alpha", vec![0, 1]),
+                ("ext:txt", vec![1]),
+                ("dir:", vec![0, 2]),
+            ] {
+                let (filters, query) = crate::filters::parse(input, 0);
+                assert_eq!(
+                    search_lines(&store, &query, mode, 10, &filters)
+                        .unwrap()
+                        .indices,
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

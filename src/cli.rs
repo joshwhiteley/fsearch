@@ -7,6 +7,10 @@ pub enum Command {
     Reindex,
     IndexSemantic,
     Doctor,
+    Status,
+    ClearCache,
+    ClearHistory,
+    Searches,
     Print(String),
     Pick(String),
     Filter(String),
@@ -34,6 +38,19 @@ usage:
   fsearch --filter [Q] fuzzy-filter stdin lines and print the selection
   cat list | fsearch   same as --filter: piped stdin fuzzy-filters lines
   fsearch --doctor     print what the terminal probe detected
+  fsearch --status     inspect index health without probing the terminal
+  fsearch --clear-cache
+                       remove search/extracted-text caches (keep models)
+  fsearch --clear-history
+                       remove open/query history and remembered layout
+  fsearch --searches   list configured [searches]
+
+options (before the command/query):
+  --json               JSON records for -p/--big/--status/--pick/--filter
+  --print0             NUL-terminated paths/selections (not JSON)
+  --read0              NUL-separated stdin records (filter mode)
+  --saved NAME         prepend a named [searches] query or scope
+  --no-history         do not load/save history or session layout
   fsearch --help       show this help
   fsearch --version    print the version
 
@@ -78,6 +95,87 @@ files:
 pub enum ConfigOpen {
     Editor(String),
     Reveal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    Nul,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Invocation {
+    pub command: Command,
+    pub format: OutputFormat,
+    pub read0: bool,
+    pub saved: Option<String>,
+    pub no_history: bool,
+}
+
+/// Options precede the command. Everything after -p/--pick/--filter remains
+/// query text, so a filename containing a flag is never silently rewritten.
+pub fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
+    let mut format = OutputFormat::Text;
+    let mut read0 = false;
+    let mut no_history = false;
+    let mut saved = None;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--json" | "--print0" => {
+                let next = if arg == "--json" {
+                    OutputFormat::Json
+                } else {
+                    OutputFormat::Nul
+                };
+                if format != OutputFormat::Text && format != next {
+                    return Err("--json and --print0 cannot be combined".into());
+                }
+                format = next;
+            }
+            "--read0" => read0 = true,
+            "--no-history" => no_history = true,
+            "--saved" => {
+                i += 1;
+                let name = args
+                    .get(i)
+                    .filter(|s| !s.is_empty() && !s.starts_with('-'))
+                    .ok_or("--saved needs a search name")?;
+                if saved.replace(name.clone()).is_some() {
+                    return Err("--saved can be supplied only once".into());
+                }
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    let command = parse(&args[i..]);
+    if read0 && !matches!(command, Command::Run | Command::Filter(_)) {
+        return Err("--read0 requires filter mode".into());
+    }
+    let searching = matches!(
+        command,
+        Command::Run | Command::Print(_) | Command::Pick(_) | Command::Filter(_)
+    );
+    if saved.is_some() && !searching {
+        return Err("--saved requires a search command".into());
+    }
+    if format != OutputFormat::Text
+        && !(searching
+            || (format == OutputFormat::Json
+                && matches!(command, Command::Status | Command::Big(_))))
+    {
+        return Err("output option is not supported by this command".into());
+    }
+    Ok(Invocation {
+        command,
+        format,
+        read0,
+        saved,
+        no_history,
+    })
 }
 
 /// $VISUAL wins over $EDITOR; with neither set, reveal the file in the
@@ -132,6 +230,10 @@ pub fn parse(args: &[String]) -> Command {
             "--reindex" => Command::Reindex,
             "--index-semantic" => Command::IndexSemantic,
             "--doctor" => Command::Doctor,
+            "--status" => Command::Status,
+            "--clear-cache" => Command::ClearCache,
+            "--clear-history" => Command::ClearHistory,
+            "--searches" => Command::Searches,
             other => return Command::Unknown(other.to_string()),
         };
         if cmd != Command::Run {
@@ -154,6 +256,34 @@ mod tests {
     #[test]
     fn no_args_runs_the_ui() {
         assert_eq!(parse_strs(&[]), Command::Run);
+    }
+
+    #[test]
+    fn invocation_options_leave_query_arguments_literal() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let inv = parse_invocation(&args(&[
+            "--json",
+            "--no-history",
+            "--saved",
+            "docs",
+            "-p",
+            "--print0",
+        ]))
+        .unwrap();
+        assert_eq!(inv.format, OutputFormat::Json);
+        assert_eq!(inv.command, Command::Print("--print0".into()));
+        assert!(inv.no_history);
+        assert_eq!(inv.saved.as_deref(), Some("docs"));
+        for invalid in [
+            vec!["--json", "--print0", "-p", "q"],
+            vec!["--read0", "-p", "q"],
+            vec!["--saved"],
+            vec!["--saved", "x", "--reindex"],
+            vec!["--json", "--clear-cache"],
+            vec!["--print0", "--status"],
+        ] {
+            assert!(parse_invocation(&args(&invalid)).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

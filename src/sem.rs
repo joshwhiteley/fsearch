@@ -67,11 +67,14 @@ mod real {
     /// all-MiniLM-L6-v2 output width.
     const DIM: usize = 384;
 
-    /// ort is built to load onnxruntime at runtime; when the user hasn't
-    /// pointed ORT_DYLIB_PATH anywhere, try the usual install locations.
-    fn bootstrap_ort() {
-        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-            return;
+    /// Select the runtime explicitly; never mutate the process environment
+    /// after other search or UI threads have started.
+    fn bootstrap_ort() -> Result<(), String> {
+        if let Some(path) = std::env::var_os("ORT_DYLIB_PATH") {
+            ort::init_from(path)
+                .map_err(|e| format!("loading ONNX Runtime: {e}"))?
+                .commit();
+            return Ok(());
         }
         for candidate in [
             "/opt/homebrew/opt/onnxruntime/lib/libonnxruntime.dylib",
@@ -80,11 +83,32 @@ mod real {
             "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
         ] {
             if std::path::Path::new(candidate).exists() {
-                // called before any embedder threads exist
-                unsafe { std::env::set_var("ORT_DYLIB_PATH", candidate) };
-                return;
+                ort::init_from(candidate)
+                    .map_err(|e| format!("loading ONNX Runtime: {e}"))?
+                    .commit();
+                return Ok(());
             }
         }
+        let library = if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+            "libonnxruntime.dylib"
+        } else {
+            "libonnxruntime.so"
+        };
+        ort::init_from(library)
+            .map_err(|e| format!("loading ONNX Runtime (set ORT_DYLIB_PATH before startup): {e}"))?
+            .commit();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a locally installed ONNX Runtime; does not download a model"]
+    fn native_runtime_initializes_without_environment_mutation() {
+        let before = std::env::var_os("ORT_DYLIB_PATH");
+        bootstrap_ort().unwrap();
+        ort::session::Session::builder().unwrap();
+        assert_eq!(std::env::var_os("ORT_DYLIB_PATH"), before);
     }
 
     struct Real {
@@ -105,7 +129,7 @@ mod real {
     }
 
     pub fn make() -> Result<Box<dyn Embedder + Send>, String> {
-        bootstrap_ort();
+        bootstrap_ort()?;
         let cache = super::default_store_path().with_file_name("models");
         let model = fastembed::TextEmbedding::try_new(
             fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
@@ -517,8 +541,19 @@ impl SemStore {
     /// Best-chunk-per-document cosine ranking, highest first. Each
     /// document's chunk loop stays scalar; documents are scored in parallel.
     pub fn query(&self, qvec: &[f32], top: usize) -> Vec<Hit> {
+        self.query_filtered(qvec, top, |_| true)
+    }
+
+    /// Rank only eligible documents, applying the predicate before scoring
+    /// and truncation so restrictive filters retain their full recall.
+    pub fn query_filtered(
+        &self,
+        qvec: &[f32],
+        top: usize,
+        predicate: impl Fn(&DocEntry) -> bool + Sync,
+    ) -> Vec<Hit> {
         let dim = self.dim as usize;
-        if dim == 0 || qvec.len() != dim {
+        if top == 0 || dim == 0 || qvec.len() != dim {
             return Vec::new();
         }
         let mut hits: Vec<Hit> = self
@@ -526,6 +561,9 @@ impl SemStore {
             .par_iter()
             .enumerate()
             .filter_map(|(doc, entry)| {
+                if !predicate(entry) {
+                    return None;
+                }
                 let end = entry.chunk_start.checked_add(entry.chunk_count)? as usize;
                 let start = entry.chunk_start as usize;
                 if end > self.chunk_lines.len() || end.checked_mul(dim)? > self.vectors.len() {
@@ -550,7 +588,7 @@ impl SemStore {
                 })
             })
             .collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.doc.cmp(&b.doc)));
         hits.truncate(top);
         hits
     }
@@ -558,12 +596,13 @@ impl SemStore {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         self.validate_for_save()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::util::create_private_dir(parent)?;
         }
         let nonce = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+        // If exclusive creation fails, the existing path is not ours to clean up.
+        let file = crate::util::create_private_file(&tmp)?;
         let written = (|| {
-            let file = std::fs::File::create(&tmp)?;
             let mut w = BufWriter::new(file);
             w.write_all(STORE_MAGIC)?;
             w.write_all(&self.dim.to_le_bytes())?;
@@ -885,6 +924,79 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restrictive_filters_rank_before_truncating_more_than_400_documents() {
+        let mut store = SemStore::new(2);
+        for i in 0..501 {
+            store.push_doc(&format!("/noise/{i}.txt"), 1, 1, &[(1, vec![1.0, 0.0])]);
+        }
+        store.push_doc("/wanted/old.md", 1, 5_000, &[(1, vec![0.9, 0.0])]);
+        store.push_doc("/wanted/small.md", 100, 1, &[(1, vec![0.8, 0.0])]);
+        store.push_doc("/wanted/first.md", 100, 5_000, &[(7, vec![0.5, 0.0])]);
+        store.push_doc("/wanted/second.md", 100, 5_000, &[(9, vec![0.4, 0.0])]);
+        let filters = crate::filters::Filters {
+            exts: vec!["md".to_string()],
+            path_terms: vec!["wanted".to_string()],
+            changed_after: Some(50),
+            min_size: Some(1_000),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("semantic.bin");
+        store.save(&path).unwrap();
+        for store in [&store, &SemStore::load(&path).unwrap()] {
+            assert!(
+                store
+                    .query(&[1.0, 0.0], 400)
+                    .iter()
+                    .all(|hit| hit.doc < 501)
+            );
+            let hits = store.query_filtered(&[1.0, 0.0], 100, |doc| {
+                filters.matches(&doc.path)
+                    && filters.matches_meta(&crate::walker::FileMeta {
+                        mtime: doc.mtime,
+                        size: doc.size,
+                    })
+            });
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| store.docs[hit.doc].path.as_str())
+                    .collect::<Vec<_>>(),
+                ["/wanted/first.md", "/wanted/second.md"]
+            );
+            assert_eq!(hits[0].line_start, 7);
+            assert_eq!(store.query_filtered(&[1.0, 0.0], 1, |_| true)[0].doc, 0);
+            assert!(store.query_filtered(&[1.0, 0.0], 100, |_| false).is_empty());
+            assert!(store.query_filtered(&[1.0, 0.0], 0, |_| true).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_save_creates_private_directory_and_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/semantic.bin");
+        SemStore::new(2).save(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        SemStore::new(2).save(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     struct NeverEmbed {
         dim: usize,

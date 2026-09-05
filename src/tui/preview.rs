@@ -84,6 +84,15 @@ struct ArchiveListing {
 /// extract, image decode — runs on this worker thread so the UI thread only
 /// applies results. Mirrors the former synchronous load_preview logic.
 pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
+    match std::fs::metadata(&req.path) {
+        Ok(meta) if meta.is_dir() => {
+            return PreviewPayload::Lines(directory_listing(&req.path, req.gutter));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return PreviewPayload::Lines(vec![Line::from("(not a regular file)")]);
+        }
+        _ => {}
+    }
     if crate::pdf::is_pdf_path(&req.path) {
         return match crate::pdf::extract_cached(&req.path, &crate::pdf::default_cache_dir()) {
             Ok(text) => match req.line_number {
@@ -215,10 +224,10 @@ fn archive_preview(path: &str, kind: ArchiveKind, gutter: Color) -> Vec<Line<'st
 }
 
 fn zip_listing(path: &str) -> Result<ArchiveListing, ()> {
-    if std::fs::metadata(path).map_err(|_| ())?.len() > MAX_ZIP_BYTES {
+    let file = crate::util::open_regular_file(std::path::Path::new(path)).map_err(|_| ())?;
+    if file.metadata().map_err(|_| ())?.len() > MAX_ZIP_BYTES {
         return Err(());
     }
-    let file = std::fs::File::open(path).map_err(|_| ())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| ())?;
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(());
@@ -279,7 +288,7 @@ impl<R: std::io::Read> std::io::Read for LimitedReader<R> {
 }
 
 fn tar_listing(path: &str, gzip: bool) -> Result<ArchiveListing, ()> {
-    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let file = crate::util::open_regular_file(std::path::Path::new(path)).map_err(|_| ())?;
     let capped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if gzip {
         let compressed = LimitedReader::new(file, MAX_TAR_INPUT_BYTES, capped.clone());
@@ -408,7 +417,7 @@ fn archive_lines(listing: ArchiveListing, gutter: Color) -> Vec<Line<'static>> {
 fn read_preview_bytes(path: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     const CAP: u64 = PREVIEW_BYTES as u64 + 1;
-    let file = std::fs::File::open(path)?;
+    let file = crate::util::open_regular_file(std::path::Path::new(path))?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut bytes = Vec::with_capacity(CAP.min(len) as usize);
     file.take(CAP).read_to_end(&mut bytes)?;
@@ -420,19 +429,24 @@ pub(super) fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>>
     let Ok(entries) = std::fs::read_dir(path) else {
         return vec![Line::from("(unreadable directory)")];
     };
+    // Bound iteration as well as storage. Sort only the first 200 entries
+    // returned by the filesystem, rather than enumerating an entire tree.
+    let mut entries = entries;
     let mut names: Vec<(bool, String)> = entries
+        .by_ref()
+        .take(200)
         .flatten()
         .map(|e| {
             let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
             (is_dir, e.file_name().to_string_lossy().into_owned())
         })
         .collect();
+    let truncated = entries.next().is_some();
     names.sort_by(|a, b| (!a.0, &a.1).cmp(&(!b.0, &b.1)));
-    names.truncate(200);
     if names.is_empty() {
         return vec![Line::from("(empty directory)")];
     }
-    names
+    let mut lines: Vec<_> = names
         .into_iter()
         .map(|(is_dir, name)| {
             if is_dir {
@@ -444,7 +458,11 @@ pub(super) fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>>
                 Line::from(name)
             }
         })
-        .collect()
+        .collect();
+    if truncated {
+        lines.push(Line::from("… more entries (showing first 200)"));
+    }
+    lines
 }
 
 /// Styled spans for the query input: a leading `>` / `?` mode prefix lights
@@ -633,6 +651,29 @@ mod tests {
     }
 
     #[test]
+    fn directory_worker_bounds_listing_and_marks_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..205 {
+            std::fs::write(dir.path().join(format!("entry-{n}")), b"").unwrap();
+        }
+        let lines = preview_text(preview_payload(&request(dir.path())));
+        assert_eq!(lines.len(), 201);
+        assert_eq!(lines[200], "… more entries (showing first 200)");
+        assert!(lines[..200].iter().all(|line| line.starts_with("entry-")));
+    }
+
+    #[test]
+    fn exactly_200_directory_entries_need_no_truncation_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..200 {
+            std::fs::write(dir.path().join(format!("entry-{n}")), b"").unwrap();
+        }
+        let lines = preview_text(preview_payload(&request(dir.path())));
+        assert_eq!(lines.len(), 200);
+        assert!(lines.iter().all(|line| line.starts_with("entry-")));
+    }
+
+    #[test]
     fn office_text_is_available_to_preview() {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
         zip.start_file("word/document.xml", SimpleFileOptions::default())
@@ -779,6 +820,28 @@ mod tests {
 
         // missing paths surface the io error like std::fs::read did
         assert!(read_preview_bytes(dir.path().join("gone.txt").to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_and_archive_readers_reject_fifo_and_symlink_sources() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, "text").unwrap();
+        let link = dir.path().join("link");
+        symlink(&regular, &link).unwrap();
+        for path in [&fifo, &link] {
+            let path = path.to_str().unwrap();
+            assert!(read_preview_bytes(path).is_err());
+            assert!(zip_listing(path).is_err());
+            assert!(tar_listing(path, false).is_err());
+            assert!(tar_listing(path, true).is_err());
+        }
     }
 
     #[test]

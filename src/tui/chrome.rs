@@ -580,6 +580,23 @@ pub(super) fn human_age(modified: std::time::SystemTime) -> String {
 }
 
 pub(super) fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(job) = &app.transfer_job {
+        let verb = if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            "cancelling"
+        } else {
+            "transferring"
+        };
+        let text = format!(
+            "{verb} {}/{} files · Esc cancels after current file",
+            job.done.load(std::sync::atomic::Ordering::Relaxed),
+            job.total
+        );
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(app.theme.accent)),
+            area,
+        );
+        return;
+    }
     let s = app.engine.status();
     let dim = Style::default().fg(app.theme.dim);
     let marked = if app.marking_enabled() && app.engine.mode() != Mode::Calc {

@@ -76,9 +76,8 @@ pub fn search(
     }
 }
 
-/// Ranks the query against the semantic index, mirroring the engine's
-/// semantic worker: over-fetch when filters are active (they are applied
-/// after ranking) so filtering doesn't drop the recall count.
+/// Ranks eligible documents against the semantic index, applying filters
+/// before the result limit, just like the engine's semantic worker.
 fn semantic(
     query: &str,
     query_filters: &Filters,
@@ -97,26 +96,16 @@ fn semantic(
         }
     };
     let qv = embedder.embed(&[query.to_string()])?;
-    let fetch = if query_filters.is_empty() {
-        SEMANTIC_LIMIT
-    } else {
-        SEMANTIC_LIMIT * 4
-    };
     let mut reported = 0usize;
-    for hit in store.query(&qv[0], fetch) {
-        if reported >= SEMANTIC_LIMIT {
-            break;
-        }
-        let doc = &store.docs[hit.doc];
-        if !(query_filters.is_empty()
+    for hit in store.query_filtered(&qv[0], SEMANTIC_LIMIT, |doc| {
+        query_filters.is_empty()
             || (query_filters.matches(&doc.path)
                 && query_filters.matches_meta(&FileMeta {
                     mtime: doc.mtime,
                     size: doc.size,
-                })))
-        {
-            continue;
-        }
+                }))
+    }) {
+        let doc = &store.docs[hit.doc];
         reported += 1;
         on_hit(Hit::Semantic {
             path: doc.path.clone(),
@@ -191,8 +180,30 @@ fn filename(
     .map_err(|e| e.to_string())?;
     // scripting keeps the old behavior: report only the strong matches,
     // not the fold-away weaker tail
+    let mut reported = false;
     for i in r.indices.iter().take(r.strong) {
         on_hit(Hit::Path(store.get(*i).to_string()));
+        reported = true;
     }
-    Ok(!r.indices.is_empty())
+    Ok(reported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_search_reports_false_when_only_folded_rows_exist() {
+        let store = PathStore::from_entries(&[("/quiet/state".to_string(), FileMeta::default())]);
+        let opts = Options {
+            max_content_filesize: 1_000,
+            quiet: Quiet::new(vec!["/quiet/".to_string()]),
+            pdf_cache: std::path::PathBuf::new(),
+        };
+        let mut hits = 0;
+        assert!(!search(&store, "", &opts, &mut |_| hits += 1).unwrap());
+        assert_eq!(hits, 0);
+        assert!(search(&store, "state", &opts, &mut |_| hits += 1).unwrap());
+        assert_eq!(hits, 1);
+    }
 }

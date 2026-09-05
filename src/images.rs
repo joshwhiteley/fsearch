@@ -1,7 +1,9 @@
-use image::DynamicImage;
+use image::{DynamicImage, ImageDecoder};
 
 /// Image preview skips files larger than this (decoding is done in memory).
 pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 32_000_000;
+const MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 
 const EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "ico", "qoi", "svg",
@@ -16,7 +18,12 @@ pub fn is_image_path(path: &str) -> bool {
 
 /// Decodes an image file (rasterizing SVGs) into a `DynamicImage`.
 pub fn load(path: &str, max_bytes: u64) -> Result<DynamicImage, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let file =
+        crate::util::open_regular_file(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular image file".into());
+    }
     if meta.len() > max_bytes {
         return Err(format!(
             "image larger than {} MiB",
@@ -28,10 +35,33 @@ pub fn load(path: &str, max_bytes: u64) -> Result<DynamicImage, String> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
     if is_svg {
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        use std::io::Read;
+        let mut data = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut data)
+            .map_err(|e| e.to_string())?;
+        if data.len() as u64 > max_bytes {
+            return Err("SVG grew beyond the input-size limit".into());
+        }
         rasterize_svg(&data)
     } else {
-        image::open(path).map_err(|e| e.to_string())
+        let format = image::ImageFormat::from_path(path).map_err(|e| e.to_string())?;
+        let mut reader = image::ImageReader::with_format(std::io::BufReader::new(file), format);
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(16_384);
+        limits.max_image_height = Some(16_384);
+        limits.max_alloc = Some(MAX_DECODE_BYTES);
+        reader.limits(limits.clone());
+        let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+        let (width, height) = decoder.dimensions();
+        if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+            return Err("image exceeds the 32 megapixel preview limit".into());
+        }
+        limits
+            .reserve(decoder.total_bytes())
+            .map_err(|e| e.to_string())?;
+        decoder.set_limits(limits).map_err(|e| e.to_string())?;
+        DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())
     }
 }
 
@@ -126,6 +156,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.png");
         std::fs::write(&path, b"not a png").unwrap();
+        assert!(load(path.to_str().unwrap(), MAX_IMAGE_BYTES).is_err());
+    }
+
+    #[test]
+    fn extreme_dimensions_are_refused_before_full_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.png");
+        image::RgbaImage::new(16_385, 1).save(&path).unwrap();
         assert!(load(path.to_str().unwrap(), MAX_IMAGE_BYTES).is_err());
     }
 }

@@ -53,7 +53,11 @@ pub fn is_office_path(path: &str) -> bool {
 /// successful parses and parse failures are cached so malformed files do not
 /// get reparsed on every query.
 pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
+    crate::util::create_private_dir(cache_dir).map_err(|e| format!("private Office cache: {e}"))?;
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular Office file".into());
+    }
     if meta.len() > MAX_OFFICE_BYTES {
         return Err(format!(
             "office file larger than {} MiB",
@@ -93,7 +97,6 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(path)))
         .unwrap_or_else(|_| Err("office parser crashed on this file".to_string()));
     IN_GUARD.with(|guard| guard.set(was_guarded));
-    let _ = std::fs::create_dir_all(cache_dir);
     let (target, body) = match &result {
         Ok(text) => (&cached, text.as_str()),
         Err(message) => (&cached_err, message.as_str()),
@@ -102,17 +105,24 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     let tmp = cache_dir.join(format!(".{key}.{}-{nonce}.tmp", std::process::id()));
     // a failed write is removed rather than renamed into place, so a
     // disk-full event can't publish truncated text as a cache hit
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, target);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+    if let Ok(mut file) = crate::util::create_private_file(&tmp) {
+        use std::io::Write;
+        let written = file
+            .write_all(body.as_bytes())
+            .and_then(|_| std::fs::rename(&tmp, target));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
     evict_oldest(cache_dir);
     result
 }
 
 fn extract(path: &str) -> Result<String, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = crate::util::open_regular_file(Path::new(path)).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_OFFICE_BYTES {
+        return Err("Office file grew beyond the input-size limit".into());
+    }
     let mut archive = ZipArchive::new(file).map_err(|e| format!("invalid office ZIP: {e}"))?;
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(format!(

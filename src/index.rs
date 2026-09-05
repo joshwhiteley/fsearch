@@ -108,11 +108,12 @@ fn tmp_path(path: &Path) -> PathBuf {
 pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> {
     checked_arena_size(entries.iter().map(|(p, _)| p.len()))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::util::create_private_dir(parent)?;
     }
     let tmp = tmp_path(path);
-    {
-        let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+    let file = crate::util::create_private_file(&tmp)?;
+    let written = (|| {
+        let mut w = BufWriter::new(file);
         w.write_all(MAGIC)?;
         w.write_all(&VERSION.to_le_bytes())?;
         w.write_all(&(entries.len() as u64).to_le_bytes())?;
@@ -128,9 +129,13 @@ pub fn save(entries: &[(String, FileMeta)], path: &Path) -> std::io::Result<()> 
         }
         w.flush()?;
         // make the bytes durable before the rename publishes them
-        w.get_ref().sync_all()?;
+        w.get_ref().sync_all()
+    })();
+    let result = written.and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    result
 }
 
 pub fn load(path: &Path) -> Option<PathStore> {

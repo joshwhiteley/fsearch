@@ -140,7 +140,7 @@ enum Msg {
         /// = cached store length), None on a cold start with no cache.
         expected: Option<usize>,
     },
-    /// One-time setup failure (bad excludes glob, unwatchable root). Keeps
+    /// Setup or runtime failure (bad excludes glob, watcher error). Keeps
     /// whatever index snapshot is already live and surfaces the reason.
     IndexError {
         error: String,
@@ -182,7 +182,16 @@ fn snippet_line(path: &str, line: u64, pdf_cache: &std::path::Path) -> Option<St
         let office_cache = crate::office::cache_dir_for(pdf_cache);
         crate::office::extract_cached(path, &office_cache).ok()
     } else {
-        std::fs::read_to_string(path).ok()
+        use std::io::Read;
+        let file = crate::util::open_regular_file(std::path::Path::new(path)).ok()?;
+        if file.metadata().ok()?.len() > sem::MAX_SEMANTIC_BYTES {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(sem::MAX_SEMANTIC_BYTES + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+        (text.len() as u64 <= sem::MAX_SEMANTIC_BYTES).then_some(text)
     }?;
     let s = text.lines().nth(line.saturating_sub(1) as usize)?;
     let s = s.trim();
@@ -200,6 +209,7 @@ struct FilenameJob {
     boosts: Arc<HashMap<String, u32>>,
     filters: Filters,
     quiet: Arc<crate::quiet::Quiet>,
+    lines: bool,
 }
 
 pub struct Engine {
@@ -213,6 +223,8 @@ pub struct Engine {
     filename_results: Vec<ResultRow>,
     semantic_results: Vec<ResultRow>,
     status: EngineStatus,
+    /// Index errors survive successful searches so watcher failures are visible.
+    index_error: Option<String>,
     mode: Mode,
     generation: u64,
     query: String,
@@ -289,16 +301,62 @@ fn start_watcher(roots: &[std::path::PathBuf]) -> (Option<WatcherStream>, usize)
     )
 }
 
-/// Folds filesystem events into fresh index snapshots, forever. Changed and
-/// created files go to the front of the list (they are the newest); deleted
-/// paths — including whole directories — are filtered out.
+#[derive(Default)]
+struct WatchBatch {
+    touched: HashSet<PathBuf>,
+    rescan: bool,
+    errors: Vec<String>,
+}
+
+impl WatchBatch {
+    fn absorb(&mut self, result: notify::Result<notify::Event>) {
+        match result {
+            Ok(event) => {
+                self.rescan |= event.need_rescan();
+                // Reading previews/content must not trigger an indexing loop.
+                if !matches!(event.kind, notify::EventKind::Access(_)) {
+                    self.touched.extend(event.paths);
+                }
+            }
+            Err(error) => {
+                self.rescan = true;
+                self.errors.push(format!("live update error: {error}"));
+            }
+        }
+    }
+}
+
+/// An ancestor refresh already replaces its whole subtree. Remove duplicate
+/// and nested paths before walking, including overlapping configured roots.
+fn disjoint_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let paths: HashSet<PathBuf> = paths.into_iter().collect();
+    let mut disjoint: Vec<_> = paths
+        .iter()
+        .filter(|path| !path.ancestors().skip(1).any(|p| paths.contains(p)))
+        .cloned()
+        .collect();
+    disjoint.sort();
+    disjoint
+}
+
+fn sort_unique_entries(entries: &mut Vec<(String, FileMeta)>) {
+    entries.sort_unstable_by(walker::mtime_cmp);
+    let mut seen = HashSet::new();
+    entries.retain(|(path, _)| seen.insert(path.clone()));
+}
+
+/// Folds filesystem events into newest-first snapshots. Lost events rebuild
+/// all configured roots, using the same excludes and app policy as startup.
 fn watch_loop(
     event_rx: &Receiver<notify::Result<notify::Event>>,
     excludes: &globset::GlobSet,
     cache_path: &std::path::Path,
     indexer_tx: &Sender<Msg>,
     mut current: Vec<(String, FileMeta)>,
+    roots: &[PathBuf],
+    index_apps: bool,
 ) {
+    let roots = disjoint_paths(roots.iter().cloned());
     let mut last_save = Instant::now();
     // single-writer courtesy: remember the cache state we produced; if the
     // file changes underneath us (another instance, a --reindex), stop
@@ -307,21 +365,21 @@ fn watch_loop(
     loop {
         // block until something happens, then debounce-collect the burst
         let Ok(first) = event_rx.recv() else { return };
-        let mut touched: std::collections::HashSet<std::path::PathBuf> = HashSet::new();
-        let mut absorb = |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                touched.extend(event.paths);
-            }
-        };
-        absorb(first);
+        let mut batch = WatchBatch::default();
+        batch.absorb(first);
         let deadline = Instant::now() + WATCH_DEBOUNCE;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match event_rx.recv_timeout(left) {
-                Ok(res) => absorb(res),
+                Ok(res) => batch.absorb(res),
                 Err(_) => break,
             }
         }
 
+        for error in batch.errors {
+            if indexer_tx.send(Msg::IndexError { error }).is_err() {
+                return;
+            }
+        }
         let mut fronts: Vec<(String, FileMeta)> = Vec::new();
         let mut gone: std::collections::HashSet<String> = HashSet::new();
         let mut gone_dir_prefixes: Vec<String> = Vec::new();
@@ -332,14 +390,18 @@ fn watch_loop(
                 fronts.push(entry);
             }
         };
-        for path in touched {
+        if batch.rescan {
+            current = walker::collect_sorted(&roots, excludes, index_apps).0;
+            batch.touched.clear();
+        }
+        for path in disjoint_paths(batch.touched) {
             if excludes.is_match(&path) {
                 continue;
             }
             let s = path.to_string_lossy().into_owned();
             if path.is_file() {
-                // front-inserted (it is the newest); the stale base copy is
-                // filtered via `gone`
+                // Replace stale metadata; final sorting uses the real mtime,
+                // not the event order (a copied file can have an old mtime).
                 let std_meta = std::fs::metadata(&path).ok();
                 let meta = FileMeta {
                     mtime: std_meta
@@ -373,7 +435,9 @@ fn watch_loop(
                         .map_or(0, |d| d.as_secs() as i64),
                     size: 0,
                 };
-                push_front(&mut fronts, &mut gone, (format!("{s}/"), meta));
+                if !roots.contains(&path) {
+                    push_front(&mut fronts, &mut gone, (format!("{s}/"), meta));
+                }
                 for entry in entries {
                     push_front(&mut fronts, &mut gone, entry);
                 }
@@ -383,7 +447,7 @@ fn watch_loop(
                 gone.insert(s);
             }
         }
-        if fronts.is_empty() && gone.is_empty() {
+        if !batch.rescan && fronts.is_empty() && gone.is_empty() {
             continue;
         }
         let mut next: Vec<(String, FileMeta)> = Vec::with_capacity(current.len() + fronts.len());
@@ -397,6 +461,7 @@ fn watch_loop(
                 .cloned(),
         );
         current = next;
+        sort_unique_entries(&mut current);
         if indexer_tx
             .send(Msg::IndexSnapshot {
                 store: Arc::new(PathStore::from_entries(&current)),
@@ -409,8 +474,14 @@ fn watch_loop(
         if last_save.elapsed() >= WATCH_SAVE_EVERY {
             last_save = Instant::now();
             if cache_mtime(cache_path) == our_stamp {
-                let _ = index::save(&current, cache_path);
-                our_stamp = cache_mtime(cache_path);
+                match index::save(&current, cache_path) {
+                    Ok(()) => our_stamp = cache_mtime(cache_path),
+                    Err(error) => {
+                        let _ = indexer_tx.send(Msg::IndexError {
+                            error: format!("saving live index: {error}"),
+                        });
+                    }
+                }
             }
         }
     }
@@ -424,15 +495,26 @@ fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
             while let Ok(newer) = job_rx.try_recv() {
                 job = newer;
             }
-            let (indices, strong, error) = match matcher::search_boosted(
-                &job.store,
-                &job.query,
-                job.mode,
-                FILENAME_LIMIT,
-                &job.boosts,
-                &job.filters,
-                &job.quiet,
-            ) {
+            let matched = if job.lines {
+                matcher::search_lines(
+                    &job.store,
+                    &job.query,
+                    job.mode,
+                    FILENAME_LIMIT,
+                    &job.filters,
+                )
+            } else {
+                matcher::search_boosted(
+                    &job.store,
+                    &job.query,
+                    job.mode,
+                    FILENAME_LIMIT,
+                    &job.boosts,
+                    &job.filters,
+                    &job.quiet,
+                )
+            };
+            let (indices, strong, error) = match matched {
                 Ok(r) => (r.indices, r.strong, None),
                 Err(e) => (Vec::new(), 0, Some(format!("invalid pattern: {e}"))),
             };
@@ -468,6 +550,7 @@ impl Engine {
         let indexer_tx = msg_tx.clone();
         let max_content_filesize = config.max_content_filesize;
         let unified = config.unified;
+        let remember_history = config.remember_history;
         std::thread::spawn(move || {
             let cached = index::load(&cache_path);
             let expected = cached.as_ref().map(|c| c.len());
@@ -499,7 +582,7 @@ impl Engine {
                 });
             }
             let (path_tx, path_rx) = mpsc::channel::<(String, FileMeta)>();
-            let roots = config.roots.clone();
+            let roots = disjoint_paths(config.roots.iter().cloned());
             let walk_excludes = excludes.clone();
             let index_apps = config.index_apps;
             let walk_thread = std::thread::spawn(move || {
@@ -525,20 +608,36 @@ impl Engine {
                 }
             }
             let _ = walk_thread.join();
-            fresh.sort_unstable_by(walker::mtime_cmp);
+            sort_unique_entries(&mut fresh);
             let _ = indexer_tx.send(Msg::IndexSnapshot {
                 store: Arc::new(PathStore::from_entries(&fresh)),
                 indexing: false,
             });
-            let _ = index::save(&fresh, &cache_path);
+            if let Err(error) = index::save(&fresh, &cache_path) {
+                let _ = indexer_tx.send(Msg::IndexError {
+                    error: format!("saving index: {error}"),
+                });
+            }
             if let Some((_watcher, event_rx)) = watcher {
                 // _watcher must stay alive for events to keep flowing
-                watch_loop(&event_rx, &excludes, &cache_path, &indexer_tx, fresh);
+                watch_loop(
+                    &event_rx,
+                    &excludes,
+                    &cache_path,
+                    &indexer_tx,
+                    fresh,
+                    &config.roots,
+                    config.index_apps,
+                );
             }
         });
 
-        let frecency = Frecency::load(history_path);
-        let boosts = Arc::new(frecency.boosts(unix_now()));
+        let frecency = remember_history.then(|| Frecency::load(history_path));
+        let boosts = Arc::new(
+            frecency
+                .as_ref()
+                .map_or_else(HashMap::new, |f| f.boosts(unix_now())),
+        );
         Engine {
             msg_rx,
             msg_tx,
@@ -551,6 +650,7 @@ impl Engine {
                 indexing: true,
                 ..Default::default()
             },
+            index_error: None,
             mode: Mode::Fuzzy,
             generation: 0,
             query: String::new(),
@@ -562,7 +662,7 @@ impl Engine {
             content_cancel: None,
             pending_semantic: None,
             sem_tx: None,
-            frecency: Some(frecency),
+            frecency,
             boosts,
             quiet: Arc::new(crate::quiet::Quiet::new(quiet_patterns)),
             unified,
@@ -603,6 +703,7 @@ impl Engine {
                 indexing: false,
                 ..Default::default()
             },
+            index_error: None,
             mode: Mode::Fuzzy,
             generation: 0,
             query: String::new(),
@@ -729,6 +830,8 @@ impl Engine {
         self.query = query.clone();
         self.status.error = None;
         self.cancel_content();
+        self.pending_content = None;
+        self.pending_semantic = None;
         self.filename_results.clear();
         self.semantic_results.clear();
         self.unified_strong = 0;
@@ -799,11 +902,11 @@ impl Engine {
                     }
                 }
                 Msg::IndexError { error } => {
-                    // one-time setup failure: keep whatever snapshot is live
+                    // Keep whatever snapshot is live
                     // (possibly none) and stop the "indexing" spinner
                     self.status.indexing = false;
                     self.status.walk = None;
-                    self.status.error = Some(error);
+                    self.index_error = Some(error);
                 }
                 Msg::FilenameResults {
                     generation,
@@ -934,7 +1037,9 @@ impl Engine {
     }
 
     pub fn status(&self) -> EngineStatus {
-        self.status.clone()
+        let mut status = self.status.clone();
+        status.error = status.error.or_else(|| self.index_error.clone());
+        status
     }
 
     pub fn mode(&self) -> Mode {
@@ -954,6 +1059,7 @@ impl Engine {
             boosts: self.boosts.clone(),
             filters: self.filters.clone(),
             quiet: self.quiet.clone(),
+            lines: self.filter,
         });
     }
 
@@ -1110,19 +1216,8 @@ impl Engine {
                     (Some((embedder, store)), _) => {
                         match embedder.embed(std::slice::from_ref(&job.query)) {
                             Ok(qv) => {
-                                // over-fetch when metadata/path filters are
-                                // active (they are applied after ranking) so
-                                // filtering doesn't drop the recall count
-                                let fetch = if job.filters.is_empty() {
-                                    SEMANTIC_LIMIT
-                                } else {
-                                    SEMANTIC_LIMIT * 4
-                                };
                                 let rows: Vec<ResultRow> = store
-                                    .query(&qv[0], fetch)
-                                    .into_iter()
-                                    .filter(|h| {
-                                        let doc = &store.docs[h.doc];
+                                    .query_filtered(&qv[0], SEMANTIC_LIMIT, |doc| {
                                         job.filters.is_empty()
                                             || (job.filters.matches(&doc.path)
                                                 && job.filters.matches_meta(&FileMeta {
@@ -1130,7 +1225,7 @@ impl Engine {
                                                     size: doc.size,
                                                 }))
                                     })
-                                    .take(SEMANTIC_LIMIT)
+                                    .into_iter()
                                     .enumerate()
                                     .map(|(i, h)| {
                                         let score = h.score.clamp(0.0, 1.0);
@@ -1187,33 +1282,277 @@ impl Engine {
 mod tests {
     use super::*;
 
+    #[test]
+    fn semantic_snippets_reject_grown_files_and_cap_normal_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.txt");
+        std::fs::write(&file, format!("first\n{}\n", "é".repeat(300))).unwrap();
+        let text = snippet_line(file.to_str().unwrap(), 2, dir.path()).unwrap();
+        assert_eq!(text.chars().count(), 160);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(sem::MAX_SEMANTIC_BYTES * 1000)
+            .unwrap();
+        assert!(snippet_line(file.to_str().unwrap(), 1, dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_snippets_reject_fifo_without_waiting_for_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.txt");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C path to a unique temporary-directory entry.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(snippet_line(path.to_str().unwrap(), 1, dir.path()).is_none());
+    }
+
+    fn watch_messages(
+        current: Vec<(String, FileMeta)>,
+        events: Vec<notify::Result<notify::Event>>,
+        roots: &[PathBuf],
+        excludes: &globset::GlobSet,
+        apps: bool,
+    ) -> Vec<Msg> {
+        let dir = tempfile::tempdir().unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        for event in events {
+            event_tx.send(event).unwrap();
+        }
+        // No timing or OS watcher dependency: EOF ends the debounce burst.
+        drop(event_tx);
+        let (index_tx, index_rx) = mpsc::channel();
+        watch_loop(
+            &event_rx,
+            excludes,
+            &dir.path().join("index.bin"),
+            &index_tx,
+            current,
+            roots,
+            apps,
+        );
+        drop(index_tx);
+        index_rx.into_iter().collect()
+    }
+
+    fn snapshot_entries(messages: &[Msg]) -> Vec<(String, FileMeta)> {
+        messages
+            .iter()
+            .find_map(|msg| match msg {
+                Msg::IndexSnapshot { store, .. } => Some(
+                    (0..store.len())
+                        .map(|i| (store.get(i).to_string(), store.meta(i)))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("snapshot")
+    }
+
+    #[test]
+    fn watcher_ignores_access_events() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("read.txt"), "x").unwrap();
+        let excludes = walker::build_exclude_set(&[]).unwrap();
+        let events = vec![Ok(notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Any,
+        ))
+        .add_path(dir.path().to_path_buf()))];
+        assert!(watch_messages(Vec::new(), events, &[], &excludes, false).is_empty());
+    }
+
+    #[test]
+    fn watcher_rescan_and_errors_rebuild_configured_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skip")).unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("skip/hidden.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("nested/new.txt"), "x").unwrap();
+        let roots = vec![dir.path().to_path_buf(), dir.path().join("nested")];
+        let excludes = walker::build_exclude_set(&["skip".to_string()]).unwrap();
+        let expected = walker::collect_sorted(&roots[..1], &excludes, false).0;
+        for event in [
+            Ok(notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+            Err(notify::Error::generic("lost event stream")),
+        ] {
+            let is_error = event.is_err();
+            let messages = watch_messages(
+                vec![("/stale.txt".to_string(), FileMeta::default())],
+                vec![event],
+                &roots,
+                &excludes,
+                false,
+            );
+            assert_eq!(snapshot_entries(&messages), expected);
+            assert_eq!(
+                messages.iter().any(|msg| matches!(msg,
+                    Msg::IndexError { error } if error.contains("lost event stream")
+                )),
+                is_error
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_rescan_preserves_app_policy() {
+        let excludes = walker::build_exclude_set(&["*.app".to_string()]).unwrap();
+        // Match the production app collector without assuming apps are installed.
+        let mut expected = walker::collect_sorted(&[], &excludes, true).0;
+        sort_unique_entries(&mut expected);
+        let events = vec![Ok(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        )];
+        let messages = watch_messages(Vec::new(), events, &[], &excludes, true);
+        assert_eq!(snapshot_entries(&messages), expected);
+    }
+
+    #[test]
+    fn watcher_sorts_real_mtimes_and_deduplicates_overlapping_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let old = sub.join("old.txt");
+        let newest = root.join("newest.txt");
+        for (path, time) in [(&old, 100), (&newest, 300), (&sub, 200)] {
+            if path != &sub {
+                std::fs::write(path, "x").unwrap();
+            }
+            let file = std::fs::File::open(path).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(time))
+                .unwrap();
+        }
+        let excludes = walker::build_exclude_set(&[]).unwrap();
+        let current = vec![(
+            newest.to_string_lossy().into_owned(),
+            FileMeta {
+                mtime: 300,
+                size: 1,
+            },
+        )];
+        let events = [sub.clone(), old.clone(), sub.clone(), old]
+            .into_iter()
+            .map(|path| Ok(notify::Event::new(notify::EventKind::Other).add_path(path)))
+            .collect();
+        let messages = watch_messages(current, events, &[root, sub.clone()], &excludes, false);
+        let entries = snapshot_entries(&messages);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, meta)| meta.mtime)
+                .collect::<Vec<_>>(),
+            [300, 200, 100]
+        );
+        assert_eq!(
+            disjoint_paths([sub.clone(), sub.join("child"), sub]),
+            vec![dir.path().join("sub")]
+        );
+    }
+
+    #[test]
+    fn index_entries_are_unique_and_mtime_ties_use_path_order() {
+        let mut entries = vec![
+            ("/b".into(), FileMeta { mtime: 10, size: 1 }),
+            ("/a".into(), FileMeta { mtime: 10, size: 1 }),
+            ("/b".into(), FileMeta { mtime: 5, size: 1 }),
+            ("/new".into(), FileMeta { mtime: 20, size: 1 }),
+        ];
+        sort_unique_entries(&mut entries);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["/new", "/a", "/b"]
+        );
+        assert_eq!(entries[2].1.mtime, 10);
+    }
+
+    #[test]
+    fn watcher_root_refresh_does_not_add_root_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child.txt"), "x").unwrap();
+        let root = dir.path().to_path_buf();
+        let excludes = walker::build_exclude_set(&[]).unwrap();
+        let messages = watch_messages(
+            Vec::new(),
+            vec![Ok(
+                notify::Event::new(notify::EventKind::Other).add_path(root.clone())
+            )],
+            &[root],
+            &excludes,
+            false,
+        );
+        assert_eq!(snapshot_entries(&messages).len(), 1);
+    }
+
+    #[test]
+    fn runtime_index_errors_survive_successful_searches() {
+        let mut engine = Engine::from_lines(vec!["alpha".to_string()]);
+        engine
+            .msg_tx
+            .send(Msg::IndexError {
+                error: "live update error".to_string(),
+            })
+            .unwrap();
+        wait_for(&mut engine, |e| e.results().len() == 1);
+        engine.set_query("alpha", false);
+        engine.tick();
+        assert_eq!(engine.status().error.as_deref(), Some("live update error"));
+    }
+
+    #[test]
+    fn empty_queries_cancel_debounced_content_and_semantic_jobs() {
+        for (input, empty) in [
+            ("> old", ">"),
+            ("? old", "?"),
+            ("> old", "> ext:txt"),
+            ("? old", "? ext:txt"),
+        ] {
+            let mut engine = Engine::from_lines(Vec::new());
+            engine.filter = false;
+            engine.set_query(input, false);
+            let past = Instant::now() - CONTENT_DEBOUNCE;
+            if let Some((_, at)) = engine.pending_content.as_mut() {
+                *at = past;
+            }
+            if let Some((_, at)) = engine.pending_semantic.as_mut() {
+                *at = past;
+            }
+            engine.set_query(empty, false);
+            engine.tick();
+            assert!(engine.pending_content.is_none(), "{empty}");
+            assert!(engine.pending_semantic.is_none(), "{empty}");
+            assert!(engine.content_cancel.is_none(), "{empty}");
+            assert!(engine.sem_tx.is_none(), "{empty}");
+            assert!(engine.results().is_empty(), "{empty}");
+        }
+    }
+
     /// Feeds one debounced event for `path` into `watch_loop` and returns
     /// the paths of the snapshot it publishes.
     fn watch_snapshot(
         current: Vec<(String, FileMeta)>,
         touched: std::path::PathBuf,
     ) -> Vec<String> {
-        let dir = tempfile::tempdir().unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
-        event_tx
-            .send(Ok(
-                notify::Event::new(notify::EventKind::Other).add_path(touched)
-            ))
-            .unwrap();
-        drop(event_tx); // ends the loop after the burst is folded
-        let (index_tx, index_rx) = mpsc::channel();
-        let excludes = globset::GlobSetBuilder::new().build().unwrap();
-        watch_loop(
-            &event_rx,
-            &excludes,
-            &dir.path().join("index.bin"),
-            &index_tx,
+        let excludes = walker::build_exclude_set(&[]).unwrap();
+        let messages = watch_messages(
             current,
+            vec![Ok(
+                notify::Event::new(notify::EventKind::Other).add_path(touched)
+            )],
+            &[],
+            &excludes,
+            false,
         );
-        match index_rx.recv().unwrap() {
-            Msg::IndexSnapshot { store, .. } => store.iter().map(str::to_string).collect(),
-            _ => panic!("expected an index snapshot"),
-        }
+        snapshot_entries(&messages)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
     }
 
     #[test]

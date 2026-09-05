@@ -60,14 +60,12 @@ pub fn append_query(path: &std::path::Path, query: &str) {
     if query.trim().is_empty() {
         return;
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    if let Some(parent) = path.parent()
+        && crate::util::create_private_dir(parent).is_err()
     {
+        return;
+    }
+    if let Ok(mut f) = crate::util::append_private_file(path) {
         let _ = writeln!(f, "{}", query.trim());
     }
 }
@@ -117,14 +115,12 @@ impl Frecency {
             .or_insert(Entry { count: 0, last: 0 });
         e.count = e.count.saturating_add(1);
         e.last = e.last.max(ts);
-        if let Some(parent) = self.file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file)
+        if let Some(parent) = self.file.parent()
+            && crate::util::create_private_dir(parent).is_err()
         {
+            return;
+        }
+        if let Ok(mut f) = crate::util::append_private_file(&self.file) {
             let _ = writeln!(f, "{ts}\t1\t{path}");
         }
     }
@@ -160,11 +156,14 @@ impl Frecency {
         let tmp = self
             .file
             .with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-        let ok = std::fs::File::create(&tmp).and_then(|mut f| {
+        let Ok(mut f) = crate::util::create_private_file(&tmp) else {
+            return;
+        };
+        let ok = (|| {
             f.write_all(body.as_bytes())?;
             // make the bytes durable before the rename publishes them
             f.sync_all()
-        });
+        })();
         if ok.is_ok() {
             let _ = std::fs::rename(&tmp, &self.file);
         } else {

@@ -56,6 +56,10 @@ pub struct Config {
     /// Restore the preview layout and row density from the last run
     /// (state file at ~/.local/state/fsearch/session.toml).
     pub remember_session: bool,
+    /// Persist and use open/query history. Independent of layout memory.
+    pub remember_history: bool,
+    /// Named initial queries and scopes, selected with --saved NAME.
+    pub searches: HashMap<String, String>,
     /// Substring patterns demoted below the fold and off the launch screen.
     pub quiet: Vec<String>,
     /// Include /Applications app bundles in the index (macOS).
@@ -98,14 +102,13 @@ impl CustomAction {
         {
             return false;
         }
-        if let Some(kind) = &self.kind {
-            if !ext
+        if let Some(kind) = &self.kind
+            && !ext
                 .as_deref()
                 .and_then(crate::filters::kind_for_ext)
                 .is_some_and(|actual| actual.eq_ignore_ascii_case(kind))
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     }
@@ -191,6 +194,8 @@ impl Default for Config {
             keys: HashMap::new(),
             mouse: true,
             remember_session: true,
+            remember_history: true,
+            searches: HashMap::new(),
             quiet: crate::quiet::DEFAULT_QUIET
                 .iter()
                 .map(|s| s.to_string())
@@ -213,6 +218,8 @@ struct RawConfig {
     keys: Option<HashMap<String, KeySpec>>,
     mouse: Option<bool>,
     remember_session: Option<bool>,
+    remember_history: Option<bool>,
+    searches: Option<HashMap<String, String>>,
     quiet: Option<Vec<String>>,
     index_apps: Option<bool>,
     icons: Option<bool>,
@@ -281,6 +288,9 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # unified: blend bare filename and semantic results (true/false)
 # quiet: substrings demoted in ranking (app internals); set [] to disable
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
+# remember_history: save and use file-open/query history (true/false)
+# [searches] named queries, e.g. recent = \"kind:doc changed:7d\"
+#   Run with fsearch --saved recent (or --saved recent -p report).
 # remember_session: restore preview layout and row density between runs
 #   (true/false)
 # Custom actions run argv directly (never through a shell). Paths support
@@ -390,9 +400,12 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
             DEFAULT_TEMPLATE_HEADER, d.excludes, d.max_content_filesize
         );
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("creating config dir")?;
+            crate::util::create_private_dir(parent).context("creating config dir")?;
         }
-        std::fs::write(path, body).context("writing default config")?;
+        use std::io::Write;
+        let mut file = crate::util::create_private_file(path).context("creating default config")?;
+        file.write_all(body.as_bytes())
+            .context("writing default config")?;
         return Ok(d);
     }
     let text = std::fs::read_to_string(path).context("reading config")?;
@@ -439,6 +452,8 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
             .unwrap_or_default(),
         mouse: raw.mouse.unwrap_or(true),
         remember_session: raw.remember_session.unwrap_or(true),
+        remember_history: raw.remember_history.unwrap_or(true),
+        searches: raw.searches.unwrap_or_default(),
         quiet: raw.quiet.unwrap_or_else(|| d.quiet.clone()),
         index_apps: raw.index_apps.unwrap_or(true),
         icons: raw.icons.unwrap_or(false),

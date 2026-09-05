@@ -48,16 +48,21 @@ pub fn load(path: &Path) -> SessionState {
 /// concurrent fsearch processes never truncate each other's temp file.
 pub fn save(path: &Path, preview_layout: &str, density: &str) {
     let body = format!("preview_layout = \"{preview_layout}\"\ndensity = \"{density}\"\n");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && crate::util::create_private_dir(parent).is_err()
+    {
+        return;
     }
     let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-    let ok = std::fs::File::create(&tmp).and_then(|mut f| {
+    let Ok(mut f) = crate::util::create_private_file(&tmp) else {
+        return;
+    };
+    let ok = (|| {
         f.write_all(body.as_bytes())?;
         // make the bytes durable before the rename publishes them
         f.sync_all()
-    });
+    })();
     if ok.is_ok() {
         let _ = std::fs::rename(&tmp, path);
     } else {
