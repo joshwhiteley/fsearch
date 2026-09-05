@@ -55,7 +55,7 @@ resvg = { version = "0.48", default-features = false, features = ["raster-images
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Parse $VISUAL/$EDITOR as argv without executing a shell.
-shlex = "1"
+shlex = "2"
 syntect = "5"
 tar = { version = "0.4", default-features = false }
 terminal-colorsaurus = "1"
