@@ -58,7 +58,7 @@ pub struct Config {
     pub remember_session: bool,
     /// Persist and use open/query history. Independent of layout memory.
     pub remember_history: bool,
-    /// Named initial queries and scopes, selected with --saved NAME.
+    /// Named queries/scopes, selected with --saved NAME or the ctrl-l picker.
     pub searches: HashMap<String, String>,
     /// Substring patterns demoted below the fold and off the launch screen.
     pub quiet: Vec<String>,
@@ -281,7 +281,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 #           e.g. selection_bg = \"#313244\"
 # [keys] remaps commands, e.g. quit = \"ctrl-q\", move_up = [\"up\", \"ctrl-k\"]
 #   help = [\"f1\", \"ctrl-o\"], toggle_mark = \"ctrl-s\", clear_marks = \"alt-s\"
-#   theme_cycle = \"ctrl-g\"
+#   theme_cycle = \"ctrl-g\", saved_searches = \"ctrl-l\"
 #   (text editing keys - typing, backspace, cursor, ctrl-a/e/w/d - are fixed)
 # index_apps: include /Applications app bundles in the index (macOS)
 # icons: nerd-font glyphs before filenames (true/false; needs a nerd font)
@@ -290,7 +290,7 @@ const DEFAULT_TEMPLATE_HEADER: &str = "\
 # mouse: click to select, double-click to open, wheel scrolls (true/false)
 # remember_history: save and use file-open/query history (true/false)
 # [searches] named queries, e.g. recent = \"kind:doc changed:7d\"
-#   Run with fsearch --saved recent (or --saved recent -p report).
+#   Use ctrl-l in the UI, or fsearch --saved recent (--saved recent -p report).
 # remember_session: restore preview layout and row density between runs
 #   (true/false)
 # Custom actions run argv directly (never through a shell). Paths support

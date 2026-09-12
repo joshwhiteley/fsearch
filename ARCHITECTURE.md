@@ -50,6 +50,7 @@ src/
     rows.rs    result row rendering
     preview.rs preview worker + pane
     chrome.rs  input, wrapped help, status, gauge, toasts, menu
+    saved.rs   modal saved-search filtering, selection, and rendering
     tests.rs   TUI test suite
 ```
 
@@ -74,7 +75,10 @@ The indexer publishes complete replacement snapshots; searches clone the
 increments a generation. Workers tag their results with the generation they
 were started for; the engine drops anything stale on arrival. Content
 searches additionally carry an `Arc<AtomicBool>` cancel flag so an obsolete
-grep stops burning CPU mid-file.
+grep stops burning CPU mid-file. Query activity includes debounce time and
+in-flight filename/content/semantic work. A generation-tagged content
+completion clears activity even when a search produces no hits, so the UI
+distinguishes pending results from a completed empty search.
 
 **Latest-job-wins search worker.** The filename-search worker drains its
 queue to the newest job before running it, so typing fast never queues up
@@ -213,7 +217,10 @@ atomic with that check. Cancellation takes effect between files.
 
 CLI options precede the command; the rest of `-p`/`--pick`/`--filter` is query
 text. `[searches]` supplies named queries/scopes through `--saved NAME`;
-`--searches` lists them. There is no interactive saved-search picker.
+`--searches` lists them. The `ctrl-l` saved-search picker keeps its own editor
+and selection. Applying a search replaces the live query and clears regex
+mode; cancellation leaves the live editor untouched. The picker is disabled
+for stdin filtering, destination selection, and active transfers.
 
 `output.rs` separates records from display formatting. `--json` emits typed
 NDJSON hits/selections (`--big` emits file metadata); `--json --status` emits

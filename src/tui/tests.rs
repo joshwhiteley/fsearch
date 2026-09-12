@@ -333,20 +333,25 @@ fn long_input_scrolls_to_keep_the_cursor_visible() {
 fn empty_state_shows_no_matches_and_minimal_footer() {
     use crate::engine::ResultRow;
     let mut app = test_app();
-    // no injected rows: the launch screen has nothing to list. Wait patiently:
-    // under a loaded test runner the initial walk can exceed tick_until's budget.
+    app.editor.input = "missing-result".into();
+    app.editor.input_cursor = app.editor.input.len();
+    app.refresh_query();
+    // Wait for both the initial walk and current query to settle.
+    // Under a loaded runner the initial walk can exceed tick_until's budget.
     for _ in 0..2000 {
         app.engine.tick();
-        if !app.engine.status().indexing {
+        let status = app.engine.status();
+        if !status.indexing && !status.searching {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(!app.engine.status().indexing && !app.engine.status().searching);
     app.engine.inject_results_for_test(Vec::<ResultRow>::new());
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
-    assert!(text.contains("(no matches)"), "empty-state message missing");
+    assert!(text.contains("No matches"), "empty-state message missing");
     assert!(text.contains("esc quit"), "minimal footer missing");
     assert!(text.contains("ctrl-u clear"), "minimal footer missing");
 }
@@ -1124,7 +1129,7 @@ fn toast_error_renders_red_without_checkmark() {
 }
 
 #[test]
-fn preview_header_shows_name_and_line_count() {
+fn preview_header_shows_name_and_preview_row_count() {
     use crate::engine::ResultRow;
     let mut app = test_app();
     app.preview_layout = PreviewLayout::Full; // keeps the buffer header-only
@@ -1149,7 +1154,10 @@ fn preview_header_shows_name_and_line_count() {
     let text = buffer_text(&terminal);
     assert!(text.contains("notes.md"), "header filename missing");
     assert!(text.contains("/a/b/"), "header parent path missing");
-    assert!(text.contains("100 lines"), "line count missing");
+    assert!(
+        text.contains("100 preview rows"),
+        "preview row count missing"
+    );
     assert!(text.contains("2.0 KB"), "size missing");
 }
 
@@ -1174,7 +1182,10 @@ fn preview_position_indicator_overflows_short_pane() {
     let text = buffer_text(&terminal);
     // Wrapped query and contextual help leave 12 preview-body rows;
     // content gets 11 and the bottom row shows its position.
-    assert!(text.contains("1–11 / 100"), "position indicator missing");
+    assert!(
+        text.contains("1–11 / 100 preview rows"),
+        "position indicator missing"
+    );
 }
 
 #[test]
@@ -1217,8 +1228,8 @@ fn help_overlay_opens_via_key_and_lists_configured_bindings() {
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
     assert!(app.help.open, "ctrl-o must open the help overlay");
 
-    // 32 rows: the full listing (29 lines) fits without scrolling
-    let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
+    // Leave room for the full action listing and fixed-editing note.
+    let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
     assert!(text.contains("help"), "overlay title missing");
@@ -2004,6 +2015,284 @@ fn batch_runner_reports_partial_failures_and_continues() {
     assert!(summary.contains("trashed 2/3 files"));
     assert!(summary.contains("1 failed"));
     assert!(summary.contains("/bad: permission denied"));
+}
+
+fn saved_app() -> App {
+    let mut app = test_app();
+    app.preview_layout = PreviewLayout::Hidden;
+    app.configure_saved_searches(
+        [
+            ("Zebra".into(), "kind:doc changed:7d".into()),
+            ("Café 東京".into(), "> naïve  spacing ext:rs".into()),
+            ("Alpha".into(), "path:PROJECT ext:md".into()),
+        ]
+        .into(),
+    );
+    app
+}
+
+fn saved_type(app: &mut App, text: &str) {
+    for c in text.chars() {
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+    }
+}
+
+#[test]
+fn saved_cancel_preserves_query_editor_selection_regex_and_history() {
+    let mut app = saved_app();
+    app.editor.input = "prior.*query".into();
+    app.editor.input_cursor = 5;
+    app.editor.input_scroll = 2;
+    app.regex_mode = true;
+    app.refresh_query();
+    app.selected = 2;
+    app.selection_anchor = Some("/tmp/prior".into());
+    app.show_weak = true;
+    app.history.pos = Some(1);
+    app.list_state = ListState::default().with_offset(3);
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)));
+    saved_type(&mut app, "東京");
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(app.saved_picker.is_none());
+    assert_eq!(app.editor.input, "prior.*query");
+    assert_eq!(app.editor.input_cursor, 5);
+    assert_eq!(app.editor.input_scroll, 2);
+    assert_eq!(app.selected, 2);
+    assert_eq!(app.selection_anchor.as_deref(), Some("/tmp/prior"));
+    assert!(app.show_weak);
+    assert!(app.regex_mode);
+    assert_eq!(app.engine.mode(), crate::engine::Mode::Regex);
+    assert_eq!(app.history.pos, Some(1));
+    assert_eq!(app.list_state.offset(), 3);
+    app.open_saved_searches();
+    assert!(app.saved_picker.as_ref().unwrap().editor.input.is_empty());
+}
+
+#[test]
+fn saved_apply_replaces_full_query_through_normal_refresh_in_pick_mode() {
+    let mut app = saved_app();
+    app.ui_mode = UiMode::Pick;
+    app.editor.input = "old.*".into();
+    app.editor.input_cursor = app.editor.input.len();
+    app.regex_mode = true;
+    app.refresh_query();
+    app.selected = 4;
+    app.selection_anchor = Some("old".into());
+    app.history.pos = Some(0);
+    app.show_weak = true;
+    app.open_saved_searches();
+    saved_type(&mut app, "CAFÉ");
+    assert_eq!(app.saved_picker.as_ref().unwrap().matches, [1]);
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(app.saved_picker.is_none());
+    assert_eq!(app.editor.input, "> naïve  spacing ext:rs");
+    assert_eq!(app.editor.input_cursor, app.editor.input.len());
+    assert_eq!(app.editor.input_scroll, 0);
+    assert!(!app.regex_mode);
+    assert_eq!(app.engine.mode(), crate::engine::Mode::Content);
+    assert_eq!(app.selected, 0);
+    assert!(app.selection_anchor.is_none());
+    assert!(app.history.pos.is_none());
+    assert!(!app.show_weak);
+    assert!(
+        app.picked.is_none(),
+        "applying a query must not exit --pick"
+    );
+    app.open_saved_searches();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(app.editor.input, "path:PROJECT ext:md");
+    assert_eq!(app.engine.mode(), crate::engine::Mode::Fuzzy);
+}
+
+#[test]
+fn saved_filter_matches_names_queries_and_edits_unicode_safely() {
+    let mut app = saved_app();
+    app.open_saved_searches();
+    assert_eq!(app.saved_searches[0].0, "Alpha", "config order is stable");
+    saved_type(&mut app, "project");
+    assert_eq!(app.saved_picker.as_ref().unwrap().matches, [0]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    saved_type(&mut app, "東x京");
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    let picker = app.saved_picker.as_ref().unwrap();
+    assert_eq!(picker.editor.input, "東京");
+    assert_eq!(picker.editor.input_cursor, "東".len());
+    assert_eq!(picker.matches, [1]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(app.saved_picker.as_ref().unwrap().editor.input, "京");
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    saved_type(&mut app, "NAÏVE");
+    assert_eq!(app.saved_picker.as_ref().unwrap().matches, [1]);
+    assert!(
+        app.editor.input.is_empty(),
+        "filter never changes live query"
+    );
+}
+
+#[test]
+fn saved_remapped_open_navigation_apply_and_help() {
+    let mut app = saved_app();
+    app.keymap = crate::keymap::Keymap::from_config(
+        &[
+            ("saved_searches".into(), vec!["f4".into()]),
+            ("move_down".into(), vec!["f5".into()]),
+            ("move_up".into(), vec!["f6".into()]),
+            ("open".into(), vec!["f7".into()]),
+        ]
+        .into(),
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(app.saved_picker.is_none());
+    app.help.open = true;
+    let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("saved searches"));
+    assert!(text.contains("f4"));
+    app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+    assert!(!app.help.open);
+    app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+    assert_eq!(app.saved_picker.as_ref().unwrap().selected, 1);
+    app.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+    assert_eq!(app.saved_picker.as_ref().unwrap().selected, 0);
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+    assert_eq!(app.editor.input, "> naïve  spacing ext:rs");
+    app.menu = Some(0);
+    app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+    assert!(app.menu.is_none());
+    assert!(app.saved_picker.is_some());
+}
+
+#[test]
+fn saved_empty_config_and_no_matches_do_not_apply() {
+    let mut app = saved_app();
+    app.configure_saved_searches(Default::default());
+    app.editor.input = "keep me".into();
+    app.editor.input_cursor = app.editor.input.len();
+    app.open_saved_searches();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("No saved searches"));
+    assert!(text.contains("[searches]"));
+    assert!(text.contains("config.toml"));
+    for code in [KeyCode::Up, KeyCode::Down, KeyCode::Enter] {
+        assert!(app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+    assert!(app.saved_picker.is_some());
+    assert_eq!(app.editor.input, "keep me");
+    let mut app = saved_app();
+    app.open_saved_searches();
+    saved_type(&mut app, "unmatched");
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("No matching saved searches"));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(app.saved_picker.is_some());
+    assert!(app.editor.input.is_empty());
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(app.saved_picker.as_ref().unwrap().matches.len(), 3);
+}
+
+#[test]
+fn saved_scroll_small_terminals_and_unicode_cursor_are_safe() {
+    let mut app = saved_app();
+    app.configure_saved_searches(
+        (0..100)
+            .map(|i| (format!("saved-{i:03}"), format!("query-{i:03}")))
+            .collect(),
+    );
+    app.open_saved_searches();
+    for _ in 0..75 {
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    }
+    let mut terminal = Terminal::new(TestBackend::new(45, 9)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("saved-075 — query-075"));
+    assert!(app.saved_picker.as_ref().unwrap().list_state.offset() > 0);
+    for border in [BorderKind::Rounded, BorderKind::None] {
+        app.theme.borders = border;
+        for (width, height) in [(1, 1), (2, 2), (3, 3), (8, 4), (20, 6)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            saved_type(&mut app, "東京é界".repeat(20).as_str());
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn saved_mouse_is_modal_and_never_activates_underlying_pick() {
+    let mut app = saved_app();
+    app.ui_mode = UiMode::Pick;
+    app.engine
+        .inject_results_for_test(vec![file_row("/tmp/first"), file_row("/tmp/second")]);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let area = app.hit_test.results_area;
+    app.hit_test.last_click = Some((0, Instant::now()));
+    app.open_saved_searches();
+    assert!(app.hit_test.last_click.is_none());
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::ScrollDown,
+    ] {
+        assert!(app.handle_mouse(MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE
+        }));
+    }
+    assert_eq!(app.selected, 0);
+    assert!(app.picked.is_none());
+    assert!(app.saved_picker.is_some());
+    assert_eq!(app.saved_picker.as_ref().unwrap().selected, 1);
+}
+
+#[test]
+fn saved_disabled_in_filter_destination_and_transfer_but_not_pick() {
+    let mut filter = test_filter_app();
+    filter.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(filter.saved_picker.is_none());
+    assert!(filter.editor.input.is_empty());
+    let mut app = saved_app();
+    app.editor.input = "target".into();
+    app.editor.input_cursor = app.editor.input.len();
+    app.destination_picker = Some(super::DestinationPicker {
+        kind: crate::actions::TransferKind::Copy,
+        paths: vec!["/tmp/file".into()],
+        previous_query: "previous".into(),
+        previous_selected: 0,
+        previous_show_weak: false,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(app.saved_picker.is_none());
+    assert!(app.destination_picker.is_some());
+    assert_eq!(app.editor.input, "target");
+    app.destination_picker = None;
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.transfer_job = Some(super::TransferJob {
+        kind: crate::actions::TransferKind::Copy,
+        total: 1,
+        done: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(app.saved_picker.is_none());
+    assert_eq!(app.editor.input, "target");
+    app.transfer_job = None;
+    app.ui_mode = UiMode::Pick;
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(app.saved_picker.is_some());
 }
 
 #[test]

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `ctrl-l` opens a filterable saved-search picker from `[searches]`; Enter
+  applies a query and Escape cancels. The shortcut is remappable
+- Text previews mark the matched line and explicitly label bounded excerpts;
+  empty text and matches beyond the loaded excerpt get explanatory messages
+- Empty result panes distinguish indexing, active search, errors and no
+  matches, with mode-specific guidance and configured clear/regex shortcuts
 - Source files gain an "open in nvim" action. fsearch temporarily leaves its
   terminal screen, runs Neovim in the foreground, then restores the same
   search session when Neovim exits. Content/semantic hits open at their

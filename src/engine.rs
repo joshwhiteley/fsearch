@@ -122,6 +122,8 @@ fn merge_unified_results(filename: &[ResultRow], semantic: &[ResultRow]) -> Vec<
 pub struct EngineStatus {
     pub indexed: usize,
     pub indexing: bool,
+    /// Current-query work, including the debounce window and streamed content.
+    pub searching: bool,
     pub matches: usize,
     pub error: Option<String>,
     /// (files walked so far, expected total from the previous index) during
@@ -160,6 +162,9 @@ enum Msg {
     ContentError {
         generation: u64,
         error: String,
+    },
+    ContentDone {
+        generation: u64,
     },
     SemanticResults {
         generation: u64,
@@ -235,6 +240,8 @@ pub struct Engine {
     pending_content: Option<(String, Instant)>,
     content_cancel: Option<Arc<AtomicBool>>,
     pending_semantic: Option<(String, Instant)>,
+    filename_running: bool,
+    semantic_running: bool,
     sem_tx: Option<Sender<SemJob>>,
     /// Open history; None in filter mode (stdin lines are not files, so
     /// nothing is recorded or persisted).
@@ -661,6 +668,8 @@ impl Engine {
             pending_content: None,
             content_cancel: None,
             pending_semantic: None,
+            filename_running: false,
+            semantic_running: false,
             sem_tx: None,
             frecency,
             boosts,
@@ -714,6 +723,8 @@ impl Engine {
             pending_content: None,
             content_cancel: None,
             pending_semantic: None,
+            filename_running: false,
+            semantic_running: false,
             sem_tx: None,
             frecency: None,
             boosts,
@@ -772,6 +783,9 @@ impl Engine {
     }
 
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
+        // Old-generation replies cannot settle work for the new query.
+        self.filename_running = false;
+        self.semantic_running = false;
         if self.filter {
             // filter mode: no `>`/`?`/prefix parsing — those are ordinary
             // text; only the regex toggle and the ext:/path: filters apply
@@ -885,6 +899,8 @@ impl Engine {
                     }
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
                         self.generation += 1;
+                        self.semantic_running = false;
+                        self.pending_semantic = None;
                         self.dispatch_filename();
                         if self.is_unified_query() && semantic_store_available() {
                             // The index update invalidates the generation of a
@@ -917,6 +933,7 @@ impl Engine {
                     if generation != self.generation {
                         continue;
                     }
+                    self.filename_running = false;
                     self.filename_results = indices
                         .into_iter()
                         .filter(|&i| i < self.store.len())
@@ -968,6 +985,11 @@ impl Engine {
                     }
                     self.status.error = Some(error);
                 }
+                Msg::ContentDone { generation } => {
+                    if generation == self.generation {
+                        self.content_cancel = None;
+                    }
+                }
                 Msg::SemanticResults {
                     generation,
                     rows,
@@ -976,6 +998,7 @@ impl Engine {
                     if generation != self.generation {
                         continue;
                     }
+                    self.semantic_running = false;
                     let f = &self.filters;
                     let rows: Vec<ResultRow> = rows
                         .into_iter()
@@ -1038,6 +1061,11 @@ impl Engine {
 
     pub fn status(&self) -> EngineStatus {
         let mut status = self.status.clone();
+        status.searching = self.filename_running
+            || self.semantic_running
+            || self.pending_content.is_some()
+            || self.content_cancel.is_some()
+            || self.pending_semantic.is_some();
         status.error = status.error.or_else(|| self.index_error.clone());
         status
     }
@@ -1046,21 +1074,24 @@ impl Engine {
         self.mode
     }
 
-    fn dispatch_filename(&self) {
+    fn dispatch_filename(&mut self) {
         let mode = match self.mode {
             Mode::Regex => FilenameMode::Regex,
             _ => FilenameMode::Fuzzy,
         };
-        let _ = self.job_tx.send(FilenameJob {
-            generation: self.generation,
-            query: self.query.clone(),
-            mode,
-            store: self.store.clone(),
-            boosts: self.boosts.clone(),
-            filters: self.filters.clone(),
-            quiet: self.quiet.clone(),
-            lines: self.filter,
-        });
+        self.filename_running = self
+            .job_tx
+            .send(FilenameJob {
+                generation: self.generation,
+                query: self.query.clone(),
+                mode,
+                store: self.store.clone(),
+                boosts: self.boosts.clone(),
+                filters: self.filters.clone(),
+                quiet: self.quiet.clone(),
+                lines: self.filter,
+            })
+            .is_ok();
     }
 
     fn fire_due_content_search(&mut self) {
@@ -1113,12 +1144,15 @@ impl Engine {
             }
             // an invalid content pattern surfaces as a typed error so the
             // filename channel stays pure filename results
-            if let Ok(Err(e)) = searcher.join() {
-                let _ = tx.send(Msg::ContentError {
-                    generation,
-                    error: format!("invalid pattern: {e}"),
-                });
+            let error = match searcher.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("invalid pattern: {e}")),
+                Err(_) => Some("content search failed".to_string()),
+            };
+            if let Some(error) = error {
+                let _ = tx.send(Msg::ContentError { generation, error });
             }
+            let _ = tx.send(Msg::ContentDone { generation });
         });
     }
 
@@ -1138,11 +1172,13 @@ impl Engine {
         }
         let (query, _) = self.pending_semantic.take().unwrap();
         let tx = self.ensure_semantic_worker();
-        let _ = tx.send(SemJob {
-            generation: self.generation,
-            query,
-            filters: self.filters.clone(),
-        });
+        self.semantic_running = tx
+            .send(SemJob {
+                generation: self.generation,
+                query,
+                filters: self.filters.clone(),
+            })
+            .is_ok();
     }
 
     /// One worker for the whole session: the embedding model loads once, on
@@ -1516,6 +1552,10 @@ mod tests {
             let mut engine = Engine::from_lines(Vec::new());
             engine.filter = false;
             engine.set_query(input, false);
+            assert!(
+                engine.status().searching,
+                "{input} must include debounce time"
+            );
             let past = Instant::now() - CONTENT_DEBOUNCE;
             if let Some((_, at)) = engine.pending_content.as_mut() {
                 *at = past;
@@ -1530,7 +1570,97 @@ mod tests {
             assert!(engine.content_cancel.is_none(), "{empty}");
             assert!(engine.sem_tx.is_none(), "{empty}");
             assert!(engine.results().is_empty(), "{empty}");
+            assert!(!engine.status().searching, "{empty}");
         }
+    }
+
+    #[test]
+    fn search_status_settles_for_filename_content_and_invalid_patterns() {
+        let mut engine = Engine::from_lines(vec!["alpha".into()]);
+        engine.tick();
+        wait_for(&mut engine, |e| !e.status().searching);
+        engine.set_query("missing", false);
+        assert!(engine.status().searching);
+        wait_for(&mut engine, |e| !e.status().searching);
+        assert!(engine.results().is_empty());
+
+        engine.filter = false;
+        for input in ["> missing", "> ["] {
+            engine.set_query(input, false);
+            assert!(engine.status().searching);
+            engine.pending_content.as_mut().unwrap().1 = Instant::now() - CONTENT_DEBOUNCE;
+            wait_for(&mut engine, |e| !e.status().searching);
+            assert!(engine.content_cancel.is_none());
+            assert!(engine.results().is_empty());
+            assert_eq!(engine.status().error.is_some(), input == "> [");
+        }
+    }
+
+    #[test]
+    fn stale_completions_cannot_clear_current_search_status() {
+        let mut engine = Engine::from_lines(Vec::new());
+        engine.tick();
+        wait_for(&mut engine, |e| !e.status().searching);
+        engine.generation += 1;
+        engine.filename_running = true;
+        engine.semantic_running = true;
+        engine.content_cancel = Some(Arc::new(AtomicBool::new(false)));
+        for generation in [engine.generation - 1, engine.generation] {
+            engine
+                .msg_tx
+                .send(Msg::FilenameResults {
+                    generation,
+                    indices: Vec::new(),
+                    strong: 0,
+                    error: None,
+                })
+                .unwrap();
+            engine
+                .msg_tx
+                .send(Msg::SemanticResults {
+                    generation,
+                    rows: Vec::new(),
+                    error: None,
+                })
+                .unwrap();
+            engine.msg_tx.send(Msg::ContentDone { generation }).unwrap();
+            engine.tick();
+            let stale = generation != engine.generation;
+            assert_eq!(engine.filename_running, stale);
+            assert_eq!(engine.semantic_running, stale);
+            assert_eq!(engine.content_cancel.is_some(), stale);
+            assert_eq!(engine.status().searching, stale);
+        }
+    }
+
+    #[test]
+    fn unified_search_stays_busy_until_both_workers_finish() {
+        let mut engine = Engine::from_lines(Vec::new());
+        engine.tick();
+        wait_for(&mut engine, |e| !e.status().searching);
+        engine.filename_running = true;
+        engine.semantic_running = true;
+        engine
+            .msg_tx
+            .send(Msg::FilenameResults {
+                generation: engine.generation,
+                indices: Vec::new(),
+                strong: 0,
+                error: None,
+            })
+            .unwrap();
+        engine.tick();
+        assert!(engine.status().searching);
+        engine
+            .msg_tx
+            .send(Msg::SemanticResults {
+                generation: engine.generation,
+                rows: Vec::new(),
+                error: None,
+            })
+            .unwrap();
+        engine.tick();
+        assert!(!engine.status().searching);
     }
 
     /// Feeds one debounced event for `path` into `watch_loop` and returns

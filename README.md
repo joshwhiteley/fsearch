@@ -63,7 +63,7 @@ Run `fsearch` and start typing.
   for source files, reveal, copy, quick look, and trash) · `ctrl-space` Quick
   Look · `ctrl-y` copies the path · `ctrl-s` toggles a mark · `alt-s` clears
   marks · the actions menu batches open/copy/trash over visible marked rows ·
-  `ctrl-p`/`ctrl-n` recall query history ·
+  `ctrl-p`/`ctrl-n` recall query history · `ctrl-l` opens saved searches ·
   `ctrl-g` cycles theme presets · `f1`/`ctrl-o` opens help ·
   `tab` cycles the preview (side → full-window → hidden) · `esc` quits
 
@@ -206,8 +206,13 @@ todos = "> ext:md TODO"
 Use `fsearch --searches` to list them. `fsearch --saved recent_docs` opens
 that query; `fsearch --saved recent_docs -p report` adds `report` to its scope.
 `--saved` works with interactive search, print, pick, and filter commands.
-It is a CLI feature, not an in-app saved-search menu. Conflicting mode
-prefixes in the saved and supplied query are rejected.
+Conflicting mode prefixes in the saved and supplied query are rejected.
+
+In the UI, `ctrl-l` opens the saved-search picker. Type to filter names and
+query text, use the arrow keys to select, and press Enter to replace the
+current query. Escape closes the picker without changing the query. It also
+works in `--pick` mode, but not stdin filter mode or during file transfers.
+Set `saved_searches = "f4"` under `[keys]` to change the shortcut.
 
 ### Actions and file transfers
 
@@ -254,6 +259,10 @@ replace source paths concurrently during a transfer.
 
 ZIP, TAR, TAR.GZ and TGZ previews list archive contents without extracting
 files. Listings are bounded; corrupt archives show an error preview.
+
+Text previews mark the matched line and label truncated excerpts. Preview
+row counts describe the excerpt, not the full file. Empty result panes show
+indexing/search progress, errors, or suggestions for broadening the query.
 
 ### Terminal preferences
 

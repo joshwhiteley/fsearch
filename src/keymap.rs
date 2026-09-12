@@ -29,6 +29,7 @@ pub enum Action {
     PreviewPageUp,
     PreviewPageDown,
     Help,
+    SavedSearches,
     ToggleMark,
     ClearMarks,
 }
@@ -55,6 +56,7 @@ const DEFAULT_BINDINGS: &[(Action, &[&str])] = &[
     (Action::PreviewPageUp, &["pgup"]),
     (Action::PreviewPageDown, &["pgdn"]),
     (Action::Help, &["f1", "ctrl-o"]),
+    (Action::SavedSearches, &["ctrl-l"]),
     // ctrl-b would collide with the tmux/herdr mux prefix, which swallows
     // it before the app ever sees the key
     (Action::ToggleMark, &["ctrl-s"]),
@@ -159,6 +161,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "preview_page_up" => Action::PreviewPageUp,
         "preview_page_down" => Action::PreviewPageDown,
         "help" => Action::Help,
+        "saved_searches" => Action::SavedSearches,
         "toggle_mark" => Action::ToggleMark,
         "clear_marks" => Action::ClearMarks,
         _ => return None,
@@ -203,6 +206,7 @@ impl Action {
             Action::PreviewPageUp => "preview page up",
             Action::PreviewPageDown => "preview page down",
             Action::Help => "help",
+            Action::SavedSearches => "saved searches",
             Action::ToggleMark => "toggle mark",
             Action::ClearMarks => "clear marks",
         }
@@ -225,7 +229,9 @@ impl Action {
             | Action::ThemeCycle
             | Action::PreviewPageUp
             | Action::PreviewPageDown => "view",
-            Action::RegexToggle | Action::ClearQuery | Action::Help => "query modes",
+            Action::RegexToggle | Action::ClearQuery | Action::Help | Action::SavedSearches => {
+                "query modes"
+            }
             Action::ToggleMark | Action::ClearMarks => "open & actions",
         }
     }
@@ -426,6 +432,7 @@ mod tests {
         check("ctrl-t", Action::DensityToggle);
         check("ctrl-x", Action::FoldToggle);
         check("ctrl-g", Action::ThemeCycle);
+        check("ctrl-l", Action::SavedSearches);
         check("pgup", Action::PreviewPageUp);
         check("pgdn", Action::PreviewPageDown);
         check("ctrl-s", Action::ToggleMark);
@@ -437,7 +444,7 @@ mod tests {
     #[test]
     fn every_default_action_has_help_metadata() {
         let actions = Keymap::default().actions();
-        assert_eq!(actions.len(), 21);
+        assert_eq!(actions.len(), 22);
         for action in actions {
             assert!(!action.label().is_empty());
             assert!(
@@ -466,6 +473,34 @@ mod tests {
         overrides.insert("copy_path".to_string(), vec!["alt-y".to_string()]);
         let custom = Keymap::from_config(&overrides);
         assert_eq!(custom.shortcut(Action::CopyPath).as_deref(), Some("alt-y"));
+    }
+
+    #[test]
+    fn saved_searches_default_remapping_and_help() {
+        let defaults = Keymap::default();
+        assert_eq!(
+            defaults.lookup(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            Some(Action::SavedSearches)
+        );
+        assert_eq!(defaults.labels(Action::SavedSearches), ["ctrl-l"]);
+        assert_eq!(Action::SavedSearches.label(), "saved searches");
+        assert_eq!(Action::SavedSearches.help_group(), "query modes");
+        let overrides = [("saved_searches".into(), vec!["f4".into(), "alt-l".into()])].into();
+        let custom = Keymap::from_config(&overrides);
+        assert_eq!(
+            custom.lookup(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            custom.lookup(KeyCode::F(4), KeyModifiers::NONE),
+            Some(Action::SavedSearches)
+        );
+        assert_eq!(custom.labels(Action::SavedSearches), ["f4", "alt-l"]);
+        let invalid = [("saved_searches".into(), vec!["x".into(), "ctrl-w".into()])].into();
+        assert_eq!(
+            Keymap::from_config(&invalid).labels(Action::SavedSearches),
+            ["ctrl-l"]
+        );
     }
 
     #[test]

@@ -111,6 +111,12 @@ fn contextual_hints(app: &App) -> Vec<(String, String)> {
             }
         }
     }
+    if app.saved_searches_enabled() {
+        actions.push((
+            crate::keymap::Action::SavedSearches,
+            "saved searches".to_string(),
+        ));
+    }
     actions.push((crate::keymap::Action::Help, "help".to_string()));
     actions
         .into_iter()
@@ -128,9 +134,13 @@ fn minimal_hints(app: &App) -> Vec<(String, String)> {
     [
         (crate::keymap::Action::Quit, "quit"),
         (crate::keymap::Action::ClearQuery, "clear"),
+        (crate::keymap::Action::SavedSearches, "saved searches"),
         (crate::keymap::Action::Help, "help"),
     ]
     .into_iter()
+    .filter(|(action, _)| {
+        *action != crate::keymap::Action::SavedSearches || app.saved_searches_enabled()
+    })
     .filter_map(|(action, label)| {
         app.keymap
             .shortcut(action)
@@ -297,6 +307,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // the help overlay renders last so it floats above everything
     if app.help.open {
         draw_help(frame, app, screen);
+    }
+    if app.saved_picker.is_some() {
+        super::saved::draw_saved(frame, app, screen);
     }
 }
 
@@ -560,7 +573,9 @@ pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(block);
     frame.render_widget(input, area);
     let visible_col = (cursor_col - app.editor.input_scroll).min(width.saturating_sub(1));
-    frame.set_cursor_position((inner.x + visible_col as u16, inner.y));
+    if app.saved_picker.is_none() && !inner.is_empty() {
+        frame.set_cursor_position((inner.x + visible_col as u16, inner.y));
+    }
 }
 
 /// Splits `shown` into spans, styling the chars at `positions` (char

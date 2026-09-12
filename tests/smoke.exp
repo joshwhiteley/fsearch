@@ -23,6 +23,8 @@ puts $cfg "excludes = \[\]"
 puts $cfg "index_apps = false"
 puts $cfg "mouse = false"
 puts $cfg "quiet = \[\]"
+puts $cfg "\[searches\]"
+puts $cfg "notes = \"ext:md meeting\""
 close $cfg
 
 log_user 0
@@ -62,7 +64,18 @@ if {[lindex $status 3] != 0} {
 }
 
 # No-history still provides the UI but creates no history/session files.
-spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache XDG_STATE_HOME=$tmp/private-state TERM=xterm-256color $bin --no-history --pick meeting"
+spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache XDG_STATE_HOME=$tmp/private-state TERM=xterm-256color $bin --no-history --pick missing"
+expect {
+    -re {No matches} {}
+    timeout { puts stderr "private pick UI did not settle"; exit 1 }
+}
+send -- "\014"
+# Ratatui can skip blank cells with cursor moves between title words.
+expect {
+    -re {saved.*searches.*\(1/1\)} {}
+    timeout { puts stderr "saved-search picker did not open"; exit 1 }
+}
+send -- "notes\r"
 expect {
     -re {meeting-notes\.md} {}
     timeout { puts stderr "private pick UI did not show results"; exit 1 }

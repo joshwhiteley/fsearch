@@ -1,14 +1,14 @@
 use super::chrome::{human_age, selection_style, themed_block};
 use super::{App, Density, Slot};
-use crate::engine::Mode;
+use crate::engine::{EngineStatus, Mode};
 use crate::matcher::Highlighter;
 use crate::util::human_size;
 use crate::walker::FileMeta;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{List, ListItem, Paragraph};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use std::time::{Duration, SystemTime};
 
 pub(super) fn spans_with_styles(
@@ -570,20 +570,126 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     app.list_state.select(Some(display_selected));
     frame.render_stateful_widget(list, area, &mut app.list_state);
     app.hit_test.slots = slots;
-    // empty state: say so instead of leaving a silent blank pane (the
-    // status bar already carries indexing progress)
-    if !has_rows && !app.engine.status().indexing && app.engine.mode() != Mode::Calc {
-        let text = "(no matches)";
-        let width = text.len() as u16;
-        let rect = Rect {
-            x: app.hit_test.results_area.x
-                + app.hit_test.results_area.width.saturating_sub(width) / 2,
-            y: app.hit_test.results_area.y + app.hit_test.results_area.height / 2,
-            width,
-            height: 1,
-        };
-        frame.render_widget(Paragraph::new(Span::styled(text, dim)), rect);
+    if !has_rows {
+        draw_empty_state(frame, app, app.hit_test.results_area, &app.engine.status());
     }
+}
+
+fn empty_state_text(app: &App, status: &EngineStatus) -> (String, String) {
+    if status.indexing {
+        return (
+            "Indexing…".into(),
+            "Results will appear as files are discovered.".into(),
+        );
+    }
+    if status.searching {
+        return (
+            "Searching…".into(),
+            "Waiting for results from the current query.".into(),
+        );
+    }
+    if let Some(error) = &status.error {
+        return ("Search needs attention".into(), error.clone());
+    }
+    let mode = app.engine.mode();
+    let query = if app.engine.is_filter() {
+        app.editor.input.clone()
+    } else {
+        crate::engine::parse_query(&app.editor.input, app.regex_mode).1
+    };
+    let (filters, pattern) = crate::filters::parse(&query, crate::util::unix_now());
+    if pattern.trim().is_empty() {
+        match mode {
+            Mode::Content => {
+                return (
+                    "Search inside files".into(),
+                    "Type a pattern after >, for example > ext:md TODO.".into(),
+                );
+            }
+            Mode::Semantic => {
+                return (
+                    "Search by meaning".into(),
+                    "Describe a document after ?, for example ? project notes.".into(),
+                );
+            }
+            Mode::Calc => {
+                return (
+                    "Calculate".into(),
+                    "Type an expression after =, for example = 2*(3+4).".into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if mode == Mode::Calc {
+        return (
+            "No result".into(),
+            "Check the expression and its parentheses.".into(),
+        );
+    }
+    if app.editor.input.is_empty() && app.engine.is_filter() && status.indexed == 0 {
+        return (
+            "No input records".into(),
+            "Pipe some lines into fsearch to filter them.".into(),
+        );
+    }
+    if app.editor.input.is_empty() && !app.engine.is_filter() {
+        return if status.indexed == 0 {
+            (
+                "No indexed files".into(),
+                "Check roots and excludes with fsearch --config, then run fsearch --reindex."
+                    .into(),
+            )
+        } else {
+            (
+                "No recent files to show".into(),
+                "Type a name or path to search the index.".into(),
+            )
+        };
+    }
+    let mut hint = if !filters.is_empty() {
+        "Try removing a filter or broadening the query.".to_string()
+    } else if mode == Mode::Regex {
+        match app.keymap.shortcut(crate::keymap::Action::RegexToggle) {
+            Some(key) => format!("Try a simpler pattern, or {key} for fuzzy search."),
+            None => "Try a simpler regular expression.".into(),
+        }
+    } else {
+        "Try a shorter or different query.".to_string()
+    };
+    if let Some(key) = app.keymap.shortcut(crate::keymap::Action::ClearQuery) {
+        hint.push_str(&format!(" {key} clears the query."));
+    }
+    ("No matches".into(), hint)
+}
+
+fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect, status: &EngineStatus) {
+    if area.is_empty() {
+        return;
+    }
+    let (title, hint) = empty_state_text(app, status);
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(hint, Style::default().fg(app.theme.dim))),
+    ]);
+    // Keep all rendering inside the results pane, including tiny terminals.
+    let offset = area.height.saturating_sub(4) / 2;
+    let rect = Rect {
+        y: area.y + offset,
+        height: area.height - offset,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        rect,
+    );
 }
 
 /// `path` with a home-directory prefix shortened to `~`; unchanged otherwise.
@@ -623,5 +729,135 @@ pub(super) fn kind_label(path: &str) -> String {
             .and_then(|e| e.to_str())
             .unwrap_or("FILE")
             .to_uppercase()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn empty_state_distinguishes_busy_errors_and_no_matches() {
+        let mut app = App::new(Engine::from_lines(Vec::new()));
+        app.editor.input = "missing".into();
+        for (status, title) in [
+            (
+                EngineStatus {
+                    indexing: true,
+                    ..Default::default()
+                },
+                "Indexing…",
+            ),
+            (
+                EngineStatus {
+                    searching: true,
+                    ..Default::default()
+                },
+                "Searching…",
+            ),
+            (
+                EngineStatus {
+                    error: Some("invalid pattern".into()),
+                    ..Default::default()
+                },
+                "Search needs attention",
+            ),
+            (EngineStatus::default(), "No matches"),
+        ] {
+            assert_eq!(empty_state_text(&app, &status).0, title);
+        }
+        app.editor.clear();
+        assert_eq!(
+            empty_state_text(&app, &EngineStatus::default()).0,
+            "No input records"
+        );
+    }
+
+    #[test]
+    fn empty_state_hints_use_configured_keys_and_filters() {
+        let mut app = App::new(Engine::from_lines(Vec::new()));
+        app.keymap = crate::keymap::Keymap::from_config(
+            &[
+                ("clear_query".into(), vec!["alt-u".into()]),
+                ("regex_toggle".into(), vec!["alt-r".into()]),
+            ]
+            .into(),
+        );
+        app.editor.input = "ext:md missing".into();
+        let (_, hint) = empty_state_text(&app, &EngineStatus::default());
+        assert!(hint.contains("removing a filter"));
+        assert!(hint.contains("alt-u"));
+        assert!(!hint.contains("ctrl-u"));
+        app.editor.input = "missing".into();
+        app.engine.set_query("missing", true);
+        let (_, hint) = empty_state_text(&app, &EngineStatus::default());
+        assert!(hint.contains("alt-r"));
+    }
+
+    #[test]
+    fn empty_state_whitespace_regex_does_not_claim_stdin_is_empty() {
+        let mut app = App::new(Engine::from_lines(vec!["alpha".into()]));
+        app.editor.input = " ".into();
+        app.engine.set_query(" ", true);
+        let status = EngineStatus {
+            indexed: 1,
+            ..Default::default()
+        };
+        let (title, hint) = empty_state_text(&app, &status);
+        assert_eq!(title, "No matches");
+        assert!(hint.contains("fuzzy search"));
+        assert!(!hint.contains("Pipe"));
+    }
+
+    #[test]
+    fn empty_state_explains_mode_prefixes_and_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            roots: vec![dir.path().to_path_buf()],
+            index_apps: false,
+            remember_history: false,
+            unified: false,
+            ..Default::default()
+        };
+        let mut app = App::new(Engine::new(
+            config,
+            dir.path().join("index"),
+            dir.path().join("history"),
+        ));
+        for (input, title) in [
+            ("> ext:md", "Search inside files"),
+            ("?", "Search by meaning"),
+            ("=", "Calculate"),
+            ("= 1+", "No result"),
+            ("", "No indexed files"),
+        ] {
+            app.editor.input = input.into();
+            app.engine.set_query(input, false);
+            assert_eq!(empty_state_text(&app, &EngineStatus::default()).0, title);
+        }
+    }
+
+    #[test]
+    fn empty_state_never_overwrites_neighboring_panes() {
+        let app = App::new(Engine::from_lines(Vec::new()));
+        for (width, height) in [(0, 0), (1, 1), (2, 3), (8, 4), (32, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+            let area = Rect::new(2, 2, width, height);
+            terminal
+                .draw(|frame| {
+                    draw_empty_state(frame, &app, area, &EngineStatus::default());
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for y in 0..16 {
+                for x in 0..40 {
+                    if !area.contains((x, y).into()) {
+                        assert_eq!(buffer[(x, y)].symbol(), " ", "outside {area:?} at {x},{y}");
+                    }
+                }
+            }
+        }
     }
 }

@@ -429,6 +429,9 @@ pub struct App {
     pub highlights: Highlights,
     pub status: StatusCache,
     pub help: HelpModal,
+    /// Configured name/query pairs, sorted by name at startup.
+    saved_searches: Vec<(String, String)>,
+    saved_picker: Option<saved::SavedPicker>,
     /// Multi-select marks, tracked as PATHS so they survive reordering of
     /// results. The set persists until cleared or quit; batch actions and
     /// the row indicators operate only on currently-visible marked rows.
@@ -539,6 +542,8 @@ impl App {
                 scroll: 0,
                 area: Rect::default(),
             },
+            saved_searches: Vec::new(),
+            saved_picker: None,
             marks: HashSet::new(),
             custom_actions: Vec::new(),
             nvim_request: None,
@@ -1084,6 +1089,17 @@ impl App {
     /// Returns false when the app should quit.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.message = None;
+        if self.saved_picker.is_some() {
+            self.handle_saved_key(key);
+            return true;
+        }
+        // Opening saved searches replaces other popups instead of being
+        // swallowed by their modal key handlers.
+        if self.keymap.lookup(key.code, key.modifiers) == Some(crate::keymap::Action::SavedSearches)
+        {
+            self.open_saved_searches();
+            return true;
+        }
         // the help overlay is modal: any key closes it, except the scroll
         // keys, which page through the listing when it overflows the box
         if self.help.open {
@@ -1235,6 +1251,7 @@ impl App {
             crate::keymap::Action::PreviewPageDown => {
                 self.preview.scroll = self.preview.scroll.saturating_add(PREVIEW_SCROLL_PAGE);
             }
+            crate::keymap::Action::SavedSearches => self.open_saved_searches(),
             crate::keymap::Action::Help => {
                 self.help.open = !self.help.open;
                 self.help.scroll = 0;
@@ -1427,6 +1444,16 @@ impl App {
     /// Mouse dispatch. Returns false only to mirror `handle_key`'s quit
     /// contract (a double-click in `--pick` mode returns the selection).
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
+        // Saved searches owns every mouse event while open. Clicks are
+        // deliberately inert, so stale underlying geometry cannot activate files.
+        if let Some(picker) = &mut self.saved_picker {
+            match ev.kind {
+                MouseEventKind::ScrollDown => picker.move_selection(1),
+                MouseEventKind::ScrollUp => picker.move_selection(-1),
+                _ => {}
+            }
+            return true;
+        }
         let point = Position {
             x: ev.column,
             y: ev.row,
@@ -1899,6 +1926,7 @@ pub fn run(
     remember_history: bool,
     custom_actions: Vec<crate::config::CustomAction>,
     action_warning: Option<String>,
+    saved_searches: std::collections::HashMap<String, String>,
 ) -> anyhow::Result<Option<String>> {
     let (traits, picker) = probe_terminal();
     highlight::preload();
@@ -1913,6 +1941,7 @@ pub fn run(
     app.picker = picker;
     app.ui_mode = ui_mode;
     app.custom_actions = custom_actions;
+    app.configure_saved_searches(saved_searches);
     if let Some(warning) = action_warning {
         app.message = Some((warning, Instant::now()));
     }
@@ -2009,6 +2038,7 @@ pub fn run(
 mod chrome;
 mod preview;
 mod rows;
+mod saved;
 #[cfg(test)]
 mod tests;
 use self::chrome::draw;

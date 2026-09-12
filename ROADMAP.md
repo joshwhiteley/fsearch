@@ -2,6 +2,8 @@
 
 Implemented for the next release:
 
+- In-app saved-search picker (`ctrl-l`), matched-line and truncated-preview
+  indicators, and contextual empty/searching states
 - Snapshot health diagnostics (`--status`), typed NDJSON (`--json`) and
   NUL-delimited input/output (`--read0`, `--print0`)
 - CLI named queries/scopes (`[searches]`, `--saved`, `--searches`)

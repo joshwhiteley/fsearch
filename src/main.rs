@@ -321,6 +321,7 @@ fn run_filter(initial_query: &str, invocation: &Invocation) {
         remember_history,
         Vec::new(),
         None,
+        std::collections::HashMap::new(),
     ) {
         Ok(Some(picked)) => write_stdout(&fsearch::output::selection(&picked, invocation.format)),
         Ok(None) => std::process::exit(1), // nothing chosen: signal like grep
@@ -348,6 +349,7 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str, invocation: &Invocation) {
         config.actions.clone()
     };
     let action_warning = config.action_warning.clone();
+    let saved_searches = config.searches.clone();
     let engine = Engine::new(
         config,
         index::default_cache_path(),
@@ -365,6 +367,7 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str, invocation: &Invocation) {
         remember_history,
         custom_actions,
         action_warning,
+        saved_searches,
     ) {
         Ok(Some(picked)) => write_stdout(&fsearch::output::selection(&picked, invocation.format)),
         Ok(None) => {

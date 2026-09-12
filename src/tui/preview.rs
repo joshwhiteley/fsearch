@@ -52,6 +52,9 @@ pub enum PreviewPayload {
     Image(image::DynamicImage),
 }
 
+const TEXT_PREVIEW_LINES: usize = 100;
+const CONTEXT_PREVIEW_LINES: usize = 40;
+const CONTEXT_LINES_BEFORE_MATCH: usize = 5;
 const ARCHIVE_PREVIEW_ENTRIES: usize = 200;
 // Match the Office ZIP guard: metadata parsing is bounded before opening the
 // central directory, while entry contents are never decompressed.
@@ -80,6 +83,143 @@ struct ArchiveListing {
     capped: bool,
 }
 
+fn preview_notice(message: impl Into<String>, gutter: Color) -> Line<'static> {
+    Line::from(Span::styled(
+        message.into(),
+        Style::default().fg(gutter).add_modifier(Modifier::ITALIC),
+    ))
+}
+
+fn text_preview_lines(
+    path: &str,
+    text: &str,
+    line_number: Option<u64>,
+    appearance: Appearance,
+    gutter: Color,
+    syntax_highlight: bool,
+    byte_truncated: bool,
+) -> Vec<Line<'static>> {
+    let source_line_count = text.lines().count();
+    if source_line_count == 0 {
+        return vec![preview_notice(
+            match line_number {
+                Some(line) => format!("(empty text; match at source line {line} is unavailable)"),
+                None => "(empty text)".to_string(),
+            },
+            gutter,
+        )];
+    }
+
+    let Some(requested_line) = line_number else {
+        let mut lines = if syntax_highlight {
+            highlight::highlight(path, text, appearance, TEXT_PREVIEW_LINES)
+        } else {
+            text.lines()
+                .take(TEXT_PREVIEW_LINES)
+                .map(|line| Line::from(line.to_string()))
+                .collect()
+        };
+        if source_line_count > TEXT_PREVIEW_LINES {
+            lines.push(preview_notice(
+                format!("… preview limited to first {TEXT_PREVIEW_LINES} source lines"),
+                gutter,
+            ));
+        }
+        if byte_truncated {
+            lines.push(preview_notice(
+                format!(
+                    "… source read limited to first {} KiB",
+                    PREVIEW_BYTES / 1024
+                ),
+                gutter,
+            ));
+        }
+        return lines;
+    };
+
+    let Ok(match_line) = usize::try_from(requested_line) else {
+        return vec![preview_notice(
+            format!(
+                "(match at source line {requested_line} is beyond the text loaded for preview)"
+            ),
+            gutter,
+        )];
+    };
+    if match_line == 0 || match_line > source_line_count {
+        let message = if byte_truncated {
+            format!(
+                "(match at source line {requested_line} is beyond the first {} KiB loaded for preview)",
+                PREVIEW_BYTES / 1024
+            )
+        } else {
+            format!(
+                "(match at source line {requested_line} is unavailable; available text has {source_line_count} source lines)"
+            )
+        };
+        return vec![preview_notice(message, gutter)];
+    }
+
+    let start = match_line.saturating_sub(CONTEXT_LINES_BEFORE_MATCH + 1);
+    let end = start
+        .saturating_add(CONTEXT_PREVIEW_LINES)
+        .min(source_line_count);
+    let number_style = Style::default().fg(gutter);
+    let active_style = number_style.add_modifier(Modifier::BOLD);
+    let excerpt: Vec<Line<'static>> = if syntax_highlight {
+        highlight::highlight(path, text, appearance, end)
+            .into_iter()
+            .skip(start)
+            .collect()
+    } else {
+        text.lines()
+            .skip(start)
+            .take(end - start)
+            .map(|line| Line::from(line.to_string()))
+            .collect()
+    };
+    let mut lines: Vec<Line<'static>> = excerpt
+        .into_iter()
+        .enumerate()
+        .map(|(offset, mut line)| {
+            let source_line = start + offset + 1;
+            let is_match = source_line == match_line;
+            if is_match {
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(Modifier::BOLD);
+                }
+            }
+            let marker = if is_match { '▶' } else { ' ' };
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::styled(
+                format!("{marker}{source_line:>5} "),
+                if is_match { active_style } else { number_style },
+            ));
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect();
+
+    if start > 0 || end < source_line_count {
+        lines.push(preview_notice(
+            format!(
+                "… context limited to {CONTEXT_PREVIEW_LINES} source lines; showing source lines {}–{end}",
+                start + 1
+            ),
+            gutter,
+        ));
+    }
+    if byte_truncated {
+        lines.push(preview_notice(
+            format!(
+                "… source read limited to first {} KiB",
+                PREVIEW_BYTES / 1024
+            ),
+            gutter,
+        ));
+    }
+    lines
+}
+
 /// The expensive half of preview loading — read, syntax-highlight, PDF
 /// extract, image decode — runs on this worker thread so the UI thread only
 /// applies results. Mirrors the former synchronous load_preview logic.
@@ -95,61 +235,29 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
     }
     if crate::pdf::is_pdf_path(&req.path) {
         return match crate::pdf::extract_cached(&req.path, &crate::pdf::default_cache_dir()) {
-            Ok(text) => match req.line_number {
-                Some(n) => {
-                    let start = (n as usize).saturating_sub(6);
-                    let gutter = Style::default().fg(req.gutter);
-                    PreviewPayload::Lines(
-                        text.lines()
-                            .enumerate()
-                            .skip(start)
-                            .take(40)
-                            .map(|(i, l)| {
-                                Line::from(vec![
-                                    Span::styled(format!("{:>5} ", i + 1), gutter),
-                                    Span::raw(l.to_string()),
-                                ])
-                            })
-                            .collect(),
-                    )
-                }
-                None => PreviewPayload::Lines(
-                    text.lines()
-                        .take(100)
-                        .map(|l| Line::from(l.to_string()))
-                        .collect(),
-                ),
-            },
+            Ok(text) => PreviewPayload::Lines(text_preview_lines(
+                &req.path,
+                &text,
+                req.line_number,
+                req.appearance,
+                req.gutter,
+                false,
+                false,
+            )),
             Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(pdf: {e})"))]),
         };
     }
     if crate::office::is_office_path(&req.path) {
         return match crate::office::extract_cached(&req.path, &crate::office::default_cache_dir()) {
-            Ok(text) => match req.line_number {
-                Some(n) => {
-                    let start = (n as usize).saturating_sub(6);
-                    let gutter = Style::default().fg(req.gutter);
-                    PreviewPayload::Lines(
-                        text.lines()
-                            .enumerate()
-                            .skip(start)
-                            .take(40)
-                            .map(|(i, line)| {
-                                Line::from(vec![
-                                    Span::styled(format!("{:>5} ", i + 1), gutter),
-                                    Span::raw(line.to_string()),
-                                ])
-                            })
-                            .collect(),
-                    )
-                }
-                None => PreviewPayload::Lines(
-                    text.lines()
-                        .take(100)
-                        .map(|line| Line::from(line.to_string()))
-                        .collect(),
-                ),
-            },
+            Ok(text) => PreviewPayload::Lines(text_preview_lines(
+                &req.path,
+                &text,
+                req.line_number,
+                req.appearance,
+                req.gutter,
+                false,
+                false,
+            )),
             Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(office: {e})"))]),
         };
     }
@@ -163,36 +271,20 @@ pub(super) fn preview_payload(req: &PreviewRequest) -> PreviewPayload {
         return PreviewPayload::Lines(archive_preview(&req.path, kind, req.gutter));
     }
     match read_preview_bytes(&req.path) {
-        Ok(bytes) if bytes.contains(&0) => PreviewPayload::Lines(vec![Line::from("(binary file)")]),
-        Ok(bytes) => {
-            let text = String::from_utf8_lossy(&bytes);
-            match req.line_number {
-                // center the preview on the matching line, with a gutter
-                Some(n) => {
-                    let start = (n as usize).saturating_sub(6);
-                    let end = start + 40;
-                    PreviewPayload::Lines(
-                        highlight::highlight(&req.path, &text, req.appearance, end)
-                            .into_iter()
-                            .enumerate()
-                            .skip(start)
-                            .map(|(i, line)| {
-                                let gutter = Style::default().fg(req.gutter);
-                                let mut spans =
-                                    vec![Span::styled(format!("{:>5} ", i + 1), gutter)];
-                                spans.extend(line.spans);
-                                Line::from(spans)
-                            })
-                            .collect(),
-                    )
-                }
-                None => PreviewPayload::Lines(highlight::highlight(
-                    &req.path,
-                    &text,
-                    req.appearance,
-                    100,
-                )),
-            }
+        Ok(preview) if preview.bytes.contains(&0) => {
+            PreviewPayload::Lines(vec![Line::from("(binary file)")])
+        }
+        Ok(preview) => {
+            let text = String::from_utf8_lossy(&preview.bytes);
+            PreviewPayload::Lines(text_preview_lines(
+                &req.path,
+                &text,
+                req.line_number,
+                req.appearance,
+                req.gutter,
+                true,
+                preview.truncated,
+            ))
         }
         Err(e) => PreviewPayload::Lines(vec![Line::from(format!("(unreadable: {e})"))]),
     }
@@ -411,18 +503,24 @@ fn archive_lines(listing: ArchiveListing, gutter: Color) -> Vec<Line<'static>> {
     lines
 }
 
+struct PreviewBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
 /// Reads at most PREVIEW_BYTES (plus a one-byte truncation sentinel) from
 /// `path`: previewing must never slurp a multi-gigabyte file into memory
 /// just to show its head. Binary detection then runs on that bounded head.
-fn read_preview_bytes(path: &str) -> std::io::Result<Vec<u8>> {
+fn read_preview_bytes(path: &str) -> std::io::Result<PreviewBytes> {
     use std::io::Read as _;
-    const CAP: u64 = PREVIEW_BYTES as u64 + 1;
+    const READ_LIMIT: u64 = PREVIEW_BYTES as u64 + 1;
     let file = crate::util::open_regular_file(std::path::Path::new(path))?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(CAP.min(len) as usize);
-    file.take(CAP).read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(READ_LIMIT.min(len) as usize);
+    file.take(READ_LIMIT).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > PREVIEW_BYTES;
     bytes.truncate(PREVIEW_BYTES);
-    Ok(bytes)
+    Ok(PreviewBytes { bytes, truncated })
 }
 
 pub(super) fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>> {
@@ -527,7 +625,12 @@ pub fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         if let PreviewContent::Lines(lines) = &app.preview.content
             && !lines.is_empty()
         {
-            meta_line.push(Span::styled(format!(" · {} lines", lines.len()), dim));
+            let row_label = if lines.len() == 1 {
+                "preview row"
+            } else {
+                "preview rows"
+            };
+            meta_line.push(Span::styled(format!(" · {} {row_label}", lines.len()), dim));
         }
         frame.render_widget(
             Paragraph::new(Line::from(meta_line)),
@@ -573,7 +676,7 @@ pub fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                 );
                 let first = app.preview.scroll + 1;
                 let last = (app.preview.scroll + content_rows).min(total);
-                let pos = format!("{first}–{last} / {total}");
+                let pos = format!("{first}–{last} / {total} preview rows");
                 let avail = body.width.saturating_sub(1); // scrollbar column
                 let pad = avail.saturating_sub(pos.chars().count() as u16) as usize;
                 let line = Line::from(Span::styled(format!("{}{pos}", " ".repeat(pad)), dim));
@@ -641,13 +744,24 @@ mod tests {
     }
 
     fn request(path: &std::path::Path) -> PreviewRequest {
+        request_at(path, None)
+    }
+
+    fn request_at(path: &std::path::Path, line_number: Option<u64>) -> PreviewRequest {
         PreviewRequest {
             generation: 0,
             path: path.to_string_lossy().into_owned(),
-            line_number: None,
+            line_number,
             appearance: Appearance::Dark,
             gutter: Color::Gray,
         }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -685,21 +799,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preview.docx");
         std::fs::write(&path, zip.finish().unwrap().into_inner()).unwrap();
-        let payload = preview_payload(&PreviewRequest {
-            generation: 0,
-            path: path.to_string_lossy().into_owned(),
-            line_number: None,
-            appearance: Appearance::Dark,
-            gutter: Color::Gray,
-        });
+        let payload = preview_payload(&request_at(&path, Some(1)));
         let PreviewPayload::Lines(lines) = payload else {
             panic!("office preview should be text");
         };
-        assert!(
+        assert_eq!(
             lines
                 .iter()
-                .flat_map(|line| line.spans.iter())
-                .any(|span| span.content.contains("Preview Needle"))
+                .filter(|line| line_text(line).starts_with('▶'))
+                .count(),
+            1
+        );
+        assert!(line_text(&lines[0]).contains("Preview Needle"));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
         );
     }
 
@@ -808,15 +925,24 @@ mod tests {
         // far larger than PREVIEW_BYTES: the read must stop at the cap
         let big = dir.path().join("big.txt");
         std::fs::write(&big, vec![b'a'; PREVIEW_BYTES * 4]).unwrap();
-        let bytes = read_preview_bytes(big.to_str().unwrap()).unwrap();
-        assert_eq!(bytes.len(), PREVIEW_BYTES);
-        assert!(bytes.iter().all(|&b| b == b'a'));
+        let preview = read_preview_bytes(big.to_str().unwrap()).unwrap();
+        assert_eq!(preview.bytes.len(), PREVIEW_BYTES);
+        assert!(preview.bytes.iter().all(|&b| b == b'a'));
+        assert!(preview.truncated);
+
+        // The sentinel distinguishes the exact cap from actual truncation.
+        let exact = dir.path().join("exact.txt");
+        std::fs::write(&exact, vec![b'b'; PREVIEW_BYTES]).unwrap();
+        let preview = read_preview_bytes(exact.to_str().unwrap()).unwrap();
+        assert_eq!(preview.bytes.len(), PREVIEW_BYTES);
+        assert!(!preview.truncated);
 
         // small files round-trip intact
         let small = dir.path().join("small.txt");
         std::fs::write(&small, b"hello").unwrap();
-        let bytes = read_preview_bytes(small.to_str().unwrap()).unwrap();
-        assert_eq!(bytes, b"hello");
+        let preview = read_preview_bytes(small.to_str().unwrap()).unwrap();
+        assert_eq!(preview.bytes, b"hello");
+        assert!(!preview.truncated);
 
         // missing paths surface the io error like std::fs::read did
         assert!(read_preview_bytes(dir.path().join("gone.txt").to_str().unwrap()).is_err());
@@ -868,8 +994,179 @@ mod tests {
         let PreviewPayload::Lines(lines) = payload else {
             panic!("oversized text file should preview as text");
         };
-        assert_eq!(lines.len(), 100);
-        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(first.contains('x'));
+        assert_eq!(lines.len(), TEXT_PREVIEW_LINES + 2);
+        assert!(line_text(&lines[0]).contains('x'));
+        assert!(line_text(&lines[TEXT_PREVIEW_LINES]).contains("first 100 source lines"));
+        assert!(line_text(&lines[TEXT_PREVIEW_LINES + 1]).contains("first 64 KiB"));
+    }
+
+    #[test]
+    fn normal_text_marks_only_actual_truncation() {
+        let exact = (1..=TEXT_PREVIEW_LINES)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = text_preview_lines(
+            "notes.txt",
+            &exact,
+            None,
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            false,
+        );
+        assert_eq!(lines.len(), TEXT_PREVIEW_LINES);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line_text(line).contains("limited"))
+        );
+
+        let truncated = format!("{exact}\nline 101");
+        let lines = text_preview_lines(
+            "notes.txt",
+            &truncated,
+            None,
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            false,
+        );
+        assert_eq!(lines.len(), TEXT_PREVIEW_LINES + 1);
+        assert!(line_text(lines.last().unwrap()).contains("first 100 source lines"));
+    }
+
+    #[test]
+    fn context_marks_only_matching_line_and_preserves_syntax_styles() {
+        let text = "let alpha = 1;\nlet café = 2; // 東京\nlet omega = 3;";
+        let lines = text_preview_lines(
+            "sample.rs",
+            text,
+            Some(2),
+            Appearance::Dark,
+            Color::Cyan,
+            true,
+            false,
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line_text(line).starts_with('▶'))
+                .count(),
+            1
+        );
+        assert!(line_text(&lines[1]).starts_with("▶    2 "));
+        assert!(line_text(&lines[1]).contains("café = 2; // 東京"));
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .skip(1)
+                .any(|span| span.style.fg.is_some()),
+            "active-line bolding must retain syntax colors"
+        );
+        assert!(
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 1)
+                .all(|(_, line)| line_text(line).starts_with(' '))
+        );
+    }
+
+    #[test]
+    fn context_cap_is_reported_only_when_source_rows_are_omitted() {
+        let exact = (1..=CONTEXT_PREVIEW_LINES)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = text_preview_lines(
+            "notes.txt",
+            &exact,
+            Some(6),
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            false,
+        );
+        assert_eq!(lines.len(), CONTEXT_PREVIEW_LINES);
+
+        let truncated = format!("{exact}\nline 41");
+        let lines = text_preview_lines(
+            "notes.txt",
+            &truncated,
+            Some(6),
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            false,
+        );
+        assert_eq!(lines.len(), CONTEXT_PREVIEW_LINES + 1);
+        assert!(line_text(lines.last().unwrap()).contains("context limited to 40 source lines"));
+
+        let late_context = text_preview_lines(
+            "notes.txt",
+            &truncated,
+            Some(41),
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            false,
+        );
+        assert!(line_text(&late_context[0]).starts_with(&format!(" {:>5} ", 36)));
+        assert!(line_text(&late_context[5]).starts_with(&format!("▶{:>5} ", 41)));
+    }
+
+    #[test]
+    fn empty_text_and_late_match_have_informative_rows() {
+        let empty = text_preview_lines(
+            "empty.txt",
+            "",
+            Some(7),
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            false,
+        );
+        assert_eq!(empty.len(), 1);
+        assert!(line_text(&empty[0]).contains("empty text"));
+        assert!(line_text(&empty[0]).contains("source line 7"));
+
+        let late = text_preview_lines(
+            "bounded.txt",
+            "first\nsecond",
+            Some(9000),
+            Appearance::Dark,
+            Color::Gray,
+            true,
+            true,
+        );
+        assert_eq!(late.len(), 1);
+        assert!(line_text(&late[0]).contains("source line 9000"));
+        assert!(line_text(&late[0]).contains("first 64 KiB"));
+    }
+
+    #[test]
+    fn unicode_byte_cap_is_reported_only_past_exact_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = "é".repeat(PREVIEW_BYTES / "é".len());
+        let path = dir.path().join("unicode.txt");
+        std::fs::write(&path, &exact).unwrap();
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert!(lines.iter().all(|line| !line.contains("64 KiB")));
+        assert!(lines.iter().any(|line| line.contains('é')));
+
+        std::fs::write(&path, format!("{exact}é")).unwrap();
+        let lines = preview_text(preview_payload(&request(&path)));
+        assert!(lines.iter().any(|line| line.contains("first 64 KiB")));
+        assert!(lines.iter().any(|line| line.contains('é')));
     }
 }
