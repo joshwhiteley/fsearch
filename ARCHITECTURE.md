@@ -89,7 +89,10 @@ distinguishes pending results from a completed empty search.
 queue to the newest job before running it, so typing fast never queues up
 redundant searches. Fuzzy ranking retains bounded top-k heaps per parallel
 accumulator rather than sorting every match; score/index ordering and the
-quiet/weak-match fold remain unchanged.
+quiet/weak-match fold remain unchanged. Regex searches also retain bounded
+per-chunk top-k candidates in boost/index order, with private regex scratch
+caches for parallel scans. Unboosted chunks stop after enough matches rather
+than collecting and sorting every match.
 
 **The watcher is armed before the walk.** Filesystem events (FSEvents /
 inotify via the notify crate) start buffering *before* the initial walk
@@ -164,7 +167,9 @@ Engine ──── job_tx ────▶ search worker (latest job wins) ─�
 Communication uses `std::sync::mpsc`; the UI does not wait for search
 workers. Content hits use 64-slot cancellation-aware queues, with a producer
 cap of 1,000 hits in the TUI (headless streams are not globally capped).
-Matching-line payloads retain at most a UTF-8-safe 4 KiB prefix. Candidate
+Matching-line payloads retain at most a UTF-8-safe 4 KiB excerpt around the
+first match, with ellipses marking clipped context. Short lines preserve
+whitespace apart from line terminators. Candidate
 filtering runs off the UI thread. Index snapshots are applied before content
 dispatch and invalidate content work against older scopes. Empty content and
 semantic queries clear pending debounce jobs. Dropping the engine signals
@@ -203,6 +208,16 @@ Neovim intentionally suspends the TUI until exit.
   parsed from search queries and applied in filename, content and semantic
   modes. Calculator expressions bypass filter parsing.
 
+## Result rendering
+
+The TUI retains a lightweight global row/header/fold map for selection and
+mouse hit testing. It computes the whole-row viewport before constructing
+text, badges and highlights, so expensive formatting scales with terminal
+height rather than result count. Global and local ListState offsets are kept
+separate. Partially fitting two-line rows are neither drawn nor clickable.
+Mouse-wheel result navigation clamps at the list ends; keyboard navigation
+continues to wrap.
+
 ## Previews
 
 Text files are syntax-highlighted (syntect + two-face, dark/light by
@@ -226,8 +241,10 @@ not total RSS or arbitrary native allocations. The parent kills and reaps
 failed helpers. Library hosts need a sibling fsearch helper executable; they
 never fall back to parsing in-process.
 
-PDF and Office caches each evict oldest entries to stay within 128 MiB and
-4,096 entries, including errors. Bounded no-follow reads enforce 8 MiB per
+PDF and Office caches each evict oldest entries on writes to stay within
+128 MiB and 4,096 entries, including errors. Read-side maintenance scans run
+on first use and at most once per minute per cache, not on every warm hit;
+a bounded directory schedule avoids retaining arbitrary cache paths forever. Bounded no-follow reads enforce 8 MiB per
 text and 16 KiB per cached error. Office container/XML/text limits remain in
 place, and empty XLSX shared-string entries retain their index positions.
 

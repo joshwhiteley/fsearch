@@ -288,13 +288,6 @@ fn head_with_boosts(
     })
 }
 
-fn apply_boost_order(hits: &mut [usize], store: &PathStore, boosts: &HashMap<String, u32>) {
-    if !boosts.is_empty() {
-        // stable: unboosted hits keep their recency order
-        hits.sort_by_key(|&i| std::cmp::Reverse(boosts.get(store.get(i)).copied().unwrap_or(0)));
-    }
-}
-
 /// Re-runs a fuzzy pattern against single strings to recover the matched
 /// character positions (for highlighting the visible result rows).
 pub struct Highlighter {
@@ -383,7 +376,9 @@ impl TopK {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            heap: BinaryHeap::with_capacity(cap),
+            // Large public limits must not eagerly reserve the entire result
+            // count in every parallel chunk. Grow only when matches need it.
+            heap: BinaryHeap::with_capacity(cap.min(CHUNK)),
         }
     }
 
@@ -507,13 +502,14 @@ fn fuzzy(
                         // quiet paths score at 2/5: even with a filename
                         // match they land under the best/2 floor whenever a
                         // non-quiet candidate exists, i.e. behind the fold
-                        if demote.is_some_and(|q| q.is_quiet(path)) {
+                        let quiet = demote.is_some_and(|q| q.is_quiet(path));
+                        if quiet {
                             total = total * 2 / 5;
                         }
                         acc.top.push(Candidate {
                             score: total,
                             index: i,
-                            quiet: demote.is_some_and(|q| q.is_quiet(path)),
+                            quiet,
                         });
                     }
                 }
@@ -579,25 +575,59 @@ fn regex_filter(
         .case_insensitive(smart_case_insensitive)
         .build()
         .map_err(|e| e.to_string())?;
-    let mut hits: Vec<usize> = (0..store.len())
+    let cap = limit.min(store.len());
+    // Compile first even with no requested results: invalid regexes must still
+    // report their error. No ranking allocation is needed for an empty result.
+    if cap == 0 {
+        return Ok((!cancelled(generation)).then(Ranked::default));
+    }
+    let top = (0..store.len().div_ceil(CHUNK))
         .into_par_iter()
-        .with_min_len(CHUNK)
-        .filter(|&i| {
-            (i % CHUNK != 0 || !cancelled(generation))
-                && passes(store, i, scope)
-                && re.is_match(store.get(i))
+        .map(|chunk| {
+            if cancelled(generation) {
+                return None;
+            }
+            // Clones share the compiled expression, but give each parallel
+            // scan its own scratch cache instead of contending on one cache.
+            let re = re.clone();
+            let mut top = TopK::new(cap);
+            let start = chunk * CHUNK;
+            for i in start..start.saturating_add(CHUNK).min(store.len()) {
+                if passes(store, i, scope) && re.is_match(store.get(i)) {
+                    top.push(Candidate {
+                        score: boosts.get(store.get(i)).copied().unwrap_or(0),
+                        index: i,
+                        quiet: false,
+                    });
+                    // With no boosts, indices are already in ranking order.
+                    // Later matches in this chunk cannot enter the global top-k.
+                    if boosts.is_empty() && top.heap.len() == cap {
+                        break;
+                    }
+                }
+            }
+            Some(top)
         })
-        .collect();
+        .try_reduce(
+            || TopK::new(cap),
+            |mut a, b| {
+                a.merge(b);
+                Some(a)
+            },
+        );
     if cancelled(generation) {
         return Ok(None);
     }
-    hits.sort_unstable();
-    apply_boost_order(&mut hits, store, boosts);
-    hits.truncate(limit);
-    let strong = hits.len();
-    Ok(Some(Ranked {
-        indices: hits,
-        strong,
+    Ok(top.map(|top| {
+        let indices: Vec<_> = top
+            .into_sorted()
+            .into_iter()
+            .map(|candidate| candidate.index)
+            .collect();
+        Ranked {
+            strong: indices.len(),
+            indices,
+        }
     }))
 }
 
@@ -1124,6 +1154,18 @@ mod tests {
             strong: strong.min(scored.len()),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn large_result_limit_does_not_eagerly_allocate_in_each_chunk() {
+        let mut top = TopK::new(usize::MAX);
+        assert!(top.heap.capacity() <= CHUNK);
+        top.push(Candidate {
+            score: 0,
+            index: 0,
+            quiet: false,
+        });
+        assert_eq!(top.into_sorted().len(), 1);
     }
 
     #[test]

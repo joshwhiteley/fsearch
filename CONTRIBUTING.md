@@ -107,6 +107,36 @@ Run the million-path performance budget separately:
 cargo test --locked --release --test perf_test -- --ignored --nocapture
 ```
 
+## Focused performance checks
+
+Run these separately, without competing builds or benchmark processes:
+
+```sh
+cargo test --locked --release --test matcher_perf_test -- --ignored --nocapture
+cargo test --locked --release --test cache_perf_test -- --ignored --nocapture
+cargo test --locked --lib tui::tests::result_redraw_benchmark -- --ignored --exact --nocapture
+```
+
+The matcher fixture uses one million synthetic paths with broad/sparse regexes
+and boost ties. The cache fixture uses 1,025 small cache entries and times
+100 warmed reads, excluding parsing/setup. The redraw fixture uses a 100×30
+TestBackend and 100 frames. All fixtures use synthetic data; these timings
+are diagnostic reports, not machine-dependent pass/fail thresholds.
+
+Representative local before/after timings on Apple M5 Pro, Rust 1.95.0:
+
+| Fixture | Before | After |
+|---|---:|---:|
+| Broad regex, release (7-run median) | 18.91 ms | 0.47 ms |
+| Broad regex with boosts, release (7-run median) | 65.88 ms | 3.06 ms |
+| Sparse regex, release (7-run median) | 15.25 ms | 1.60 ms |
+| 100 warm PDF-cache reads, release (5-run median) | 170.91 ms | 2.12 ms |
+| 1,000-result redraw, debug (mean over 100 frames) | 13.67 ms | 0.95 ms |
+
+The last result demonstrates viewport-bounded formatting, not a guarantee
+for real-terminal/image-protocol performance. Cheap global slot bookkeeping
+still scales with result count.
+
 ## Good first areas
 
 Check [ROADMAP.md](ROADMAP.md) and issues labeled `good first issue`.

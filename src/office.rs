@@ -76,12 +76,7 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
         .hash(&mut hasher);
     let key = format!("office-{:016x}-{mtime}-{}.txt", hasher.finish(), meta.len());
     let cached = cache_dir.join(&key);
-    crate::document_cache::evict(
-        cache_dir,
-        true,
-        crate::document_cache::MAX_TOTAL_BYTES,
-        crate::document_cache::MAX_FILES,
-    );
+    crate::document_cache::maintain(cache_dir, true);
     if let Some(text) = crate::document_cache::read(&cached, crate::document_cache::MAX_ENTRY_BYTES)
     {
         return Ok(text);

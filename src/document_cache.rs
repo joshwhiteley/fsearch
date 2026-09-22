@@ -1,7 +1,9 @@
 //! Shared disk budgets for extracted document text (including failure markers).
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ERROR_BYTES: u64 = 16 * 1024;
@@ -9,6 +11,48 @@ pub(crate) const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 4096;
 static NONCE: AtomicU64 = AtomicU64::new(0);
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_MAINTENANCE_DIRS: usize = 16;
+static MAINTENANCE: std::sync::Mutex<Maintenance> = std::sync::Mutex::new(Maintenance {
+    directories: VecDeque::new(),
+});
+
+struct Maintenance {
+    directories: VecDeque<(PathBuf, bool, Instant)>,
+}
+
+impl Maintenance {
+    fn due(&mut self, dir: &Path, office: bool, now: Instant) -> bool {
+        if let Some(index) = self
+            .directories
+            .iter()
+            .position(|(path, kind, _)| path == dir && *kind == office)
+        {
+            if now.saturating_duration_since(self.directories[index].2) < MAINTENANCE_INTERVAL {
+                return false;
+            }
+            self.directories.remove(index);
+        } else if self.directories.len() == MAX_MAINTENANCE_DIRS {
+            self.directories.pop_front();
+        }
+        self.directories.push_back((dir.to_path_buf(), office, now));
+        true
+    }
+}
+
+/// Audit legacy/external entries on first use and periodically, not for every
+/// warm hit. Reads still enforce per-entry limits, and every write below
+/// enforces the full byte/count budgets regardless of this schedule.
+pub(crate) fn maintain(dir: &Path, office: bool) {
+    let due =
+        MAINTENANCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .due(dir, office, Instant::now());
+    if due {
+        evict(dir, office, MAX_TOTAL_BYTES, MAX_FILES);
+    }
+}
 
 pub(crate) fn read(path: &Path, limit: u64) -> Option<String> {
     let file = crate::util::open_regular_file(path).ok()?;
@@ -108,6 +152,46 @@ pub(crate) fn evict(dir: &Path, office: bool, bytes: u64, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_reads_throttle_directory_scans_and_schedule_state_is_bounded() {
+        let now = Instant::now();
+        let mut maintenance = Maintenance {
+            directories: VecDeque::new(),
+        };
+        let path = Path::new("cache");
+        assert!(maintenance.due(path, false, now));
+        for second in 0..60 {
+            assert!(!maintenance.due(path, false, now + Duration::from_secs(second)));
+        }
+        assert!(maintenance.due(path, false, now + MAINTENANCE_INTERVAL));
+        assert!(maintenance.due(path, true, now));
+        for index in 0..100 {
+            assert!(maintenance.due(&PathBuf::from(format!("cache-{index}")), false, now));
+            assert!(maintenance.directories.len() <= MAX_MAINTENANCE_DIRS);
+        }
+        assert!(maintenance.due(path, false, now));
+    }
+
+    #[test]
+    fn writes_enforce_budgets_even_when_read_maintenance_is_not_due() {
+        for office in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            maintain(dir.path(), office);
+            let prefix = if office { "office-" } else { "" };
+            // Legacy oversized files arriving between audits must still be
+            // removed by a write, rather than being trusted until next minute.
+            let oversized = dir.path().join(format!("{prefix}0123456789abcdef-0-0.txt"));
+            std::fs::File::create(&oversized)
+                .unwrap()
+                .set_len(MAX_ENTRY_BYTES + 1)
+                .unwrap();
+            let target = dir.path().join(format!("{prefix}fedcba9876543210-0-4.txt"));
+            store(dir.path(), &target, "text", office);
+            assert!(!oversized.exists());
+            assert_eq!(read(&target, MAX_ENTRY_BYTES).as_deref(), Some("text"));
+        }
+    }
 
     #[test]
     fn both_caches_evict_by_bytes_and_count_including_errors() {

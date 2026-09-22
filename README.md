@@ -109,7 +109,8 @@ repeated content hits can repeat a path. `--json` and `--print0` cannot be
 combined. Use them instead of newline-delimited text for paths containing
 newlines. Human-readable text results escape terminal control characters when
 stdout is a terminal; redirected text, JSON and NUL records keep their existing
-encoding. Content-result text is limited to a UTF-8-safe 4 KiB prefix per hit.
+encoding. Long content lines use a UTF-8-safe excerpt of at most 4 KiB around
+the first match; `…` marks omitted context.
 
 `--read0` accepts NUL-separated stdin records in filter mode. Stdin must be
 valid UTF-8, even with NUL delimiters. Input is limited to 64 MiB total and

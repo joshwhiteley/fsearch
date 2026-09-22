@@ -1412,6 +1412,19 @@ impl App {
             .map(|row| row.path.clone());
     }
 
+    /// Mouse wheels stop at the list edges; keyboard navigation keeps wrapping.
+    fn scroll_selection(&mut self, delta: isize) {
+        let len = self.visible_len();
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(len.saturating_sub(1));
+        self.selection_anchor = (len > 0)
+            .then(|| self.engine.results().get(self.selected))
+            .flatten()
+            .map(|row| row.path.clone());
+    }
+
     fn restore_selection_anchor(&mut self) {
         // Content results append without reranking and can contain several
         // lines from one path. Path-only anchoring would jump to its first hit.
@@ -1559,14 +1572,14 @@ impl App {
         match ev.kind {
             MouseEventKind::ScrollDown => {
                 if self.hit_test.results_area.contains(point) {
-                    self.move_selection(1);
+                    self.scroll_selection(1);
                 } else if self.hit_test.preview_area.contains(point) {
                     self.preview.scroll = self.preview.scroll.saturating_add(3);
                 }
             }
             MouseEventKind::ScrollUp => {
                 if self.hit_test.results_area.contains(point) {
-                    self.move_selection(-1);
+                    self.scroll_selection(-1);
                 } else if self.hit_test.preview_area.contains(point) {
                     self.preview.scroll = self.preview.scroll.saturating_sub(3);
                 }
@@ -1594,6 +1607,13 @@ impl App {
             .skip(self.list_state.offset())
             .copied()
         {
+            // List renders whole rows only. The spare cell below a two-line
+            // row is not a hit target for the next, off-screen result.
+            if usize::from(cursor_y) + usize::from(h)
+                > usize::from(self.hit_test.results_area.height)
+            {
+                break;
+            }
             if y_rel < cursor_y + h {
                 return match slot {
                     Slot::Row(i) => {

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Regex ranking uses bounded parallel top-k selection and private matcher
+  scratch caches, avoiding full-result sorts and cross-thread cache contention
+- Result rendering builds text/highlights only for the on-screen viewport;
+  mouse-wheel navigation stops at the ends without changing keyboard wrapping,
+  and spare cells below a multiline row no longer select an invisible result
+- Warm PDF/Office cache reads no longer scan and sort the entire cache directory
+  on every hit. Writes still enforce byte/count budgets; read-side maintenance
+  runs on first use and periodically
+- Long content-line excerpts keep the first match with nearby context and
+  explicit truncation markers instead of returning an unrelated line prefix
+
 - Home-directory display shortening is component-aware and safe for `~/`
   results. Content highlights persist across frames, query cursors account for
   display-cell widths, and Forge honors explicit sharp borders

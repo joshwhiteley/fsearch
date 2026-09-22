@@ -45,12 +45,7 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     path.hash(&mut hasher);
     let key = format!("{:016x}-{mtime}-{}.txt", hasher.finish(), meta.len());
     let cached = cache_dir.join(&key);
-    crate::document_cache::evict(
-        cache_dir,
-        false,
-        crate::document_cache::MAX_TOTAL_BYTES,
-        MAX_PDF_CACHE_FILES,
-    );
+    crate::document_cache::maintain(cache_dir, false);
     if let Some(text) = crate::document_cache::read(&cached, crate::document_cache::MAX_ENTRY_BYTES)
     {
         return Ok(text);

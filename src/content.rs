@@ -1,5 +1,6 @@
 use crate::{office, pdf};
-use grep_regex::RegexMatcherBuilder;
+use grep_matcher::Matcher;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use rayon::prelude::*;
@@ -18,6 +19,43 @@ const PER_FILE_CAP: usize = 20;
 pub const QUEUE_CAPACITY: usize = 64;
 /// Bound retained matching text even for a single enormous source line.
 pub const MAX_LINE_BYTES: usize = 4096;
+
+/// Keep short lines unchanged and long-line hits useful: show the first match
+/// with a little leading context, rather than an unrelated prefix of the line.
+/// Reuse grep's compiled matcher so smart-case and regex semantics stay exact.
+fn match_excerpt(line: &str, matcher: &RegexMatcher) -> String {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.len() <= MAX_LINE_BYTES {
+        return line.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    const CONTEXT_BYTES: usize = 32;
+    let budget = MAX_LINE_BYTES - 2 * ELLIPSIS.len();
+    let mut start = matcher
+        .find(line.as_bytes())
+        .ok()
+        .flatten()
+        .map_or(0, |found| {
+            let context = CONTEXT_BYTES.min(budget.saturating_sub(found.len()));
+            found.start().saturating_sub(context)
+        });
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + budget).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut excerpt = String::with_capacity(MAX_LINE_BYTES);
+    if start > 0 {
+        excerpt.push_str(ELLIPSIS);
+    }
+    excerpt.push_str(&line[start..end]);
+    if end < line.len() {
+        excerpt.push_str(ELLIPSIS);
+    }
+    excerpt
+}
 
 /// A full queue must not prevent cancellation or shutdown.
 pub(crate) fn send_cancellable<T>(tx: &SyncSender<T>, mut value: T, cancel: &AtomicBool) -> bool {
@@ -105,15 +143,10 @@ pub(crate) fn search_with_sink<'a>(
             {
                 return Ok(false);
             }
-            let line = line.trim_end();
-            let mut end = line.len().min(MAX_LINE_BYTES);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
             let hit = ContentMatch {
                 path: path.to_string(),
                 line_number,
-                line: line[..end].to_string(),
+                line: match_excerpt(line, &matcher),
             };
             sent += 1;
             if !emit(hit) {
@@ -182,6 +215,51 @@ mod tests {
         )?;
         drop(tx);
         Ok(rx.into_iter().collect())
+    }
+
+    #[test]
+    fn long_line_excerpt_keeps_the_actual_match_and_marks_clipped_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("{} Needle {}\n", "界".repeat(3000), "é".repeat(3000));
+        let hits = run(
+            dir.path(),
+            &[("long.txt", text.as_bytes())],
+            "needle",
+            32_000,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].line.contains("Needle"), "match lost from excerpt");
+        assert!(hits[0].line.starts_with('…'));
+        assert!(hits[0].line.ends_with('…'));
+        assert!(hits[0].line.len() <= MAX_LINE_BYTES);
+        assert_eq!(hits[0].line_number, 1);
+    }
+
+    #[test]
+    fn excerpts_preserve_short_lines_and_handle_match_and_unicode_boundaries() {
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        assert_eq!(match_excerpt("a needle  \t\r\n", &matcher), "a needle  \t");
+        for text in [
+            format!("needle{}", "界".repeat(3000)),
+            format!("{}needle", "界".repeat(3000)),
+            format!("{}needle{}", "界".repeat(3000), "界".repeat(3000)),
+        ] {
+            let excerpt = match_excerpt(&text, &matcher);
+            assert!(excerpt.contains("needle"));
+            assert!(excerpt.len() <= MAX_LINE_BYTES);
+            assert_eq!(excerpt.starts_with('…'), !text.starts_with("needle"));
+            assert_eq!(excerpt.ends_with('…'), !text.ends_with("needle"));
+        }
+        let very_long = RegexMatcherBuilder::new().build("x+").unwrap();
+        let excerpt = match_excerpt(&"x".repeat(10_000), &very_long);
+        assert!(excerpt.len() <= MAX_LINE_BYTES);
+        assert!(excerpt.ends_with('…'));
+        let whole_line = RegexMatcherBuilder::new().build("^needle").unwrap();
+        assert!(
+            match_excerpt(&format!("needle{}", "界".repeat(3000)), &whole_line)
+                .starts_with("needle")
+        );
     }
 
     #[test]

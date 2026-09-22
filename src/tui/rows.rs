@@ -8,7 +8,8 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use std::ops::Range;
 use std::time::{Duration, SystemTime};
 
 pub(super) fn spans_with_styles(
@@ -214,6 +215,44 @@ pub(super) fn mark_spans(app: &App, path: &str) -> (Vec<Span<'static>>, usize) {
     (vec![span], width)
 }
 
+/// Compute the same whole-item viewport as a List with no scroll padding,
+/// without first formatting every result. A jump goes straight to the selected
+/// row, so even wrapping from the first row to the last only examines a screenful.
+fn viewport_slots(
+    slots: &[(Slot, u16)],
+    offset: usize,
+    selected: usize,
+    height: u16,
+) -> Range<usize> {
+    if slots.is_empty() {
+        return 0..0;
+    }
+    let height = usize::from(height);
+    let selected = selected.min(slots.len() - 1);
+    let mut start = offset.min(slots.len() - 1).min(selected);
+    let mut end = start;
+    let mut used = 0;
+    while end < slots.len() && used + usize::from(slots[end].1) <= height {
+        used += usize::from(slots[end].1);
+        end += 1;
+    }
+    if selected >= end {
+        end = selected + 1;
+        start = end;
+        used = 0;
+        while start > 0 && used + usize::from(slots[start - 1].1) <= height {
+            start -= 1;
+            used += usize::from(slots[start].1);
+        }
+        // A two-line row cannot fit in a one-line pane. Keep its offset,
+        // but render nothing rather than spilling into neighboring widgets.
+        if start > selected {
+            return selected..selected;
+        }
+    }
+    start..end
+}
+
 pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
     let match_color = app.theme.match_fg.unwrap_or(app.theme.accent);
@@ -250,15 +289,87 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         app.highlights.content_input.clear();
         content_re = None;
     }
-    let inner_width = themed_block("results", &app.theme).inner(area).width as usize;
+    let block = themed_block("results", &app.theme);
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
     let name_plain = Style::default().add_modifier(Modifier::BOLD);
     let parent_hl = Style::default().fg(match_color).add_modifier(Modifier::DIM);
-    let items: Vec<ListItem> = app
-        .engine
-        .results()
+    let rows = app.engine.results();
+    let visible = app.visible_len();
+    let strong = app.engine.strong_count();
+    let has_rows = !rows.is_empty();
+    let hidden = rows.len().saturating_sub(visible);
+    let opened = if app.editor.input.is_empty() && app.engine.mode() == Mode::Fuzzy {
+        rows.iter().take_while(|r| r.recent_open).count()
+    } else {
+        0
+    };
+    let row_height = if app.engine.is_filter()
+        || app.engine.mode() == Mode::Calc
+        || app.density == Density::Compact
+    {
+        1
+    } else {
+        2
+    };
+    // Keep the cheap global slot map for scrolling and mouse hit testing.
+    // Expensive text construction and highlighting below only visit the viewport.
+    let mut slots = Vec::with_capacity(visible + 3);
+    let mut headers = Vec::with_capacity(3);
+    let mut display_selected = 0;
+    for i in 0..visible {
+        let section = if opened > 0 && i == 0 {
+            Some("─ RECENT OPENS ────────")
+        } else if opened > 0 && i == opened {
+            Some("─ RECENTLY MODIFIED ────────")
+        } else {
+            None
+        };
+        if let Some(label) = section {
+            headers.push((slots.len(), label));
+            slots.push((Slot::Header, 1));
+        }
+        if app.show_weak && strong < rows.len() && i == strong {
+            headers.push((slots.len(), "─ WEAKER MATCHES ─"));
+            slots.push((Slot::Header, 1));
+        }
+        if i == app.selected.min(visible.saturating_sub(1)) {
+            display_selected = slots.len();
+        }
+        slots.push((Slot::Row(i), row_height));
+    }
+    if hidden > 0 {
+        slots.push((Slot::Fold, 1));
+    }
+    let viewport = viewport_slots(
+        &slots,
+        app.list_state.offset(),
+        display_selected,
+        if inner.is_empty() { 0 } else { inner.height },
+    );
+    let items: Vec<ListItem> = slots[viewport.clone()]
         .iter()
-        .take(app.visible_len())
-        .map(|r| {
+        .enumerate()
+        .map(|(local, (slot, _))| {
+            let r = match slot {
+                Slot::Row(i) => &rows[*i],
+                Slot::Header => {
+                    let label = headers
+                        .iter()
+                        .find(|(index, _)| *index == viewport.start + local)
+                        .map_or("", |(_, label)| *label);
+                    return ListItem::new(Span::styled(
+                        label,
+                        Style::default().fg(app.theme.section.unwrap_or(app.theme.dim)),
+                    ));
+                }
+                Slot::Fold => {
+                    return ListItem::new(Span::styled(
+                        format!("▸ {hidden} weaker matches hidden · ctrl-x show"),
+                        dim,
+                    ));
+                }
+            };
             if app.engine.mode() == crate::engine::Mode::Calc {
                 // the calculator's single row: dim "expr =" then the
                 // result in bold accent
@@ -467,95 +578,24 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
-    // On the launch screen (empty query), split the list into "recent
-    // opens" (frecency) and "recently modified" with dim section headers.
-    // Headers are extra list rows, so the selection index shifts past them.
-    let rows = app.engine.results();
-    let visible = app.visible_len();
-    let strong = app.engine.strong_count();
-    let has_rows = !rows.is_empty();
-    let hidden = rows.len().saturating_sub(visible);
-    let opened = rows.iter().take_while(|r| r.recent_open).count();
-    let sectioned =
-        app.editor.input.is_empty() && matches!(app.engine.mode(), Mode::Fuzzy) && opened > 0;
-    let mut display_items = items;
-    let mut display_selected = app.selected;
-    // slot map mirrors the final display list 1:1 for mouse hit testing:
-    // result rows are 2 lines in Comfy density, 1 in Compact (content rows
-    // are 2 lines in comfy too); filter rows are always 1 line. headers and
-    // the fold row are 1 line each.
-    let row_height: u16 = if app.engine.is_filter() || app.engine.mode() == Mode::Calc {
-        1
-    } else {
-        match app.density {
-            Density::Comfy => 2,
-            Density::Compact => 1,
-        }
-    };
-    let mut slots: Vec<(Slot, u16)> = (0..visible).map(|i| (Slot::Row(i), row_height)).collect();
-    if sectioned {
-        let header = |label: &str| {
-            ListItem::new(Span::styled(
-                format!("─ {label} ────────"),
-                Style::default().fg(app.theme.section.unwrap_or(app.theme.dim)),
-            ))
-        };
-        let mut with_headers = Vec::with_capacity(display_items.len() + 2);
-        let mut with_slots = Vec::with_capacity(slots.len() + 2);
-        with_headers.push(header("RECENT OPENS"));
-        with_slots.push((Slot::Header, 1));
-        for (i, item) in display_items.into_iter().enumerate() {
-            if i == opened {
-                with_headers.push(header("RECENTLY MODIFIED"));
-                with_slots.push((Slot::Header, 1));
-            }
-            with_headers.push(item);
-            with_slots.push(slots[i]);
-        }
-        display_items = with_headers;
-        slots = with_slots;
-        display_selected += if app.selected < opened { 1 } else { 2 };
-    }
-    // The weaker-match fold: a one-line dim fold after the last strong row
-    // while weak matches are hidden, or — once revealed — a section header
-    // before the first weaker row. Extra non-result rows (like the launch
-    // sections above); the trailing fold row never shifts the selection.
-    if hidden > 0 || (app.show_weak && strong < rows.len()) {
-        let mut out = Vec::with_capacity(display_items.len() + 2);
-        if app.show_weak && strong < rows.len() {
-            for (i, item) in display_items.into_iter().enumerate() {
-                if i == strong {
-                    out.push(ListItem::new(Span::styled(
-                        "─ WEAKER MATCHES ─",
-                        Style::default().fg(app.theme.section.unwrap_or(app.theme.dim)),
-                    )));
-                    slots.insert(i, (Slot::Header, 1));
-                }
-                out.push(item);
-            }
-            display_items = out;
-            // the header sits just before the first weaker row; a selection
-            // at or past it shifts one place
-            display_selected += if app.selected < strong { 0 } else { 1 };
-        } else {
-            out.extend(display_items);
-            out.push(ListItem::new(Span::styled(
-                format!("▸ {hidden} weaker matches hidden · ctrl-x show"),
-                Style::default().fg(app.theme.dim),
-            )));
-            display_items = out;
-            slots.push((Slot::Fold, 1));
-        }
-    }
     app.highlights.fuzzy = highlighter;
     app.highlights.content = content_re;
-    let block = themed_block("results", &app.theme);
-    app.hit_test.results_area = block.inner(area);
-    let list = List::new(display_items)
+    app.hit_test.results_area = inner;
+    let list = List::new(items)
         .block(block)
         .highlight_style(selection_style(&app.theme));
-    app.list_state.select(Some(display_selected));
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    let mut local_state = ListState::default();
+    if viewport.contains(&display_selected) {
+        local_state.select(Some(display_selected - viewport.start));
+    }
+    frame.render_stateful_widget(list, area, &mut local_state);
+    // List only sees the viewport slice; retain global coordinates for the
+    // next draw and click_results, including decorative rows before it.
+    if !inner.is_empty() {
+        app.list_state
+            .select((!slots.is_empty()).then_some(display_selected));
+        *app.list_state.offset_mut() = viewport.start;
+    }
     app.hit_test.slots = slots;
     if !has_rows {
         draw_empty_state(frame, app, app.hit_test.results_area, &app.engine.status());
@@ -745,6 +785,85 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn viewport_matches_full_list_scrolling_and_pixels() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::StatefulWidget;
+
+        for heights in [
+            vec![],
+            vec![1],
+            vec![2],
+            vec![1; 12],
+            vec![2; 12],
+            vec![1, 2, 2, 1, 2, 2, 1],
+        ] {
+            let slots: Vec<_> = heights
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (Slot::Row(i), *h))
+                .collect();
+            let items: Vec<_> = heights
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    ListItem::new(Text::from(
+                        (0..*h)
+                            .map(|line| Line::raw(format!("{i}:{line}")))
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+                .collect();
+            let style = Style::default().bg(Color::Blue);
+            for height in 1..10 {
+                let area = Rect::new(0, 0, 12, height);
+                for offset in 0..heights.len() + 2 {
+                    for selected in 0..heights.len() + 2 {
+                        let mut expected = Buffer::empty(area);
+                        let mut state = ListState::default()
+                            .with_offset(offset)
+                            .with_selected(Some(selected));
+                        StatefulWidget::render(
+                            List::new(items.clone()).highlight_style(style),
+                            area,
+                            &mut expected,
+                            &mut state,
+                        );
+                        let range = viewport_slots(&slots, offset, selected, height);
+                        assert_eq!(
+                            range.start,
+                            state.offset(),
+                            "heights={heights:?}, offset={offset}, selected={selected}, height={height}"
+                        );
+                        let mut actual = Buffer::empty(area);
+                        let selected = selected.min(heights.len().saturating_sub(1));
+                        let local_selection =
+                            range.contains(&selected).then(|| selected - range.start);
+                        StatefulWidget::render(
+                            List::new(items[range.clone()].to_vec()).highlight_style(style),
+                            area,
+                            &mut actual,
+                            &mut ListState::default().with_selected(local_selection),
+                        );
+                        assert_eq!(actual, expected);
+                        assert!(range.len() <= height as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_work_stays_bounded_when_jumping_through_many_rows() {
+        let slots: Vec<_> = (0..100_000).map(|i| (Slot::Row(i), 2)).collect();
+        assert_eq!(viewport_slots(&slots, 0, 99_999, 21), 99_990..100_000);
+        assert_eq!(viewport_slots(&slots, 99_990, 0, 21), 0..10);
+        assert_eq!(viewport_slots(&slots, 50_000, 50_005, 21), 50_000..50_010);
+        assert_eq!(viewport_slots(&slots, 0, 99_999, 1), 99_999..99_999);
+        assert_eq!(viewport_slots(&slots, 0, 99_999, 0), 99_999..99_999);
+        assert_eq!(viewport_slots(&slots, 0, 0, u16::MAX), 0..32_767);
+    }
 
     #[test]
     fn home_shortening_is_component_aware_and_splits_displayed_utf8() {

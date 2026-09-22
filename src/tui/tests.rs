@@ -1271,12 +1271,225 @@ fn mouse_state() -> App {
 }
 
 #[test]
+#[ignore = "synthetic redraw timing; run explicitly with --nocapture"]
+fn result_redraw_benchmark() {
+    let mut app = test_app();
+    app.preview_layout = PreviewLayout::Hidden;
+    app.editor.input = "synthetic".into();
+    app.show_weak = true;
+    for count in [500, 1000] {
+        app.engine.inject_results_for_test(
+            (0..count)
+                .map(|i| test_row(&format!("/synthetic/project/src/module_{i:04}.rs")))
+                .collect(),
+        );
+        assert_eq!(app.visible_len(), count);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let started = Instant::now();
+        for _ in 0..100 {
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+        eprintln!("{count} rows: {:?}/frame", started.elapsed() / 100);
+    }
+}
+
+#[test]
 fn mouse_wheel_in_results_moves_selection() {
     let mut app = mouse_state();
     assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10)));
     assert_eq!(app.selected, 1);
     assert!(app.handle_mouse(mouse(MouseEventKind::ScrollUp, 10)));
     assert_eq!(app.selected, 0);
+}
+
+#[test]
+fn mouse_wheel_stops_at_results_edges_but_keys_still_wrap() {
+    let mut app = mouse_state();
+    assert!(app.handle_mouse(mouse(MouseEventKind::ScrollUp, 10)));
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.selection_anchor.as_deref(), Some("/a"));
+    app.move_selection(-1);
+    assert_eq!(app.selected, 2, "keyboard navigation still wraps");
+    assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10)));
+    assert_eq!(app.selected, 2);
+    assert_eq!(app.selection_anchor.as_deref(), Some("/c"));
+    app.move_selection(1);
+    assert_eq!(app.selected, 0);
+
+    app.engine.inject_results_for_test(vec![]);
+    for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+        assert!(app.handle_mouse(mouse(kind, 10)));
+        assert_eq!(app.selected, 0);
+        assert!(app.selection_anchor.is_none());
+    }
+}
+
+#[test]
+fn result_viewport_preserves_global_selection_and_mouse_indices() {
+    for density in [Density::Compact, Density::Comfy] {
+        let mut app = test_app();
+        app.preview_layout = PreviewLayout::Hidden;
+        app.density = density;
+        app.engine.inject_results_for_test(
+            (0..1000)
+                .map(|i| {
+                    let mut row = test_row(&format!("/synthetic/row_{i:04}.rs"));
+                    row.recent_open = i < 5;
+                    row
+                })
+                .collect(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(90, 18)).unwrap();
+        for selected in [0, 4, 5, 500, 999, 0] {
+            app.selected = selected;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(buffer_text(&terminal).contains(&format!("row_{selected:04}.rs")));
+            let display_selected = app.list_state.selected().unwrap();
+            assert_eq!(app.hit_test.slots[display_selected].0, Slot::Row(selected));
+            assert_eq!(
+                display_selected,
+                selected + if selected < 5 { 1 } else { 2 }
+            );
+            let offset = app.list_state.offset();
+            let (local, index) = app.hit_test.slots[offset..]
+                .iter()
+                .enumerate()
+                .find_map(|(local, (slot, _))| match slot {
+                    Slot::Row(index) => Some((local, *index)),
+                    _ => None,
+                })
+                .unwrap();
+            let y = app.hit_test.results_area.y
+                + app.hit_test.slots[offset..offset + local]
+                    .iter()
+                    .map(|(_, height)| *height)
+                    .sum::<u16>();
+            // A single click must select the global row, not the viewport-local index.
+            app.hit_test.last_click = None;
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: app.hit_test.results_area.x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.selected, index);
+        }
+    }
+}
+
+#[test]
+fn result_viewport_preserves_fold_rows_and_content_hits() {
+    let mut app = test_filter_app();
+    app.editor.input = "alpha".into();
+    app.refresh_query();
+    tick_until(&mut app, |app| !app.engine.status().searching);
+    assert_eq!(app.engine.strong_count(), 1);
+    app.engine.inject_results_for_test(
+        (0..1000)
+            .map(|i| test_row(&format!("alpha_{i:04}")))
+            .collect(),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(90, 18)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert_eq!(app.hit_test.slots, vec![(Slot::Row(0), 1), (Slot::Fold, 1)]);
+    assert!(buffer_text(&terminal).contains("999 weaker matches hidden"));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: app.hit_test.results_area.x,
+        row: app.hit_test.results_area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(app.show_weak);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert_eq!(app.hit_test.slots[1], (Slot::Header, 1));
+    assert!(buffer_text(&terminal).contains("WEAKER MATCHES"));
+    app.selected = 999;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert_eq!(app.list_state.selected(), Some(1000));
+    assert!(buffer_text(&terminal).contains("alpha_0999"));
+    app.run_action(crate::keymap::Action::FoldToggle);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.list_state.offset(), 0);
+    assert!(buffer_text(&terminal).contains("999 weaker matches hidden"));
+    app.handle_mouse(mouse(
+        MouseEventKind::ScrollDown,
+        app.hit_test.results_area.y,
+    ));
+    assert_eq!(app.selected, 0, "wheel cannot enter the folded tail");
+
+    let mut app = test_app();
+    app.engine.set_query(">needle", false);
+    app.editor.input = ">needle".into();
+    app.engine.inject_results_for_test(
+        (0..1000)
+            .map(|i| {
+                let mut row = test_row("/synthetic/hits.rs");
+                row.line_number = Some(i + 1);
+                row.line = Some(format!("needle hit {i:04}"));
+                row
+            })
+            .collect(),
+    );
+    app.move_selection(999);
+    for density in [Density::Comfy, Density::Compact] {
+        app.density = density;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("needle hit 0999"));
+        assert_eq!(app.list_state.selected(), Some(999));
+        app.restore_selection_anchor();
+        assert_eq!(app.matched_line("/synthetic/hits.rs"), Some(1000));
+    }
+}
+
+#[test]
+fn result_viewport_blank_tail_is_not_an_invisible_mouse_target() {
+    let mut app = mouse_state();
+    let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    terminal
+        .draw(|frame| super::rows::draw_results(frame, &mut app, Rect::new(0, 0, 60, 5)))
+        .unwrap();
+    assert_eq!(app.hit_test.results_area.height, 3);
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: app.hit_test.results_area.x,
+        row: app.hit_test.results_area.y + 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.selected, 0, "the next two-line row is not on screen");
+    assert!(app.hit_test.last_click.is_none());
+}
+
+#[test]
+fn result_viewport_handles_tiny_panes_and_resize_without_spilling() {
+    let mut app = test_app();
+    app.engine.inject_results_for_test(
+        (0..1000)
+            .map(|i| test_row(&format!("/synthetic/row_{i:04}.rs")))
+            .collect(),
+    );
+    app.selected = 999;
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    for height in [15, 3, 2, 1, 0, 8, 18] {
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("neighbor"),
+                    Rect::new(0, 19, 60, 1),
+                );
+                super::rows::draw_results(frame, &mut app, Rect::new(0, 0, 60, height));
+            })
+            .unwrap();
+        assert!(buffer_text(&terminal).contains("neighbor"));
+        if height >= 4 {
+            assert!(buffer_text(&terminal).contains("row_0999.rs"));
+            assert_eq!(
+                app.hit_test.slots[app.list_state.selected().unwrap()].0,
+                Slot::Row(999)
+            );
+        }
+    }
 }
 
 #[test]
