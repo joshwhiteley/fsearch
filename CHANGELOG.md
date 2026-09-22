@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Home-directory display shortening is component-aware and safe for `~/`
+  results. Content highlights persist across frames, query cursors account for
+  display-cell widths, and Forge honors explicit sharp borders
+- Actions popups retain their command and target identities across mouse
+  events and result updates. Clipboard/trash work and selection metadata move
+  off the UI thread; subprocesses are bounded, cancellable and reaped. Linux
+  clipboard fallback continues after an installed backend fails
+- Filter runs no longer overwrite ordinary session layout preferences
+- Content searches use bounded result queues and payloads, enforce the TUI
+  hit budget at production, and restart when their index scope changes.
+  Filename work cancels stale generations and uses bounded top-k fuzzy ranking
+- Watchers preserve no-follow and application-bundle rules, merge changes
+  without cloning every path, coalesce snapshots, and shut down with the
+  engine. Incomplete discovery reports errors without replacing usable caches;
+  cold starts can search partial results without caching them as complete
+- History/query compaction and appends use stable cross-process locks. Query
+  history stays bounded while loading and on disk; path-cache loading reuses
+  its validated backing allocation. Semantic reload retains the warm model
+- PDF extraction runs in an exec-isolated helper with heap, CPU, wall-time and
+  output budgets; Linux also limits address space. PDF/Office caches enforce
+  byte and entry budgets. Empty XLSX shared-string entries preserve indexes
+- SVG previews reject external/embedded images and compressed input, rather
+  than bypass raster limits. Human-readable terminal result output escapes
+  control characters; pipe, JSON and NUL record encoding remain unchanged
+- CI exercises the real native embedding runtime/model and restricts release
+  write permissions and tokens to the publication job. The locked rustls
+  dependency is patched to 0.23.45 for RUSTSEC-2026-0285
+
 - `ctrl-l` opens a filterable saved-search picker from `[searches]`; Enter
   applies a query and Escape cancels. The shortcut is remappable
 - Text previews mark the matched line and explicitly label bounded excerpts;

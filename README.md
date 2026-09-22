@@ -107,7 +107,9 @@ records have a `type` field:
 searches it emits only the path **per hit**, without line or score fields;
 repeated content hits can repeat a path. `--json` and `--print0` cannot be
 combined. Use them instead of newline-delimited text for paths containing
-newlines.
+newlines. Human-readable text results escape terminal control characters when
+stdout is a terminal; redirected text, JSON and NUL records keep their existing
+encoding. Content-result text is limited to a UTF-8-safe 4 KiB prefix per hit.
 
 `--read0` accepts NUL-separated stdin records in filter mode. Stdin must be
 valid UTF-8, even with NUL delimiters. Input is limited to 64 MiB total and
@@ -322,7 +324,11 @@ extracted-cache files and bytes (at most 8,192 entries per cache directory;
 partial counts are marked). It does not probe the terminal,
 start a watcher, build an index, or verify documents against semantic
 vectors. A valid or recent snapshot is **not** a freshness guarantee.
-Use `--doctor` for terminal/image diagnostics.
+Use `--doctor` for terminal/image diagnostics. Incomplete walks warn rather
+than overwrite a usable index. On a cold start, discovered partial results
+remain searchable without being saved as a complete cache. Explicit
+`--reindex` and `--index-semantic` stop before replacing indexes if discovery
+is incomplete.
 
 Paths and metadata are cached under `~/.cache/fsearch/`; extracted PDF and
 Office text and semantic vectors also stay there. Open/query history and
@@ -330,6 +336,14 @@ layout live under `~/.local/state/fsearch/`. `XDG_CACHE_HOME` and
 `XDG_STATE_HOME` override these base directories. Configuration uses
 `XDG_CONFIG_HOME` (default `~/.config`). New app-managed cache/state directories
 use mode 0700 and files use 0600 on Unix. These local files are not encrypted.
+Each extracted-text cache has a 128 MiB byte budget and a 4,096-entry limit;
+individual texts are limited to 8 MiB and cached errors to 16 KiB.
+
+PDF parsing runs in an isolated subprocess with a 256 MiB accounted Rust heap
+budget, 3 CPU seconds, a 10-second wall timeout and bounded output. Linux also
+limits virtual address space to 768 MiB. The heap budget is not a total-RSS or
+native-allocation limit on macOS. SVG previews accept plain UTF-8 vector SVGs;
+external image references, embedded images and gzip-compressed SVGs are rejected.
 
 ```sh
 fsearch --clear-cache     # index.bin, semantic.bin, pdftext/, officetext/
@@ -338,7 +352,8 @@ fsearch --clear-history   # open/query history and remembered layout
 
 Close other fsearch instances **before** cleanup to prevent them from
 recreating data. Cleanup keeps downloaded models, configuration and original
-documents. `--no-history` prevents history/layout use for one search session;
+documents. Empty history/query lock sidecars remain to preserve coordination
+between processes. `--no-history` prevents history/layout use for one search session;
 it is not a zero-cache or anonymous mode.
 
 ## How it works

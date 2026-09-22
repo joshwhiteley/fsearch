@@ -36,7 +36,9 @@ src/
   frecency.rs  open history → ranking boosts
   session.rs   remembers preview layout + density between runs
   keymap.rs    configurable keybindings (spec parser + action table)
-  pdf.rs       PDF text extraction (cached, panic-guarded)
+  pdf.rs       PDF text extraction/cache facade
+  pdf_process.rs exec-only parser, heap/CPU/time/output budgets
+  document_cache.rs shared extracted-text byte/entry budgets
   office.rs    docx/xlsx text extraction (cached)
   engine.rs    orchestration: threads, generations, debounce, result state
   query.rs     headless filename/content/semantic search for -p
@@ -69,11 +71,14 @@ beside each cached path for filters and result metadata.
 
 **Snapshots, not locks.** The path list lives in an `Arc<PathStore>`.
 The indexer publishes complete replacement snapshots; searches clone the
-`Arc` and run against an immutable arena-backed store.
+`Arc` and run against an immutable arena-backed store. Loading retains the
+validated serialized backing allocation rather than copying its path arena.
+A one-slot mailbox coalesces unpublished snapshots.
 
 **Generation counters instead of cancellation trees.** Every query bump
 increments a generation. Workers tag their results with the generation they
-were started for; the engine drops anything stale on arrival. Content
+were started for; the engine drops anything stale on arrival. Filename
+matching also checks the current generation between scoring chunks. Content
 searches additionally carry an `Arc<AtomicBool>` cancel flag so an obsolete
 grep stops burning CPU mid-file. Query activity includes debounce time and
 in-flight filename/content/semantic work. A generation-tagged content
@@ -82,7 +87,9 @@ distinguishes pending results from a completed empty search.
 
 **Latest-job-wins search worker.** The filename-search worker drains its
 queue to the newest job before running it, so typing fast never queues up
-redundant searches.
+redundant searches. Fuzzy ranking retains bounded top-k heaps per parallel
+accumulator rather than sorting every match; score/index ordering and the
+quiet/weak-match fold remain unchanged.
 
 **The watcher is armed before the walk.** Filesystem events (FSEvents /
 inotify via the notify crate) start buffering *before* the initial walk
@@ -91,18 +98,28 @@ so reading previews does not trigger another walk. Changed paths are
 re-statted; replaced and deleted subtrees are pruned. Overlapping events
 and roots are coalesced, paths are deduplicated, and snapshots are sorted
 by actual mtime with path-order ties. A copied old file is not necessarily
-the newest file.
+the newest file. Incremental updates sort only changed entries and merge
+unchanged owned strings without cloning the full path list. Watch eligibility
+uses no-follow metadata within configured roots, including application roots;
+application bundles keep their file-like classification.
 
 Rescan flags and watcher errors rebuild configured roots with the same
 excludes and app policy as startup. Watcher and save errors remain visible
 across successful queries. This reduces missed-update windows; it is not a
 freshness guarantee. Headless searches use the cached path snapshot when
-available. `--reindex` explicitly refreshes it.
+available. `--reindex` explicitly refreshes it. Incomplete walks preserve a
+usable cached snapshot and report errors. Cold starts can publish partial
+results without saving them as a complete replacement. Explicit CLI rebuilds
+abort before replacing path/semantic indexes when discovery is incomplete.
 
 **Frecency lives beside the index, not in it.** Opens append to a small
 history file; at search time they become per-path score boosts.
 `remember_history = false` bypasses both history loading and recording.
-Layout persistence is controlled separately by `remember_session`.
+Layout persistence is controlled separately by `remember_session`; filter
+runs never overwrite ordinary layout preferences. Stable sidecar file locks
+serialize history/query appends with read/compact/rename across processes.
+Query loading maintains at most 100 recent unique records, bounds malformed
+lines, and compacts legacy logs.
 
 **Semantic vectors are f16 and memory-mapped.** Loads parse document metadata
 but map the vector tail read-only. Legacy f32 stores migrate without
@@ -118,7 +135,8 @@ the previous semantic store, including same-second changes. Reuse still
 relies on metadata rather than content hashes. Legacy migration is a
 separate first invocation: it converts vectors without loading the model,
 then exits. A subsequent invocation refreshes documents. The semantic
-worker notices store replacements on later queries, but the path watcher
+worker notices store replacements on later queries and retains the warm
+embedder when reloading vectors, but the path watcher
 does not rebuild embeddings. ONNX Runtime is selected with safe explicit
 `ort::init_from` calls, not a runtime environment mutation.
 
@@ -144,9 +162,18 @@ Engine ──── job_tx ────▶ search worker (latest job wins) ─�
 ```
 
 Communication uses `std::sync::mpsc`; the UI does not wait for search
-workers. Empty content and semantic queries clear pending debounce jobs.
+workers. Content hits use 64-slot cancellation-aware queues, with a producer
+cap of 1,000 hits in the TUI (headless streams are not globally capped).
+Matching-line payloads retain at most a UTF-8-safe 4 KiB prefix. Candidate
+filtering runs off the UI thread. Index snapshots are applied before content
+dispatch and invalidate content work against older scopes. Empty content and
+semantic queries clear pending debounce jobs. Dropping the engine signals
+indexer shutdown and joins it; an in-progress filesystem syscall can still
+need time to return.
 File transfers use a separate UI-owned worker with progress and cancellation
-between files. Foreground Neovim intentionally suspends the TUI until exit.
+between files. Clipboard/trash jobs and selection metadata also run outside
+the UI thread, with bounded queues and stale-result guards. Foreground
+Neovim intentionally suspends the TUI until exit.
 
 ## Search behavior
 
@@ -185,10 +212,33 @@ render through ratatui-image's best protocol, with a halfblock fallback.
 ZIP, TAR and gzip-compressed TAR previews list bounded archive contents
 without extracting files. Preview loading runs on a worker thread. Raster previews limit each dimension
 to 16,384 pixels, total pixels to 32 Mi pixels, and decoder allocation to
-128 MiB. Parsed and displayed text is capped; failures and guarded parser
-panics become error previews instead of terminating the UI.
+128 MiB. SVG input must be plain UTF-8 XML: external and embedded image
+resolvers are disabled, and gzip-disguised SVGs are rejected before expansion.
+Parsed and displayed text is capped; failures become error previews.
+
+PDF parsing runs only after exec in a helper mode of the same binary. A
+startup-accounting System allocator limits the helper's accounted Rust heap
+to 256 MiB; Linux additionally applies a 768 MiB RLIMIT_AS. Both supported
+platforms apply a 3-second CPU limit, disable core dumps, and enforce a
+10-second parent wall timeout and 8 MiB output cap. macOS does not provide
+Linux-equivalent RLIMIT_AS enforcement: its guarantee is the Rust heap budget,
+not total RSS or arbitrary native allocations. The parent kills and reaps
+failed helpers. Library hosts need a sibling fsearch helper executable; they
+never fall back to parsing in-process.
+
+PDF and Office caches each evict oldest entries to stay within 128 MiB and
+4,096 entries, including errors. Bounded no-follow reads enforce 8 MiB per
+text and 16 KiB per cached error. Office container/XML/text limits remain in
+place, and empty XLSX shared-string entries retain their index positions.
 
 ## Actions and transfer boundaries
+
+Actions popups freeze command and target identities until dismissal. Mouse
+input remains modal, and preview labels use the same frozen target as the
+action. Clipboard backends retry operational failures, not just spawn failures;
+subprocess writes/waits honor cancellation and deadlines. Background launches
+are reaped by a bounded shared reaper. The terminal is restored before waiting
+for outstanding action work on exit.
 
 Custom actions are argv arrays. `{path}`, `{dir}`, `{line}` and standalone
 `{paths}` expand from the original template, so placeholder-like text inside
@@ -226,6 +276,8 @@ for stdin filtering, destination selection, and active transfers.
 NDJSON hits/selections (`--big` emits file metadata); `--json --status` emits
 one health object. `--print0` emits a NUL-terminated path per hit, including
 content hits that share a path. It does not include line/score text.
+Human-readable terminal results escape control characters in untrusted
+fields; redirected text, JSON and NUL record encoding remain unchanged.
 `--read0` selects NUL-delimited filter input. Stdin is UTF-8 only, bounded
 at 64 MiB total, 1 MiB per record and 500,000 records. Byte-limit or UTF-8
 violations fail; record-count overflow warns and truncates.
@@ -240,7 +292,9 @@ not encryption or a guarantee against concurrently hostile path mutation.
 not index, model or extracted-text caches. `--clear-cache` removes known
 path/semantic indexes and extraction caches. `--clear-history` removes
 open/query history and layout. Cleanup does not delete models, configuration
-or source documents. Other running instances can recreate cleared data.
+or source documents. Empty history/query lock sidecars deliberately remain:
+deleting a locked inode would break cross-process serialization. Other
+running instances can recreate cleared data.
 
 `health.rs` inspects root readability and persisted cache validity, size,
 age and counts without starting an indexer, watcher, model or terminal
@@ -268,4 +322,8 @@ freshness. `--doctor` remains the terminal-probe diagnostic.
   Linux, alongside the engine's real watcher integration.
 - CI checks the locked default and semantic builds with exactly Rust 1.90.0,
   in addition to current-stable tests, clippy, formatting and all-feature
-  cargo-deny advisory/source checks.
+  cargo-deny advisory/source checks. A provisioned ONNX Runtime job also
+  executes native initialization and a real 384-dimensional embedding; the
+  ordinary semantic suite still uses the deterministic fake embedder.
+- Regression tests cover bounded PDF resource exhaustion in child processes,
+  terminal-control output in a PTY, and concurrent history compaction/appends.

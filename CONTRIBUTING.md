@@ -32,7 +32,11 @@ environment variables on child commands rather than mutating a
 multithreaded test process's environment.
 
 Run `cargo fmt` before submitting changes. In a shared working tree, format
-only files you own with `rustfmt --edition 2024 path/to/file.rs`.
+only files you own with `rustfmt --edition 2024 path/to/file.rs`. Parallel
+worktrees must use separate Cargo target directories: sharing one can reuse
+stale same-package artifacts from another checkout. On APFS, a copy-on-write
+copy of an existing target directory can seed dependencies without sharing
+mutable build outputs; force a rebuild of the local crate afterward.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) first — it explains the moving
 parts in ten minutes and will save you an hour of code reading.
@@ -57,7 +61,8 @@ parts in ten minutes and will save you an hour of code reading.
 ## CI and manual checks
 
 CI runs default tests and PTY smoke tests on macOS and Linux, semantic tests
-on Linux, all-feature tests/clippy with chafa on macOS, exact-MSRV checks,
+on Linux, a provisioned ONNX Runtime 1.24.4 job with real inference,
+all-feature tests/clippy with chafa on macOS, exact-MSRV checks,
 and cargo-audit/cargo-deny gates. Advisory/source checks include optional
 features (`cargo deny --all-features check advisories sources`).
 
@@ -80,12 +85,23 @@ For optional renderers and the native runtime loader:
 ```sh
 brew install chafa pkgconf onnxruntime
 FSEARCH_SEM_FAKE=1 cargo test --locked --all-features
-cargo test --locked --all-features --lib native_runtime_initializes_without_environment_mutation -- --ignored
+FSEARCH_SEM_FAKE=0 cargo test --locked --all-features --lib native_runtime_initializes_without_environment_mutation -- --ignored
+FSEARCH_SEM_FAKE=0 cargo test --locked --features semantic --test native_semantic -- --ignored
 ```
 
-The ignored native-runtime test initializes the installed ONNX Runtime without
-loading or downloading an embedding model. It is a local check, not a model
-relevance benchmark. Run the million-path performance budget separately:
+The ignored native-runtime unit test initializes the installed ONNX Runtime
+without downloading a model. The native integration test downloads/loads the
+model and checks real, finite, normalized 384-dimensional vectors. CI runs
+both explicitly; neither is a relevance benchmark. Set `ORT_DYLIB_PATH` before
+launch if the runtime is outside the usual locations. Runtime API 24 or newer
+is required by the locked fastembed dependency.
+
+PDF resource regression fixtures run only in bounded child processes. The
+three ignored `pdf_process` entry points are internal subprocess test helpers,
+not standalone tests. Never remove their child-only guards or move resource
+exhaustion probes into the parent process.
+
+Run the million-path performance budget separately:
 
 ```sh
 cargo test --locked --release --test perf_test -- --ignored --nocapture
