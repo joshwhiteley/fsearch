@@ -76,6 +76,7 @@ pub fn search_boosted(
 
 /// Like [`search_boosted`], but drops work when a newer engine generation is
 /// published. The existing search functions remain synchronous and unchanged.
+#[allow(clippy::too_many_arguments)]
 pub fn search_boosted_generation(
     store: &PathStore,
     query: &str,
@@ -157,6 +158,7 @@ struct MatchScope<'a> {
     lines: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_with_scope(
     store: &PathStore,
     query: &str,
@@ -547,7 +549,7 @@ fn fuzzy(
     // selected prefix is sufficient to compute the visible fold: if more
     // candidates existed, truncating to `limit` would cap `strong` there too.
     let non_quiet = scored.partition_point(|candidate| !candidate.quiet);
-    let strong = if let Some(_) = demote {
+    let strong = if demote.is_some() {
         if non_quiet > 0 {
             floor_strong(&scored[..non_quiet])
         } else {
@@ -1145,11 +1147,10 @@ mod tests {
         );
         current.store(1, Ordering::Release);
         assert!(
-            search(&store, "report", FilenameMode::Fuzzy, 10)
+            !search(&store, "report", FilenameMode::Fuzzy, 10)
                 .unwrap()
                 .indices
-                .len()
-                > 0
+                .is_empty()
         );
     }
 }

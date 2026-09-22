@@ -150,10 +150,10 @@ fn load_queries_locked(path: &Path) -> (Vec<String>, usize) {
         }
         seen.insert(query.to_string());
         out.push_back(query.to_string());
-        if out.len() > QUERY_LIMIT {
-            if let Some(oldest) = out.pop_front() {
-                seen.remove(&oldest);
-            }
+        if out.len() > QUERY_LIMIT
+            && let Some(oldest) = out.pop_front()
+        {
+            seen.remove(&oldest);
         }
     }
     (out.into_iter().collect(), lines)
