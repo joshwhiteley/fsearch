@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Idle UI polling no longer redraws unchanged frames; async results, transfer
+  progress, toast expiry, visible ages and terminal resizing still refresh
+- Semantic scoring checks vector bounds and selects its storage decoder once
+  per vector, preserving exact scalar scores and ranking across f16/f32 stores
+- Bracketed paste inserts sanitized text in one edit instead of interpreting
+  newlines as commands, with a UTF-8-safe 64 KiB total-query budget
+- Home/End/Delete edit the query unless explicitly remapped. Query and fold
+  hints use effective bindings, and stdin-filter hints describe supported modes
+
 - Regex ranking uses bounded parallel top-k selection and private matcher
   scratch caches, avoiding full-result sorts and cross-thread cache contention
 - Result rendering builds text/highlights only for the on-screen viewport;

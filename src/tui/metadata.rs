@@ -51,9 +51,12 @@ impl StatusCache {
         }
     }
 
-    pub(super) fn refresh(&mut self, path: Option<String>) {
+    /// Report accepted path/metadata changes, not queued work or stale replies.
+    pub(super) fn refresh(&mut self, path: Option<String>) -> bool {
         let path = path.unwrap_or_default();
-        if self.path != path {
+        let path_changed = self.path != path;
+        let previous_meta = self.meta;
+        if path_changed {
             self.generation = self.generation.wrapping_add(1);
             self.path = path;
             self.meta = None;
@@ -70,6 +73,7 @@ impl StatusCache {
                 Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
             }
         }
+        path_changed || self.meta != previous_meta
     }
 }
 
@@ -82,6 +86,42 @@ impl StatusCache {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn refresh_dirty_tracks_accepted_metadata_not_stale_or_duplicate_replies() {
+        // Inject replies directly: no real paths, worker timing, or stat calls.
+        let (tx, _requests) = mpsc::sync_channel(1);
+        let (replies, rx) = mpsc::channel();
+        let mut cache = StatusCache {
+            path: String::new(),
+            meta: None,
+            generation: 0,
+            pending: None,
+            tx,
+            rx,
+        };
+        assert!(!cache.refresh(None));
+        assert!(cache.refresh(Some("synthetic".into())));
+        assert!(!cache.refresh(Some("synthetic".into())));
+        replies
+            .send((0, "synthetic".into(), Some((true, 1, None))))
+            .unwrap();
+        replies
+            .send((1, "other".into(), Some((true, 1, None))))
+            .unwrap();
+        assert!(!cache.refresh(Some("synthetic".into())));
+        replies
+            .send((1, "synthetic".into(), Some((true, 2, None))))
+            .unwrap();
+        assert!(cache.refresh(Some("synthetic".into())));
+        assert_eq!(cache.meta, Some((true, 2, None)));
+        replies
+            .send((1, "synthetic".into(), Some((true, 2, None))))
+            .unwrap();
+        assert!(!cache.refresh(Some("synthetic".into())));
+        assert!(cache.refresh(None));
+        assert!(!cache.refresh(None));
+    }
 
     #[test]
     fn metadata_is_off_thread_bounded_and_rejects_stale_same_path_replies() {

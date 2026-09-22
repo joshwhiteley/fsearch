@@ -30,6 +30,10 @@ close $cfg
 log_user 0
 spawn -noecho sh -c "stty rows 30 cols 120; exec env HOME=$home XDG_CONFIG_HOME=$tmp/config XDG_CACHE_HOME=$cache XDG_STATE_HOME=$tmp/state TERM=xterm-256color $bin"
 expect {
+    -exact "\033\[?2004h" {}
+    timeout { puts stderr "bracketed paste was not enabled"; exit 1 }
+}
+expect {
     -re {fsearch} {}
     timeout {
         puts stderr "TUI did not start"
@@ -37,17 +41,32 @@ expect {
     }
 }
 
-send -- "meeting"
+# First prove the Paste event changes the query, rather than merely observing
+# the initial unfiltered result (which would also pass with a no-op handler).
+expect {
+    -re {meeting-notes\.md} {}
+    timeout { puts stderr "initial index did not appear"; exit 1 }
+}
+send -- "\033\[200~zzfsearchabsent987654321\033\[201~"
+expect {
+    -re {No matches} {}
+    timeout { puts stderr "pasted query was not applied"; exit 1 }
+}
+send -- "\025\033\[200~meeting\033\[201~"
 expect {
     -re {meeting-notes\.md} {}
     timeout {
-        puts stderr "typed query did not produce the indexed file"
+        puts stderr "pasted query did not produce the indexed file"
         send -- "\003"
         exit 1
     }
 }
 
 send -- "\033"
+expect {
+    -exact "\033\[?2004l" {}
+    timeout { puts stderr "bracketed paste was not restored on exit"; exit 1 }
+}
 expect {
     eof {}
     timeout {
@@ -69,13 +88,34 @@ expect {
     -re {No matches} {}
     timeout { puts stderr "private pick UI did not settle"; exit 1 }
 }
+# A multiline clipboard paste is one edit, not Enter/open or a stream of
+# shortcuts. Opening the saved picker afterwards proves it did not accept/exit.
+send -- "\025\033\[200~meeting\r\nnotes\033\[201~"
+expect {
+    -re {meeting-notes\.md} {}
+    eof { puts stderr "pasted newline accepted the result"; exit 1 }
+    timeout { puts stderr "multiline paste did not search"; exit 1 }
+}
+# Start the picker from an empty result set so applying its query must paint
+# a new result, rather than depending on unchanged terminal cells being emitted.
+send -- "\025zzfsearchabsent987654321"
+expect {
+    -re {No matches} {}
+    timeout { puts stderr "private query did not clear results"; exit 1 }
+}
 send -- "\014"
 # Ratatui can skip blank cells with cursor moves between title words.
 expect {
     -re {saved.*searches.*\(1/1\)} {}
     timeout { puts stderr "saved-search picker did not open"; exit 1 }
 }
-send -- "notes\r"
+send -- "\033\[200~zzfsearchabsent987654321\033\[201~"
+expect {
+    -re {No.*matching.*saved.*searches} {}
+    timeout { puts stderr "paste did not filter saved searches"; exit 1 }
+}
+send -- "\027\033\[200~notes\033\[201~"
+send -- "\r"
 expect {
     -re {meeting-notes\.md} {}
     timeout { puts stderr "private pick UI did not show results"; exit 1 }

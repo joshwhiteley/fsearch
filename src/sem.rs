@@ -309,30 +309,48 @@ impl VectorStorage {
         }
     }
 
-    fn f32_at(&self, index: usize) -> Option<f32> {
+    /// Check the whole vector once and dispatch outside the component loop.
+    /// Keep scalar accumulation in query order so scores are bit-for-bit
+    /// identical for owned f16, mapped f16, and legacy mapped f32 stores.
+    fn dot(&self, start: usize, query: &[f32]) -> Option<f32> {
+        let end = start.checked_add(query.len())?;
+        let mut score = 0.0;
         match self {
-            Self::Owned(bits) => bits
-                .get(index)
-                .copied()
-                .map(f16::from_bits)
-                .map(f16::to_f32),
+            Self::Owned(bits) => {
+                for (&bits, &q) in bits.get(start..end)?.iter().zip(query) {
+                    score += f16::from_bits(bits).to_f32() * q;
+                }
+            }
             Self::Mapped {
                 mmap,
                 vector_offset,
                 vector_count,
                 format,
-            } if index < *vector_count => {
-                let offset = vector_offset.checked_add(index.checked_mul(format.bytes())?)?;
-                let bytes = mmap.get(offset..offset.checked_add(format.bytes())?)?;
-                Some(match format {
+            } => {
+                if end > *vector_count {
+                    return None;
+                }
+                let byte_start = vector_offset.checked_add(start.checked_mul(format.bytes())?)?;
+                let byte_end = vector_offset.checked_add(end.checked_mul(format.bytes())?)?;
+                let bytes = mmap.get(byte_start..byte_end)?;
+                match format {
                     VectorFormat::F16 => {
-                        f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+                        for (bytes, &q) in bytes.chunks_exact(2).zip(query) {
+                            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                            score += f16::from_bits(bits).to_f32() * q;
+                        }
                     }
-                    VectorFormat::F32 => f32::from_le_bytes(bytes.try_into().ok()?),
-                })
+                    VectorFormat::F32 => {
+                        for (bytes, &q) in bytes.chunks_exact(4).zip(query) {
+                            let value =
+                                f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                            score += value * q;
+                        }
+                    }
+                }
             }
-            _ => None,
         }
+        Some(score)
     }
 
     fn f16_bits_at(&self, index: usize) -> Option<u16> {
@@ -529,10 +547,6 @@ impl SemStore {
         }
     }
 
-    fn vector_f32_at(&self, index: usize) -> Option<f32> {
-        self.vectors.f32_at(index)
-    }
-
     #[cfg(test)]
     fn vector_bits_at(&self, index: usize) -> Option<u16> {
         self.vectors.f16_bits_at(index)
@@ -572,11 +586,7 @@ impl SemStore {
                 let mut best: Option<(f32, u32)> = None;
                 for ci in start..end {
                     let base = ci.checked_mul(dim)?;
-                    let mut score = 0.0;
-                    for (component, query) in qvec.iter().enumerate() {
-                        let value = self.vector_f32_at(base + component)?;
-                        score += value * query;
-                    }
+                    let score = self.vectors.dot(base, qvec)?;
                     if score.is_finite() && best.is_none_or(|(s, _)| score > s) {
                         best = Some((score, self.chunk_lines[ci]));
                     }

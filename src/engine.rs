@@ -118,7 +118,7 @@ fn merge_unified_results(filename: &[ResultRow], semantic: &[ResultRow]) -> Vec<
     ranked.into_iter().map(|(_, _, _, row)| row).collect()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineStatus {
     pub indexed: usize,
     pub indexing: bool,
@@ -1118,7 +1118,16 @@ impl Engine {
         }
     }
 
+    /// Apply worker updates and due searches.
     pub fn tick(&mut self) {
+        self.tick_changed();
+    }
+
+    /// Apply updates and report whether results or status need repainting.
+    /// Unlike `tick`, this is intended for demand-driven UI event loops.
+    pub fn tick_changed(&mut self) -> bool {
+        let previous_status = self.status();
+        let mut results_changed = false;
         let mut snapshot = self
             .snapshot
             .lock()
@@ -1132,6 +1141,7 @@ impl Engine {
         {
             match msg {
                 Msg::IndexSnapshot { store, indexing } => {
+                    results_changed = true;
                     self.store = store;
                     self.status.indexed = self.store.len();
                     self.status.indexing = indexing;
@@ -1194,6 +1204,7 @@ impl Engine {
                     if generation != self.generation {
                         continue;
                     }
+                    results_changed = true;
                     self.filename_running = false;
                     self.filename_results = indices
                         .into_iter()
@@ -1225,6 +1236,7 @@ impl Engine {
                     if generation != self.generation || self.results.len() >= CONTENT_LIMIT {
                         continue;
                     }
+                    results_changed = true;
                     self.results.push(ResultRow {
                         path: hit.path,
                         line_number: Some(hit.line_number),
@@ -1259,6 +1271,7 @@ impl Engine {
                     if generation != self.generation {
                         continue;
                     }
+                    results_changed = true;
                     self.semantic_running = false;
                     let f = &self.filters;
                     let rows: Vec<ResultRow> = rows
@@ -1281,6 +1294,7 @@ impl Engine {
         // Drain index changes before choosing the content-search scope.
         self.fire_due_content_search();
         self.fire_due_semantic_search();
+        results_changed || self.status() != previous_status
     }
 
     pub fn results(&self) -> &[ResultRow] {
@@ -1708,6 +1722,168 @@ mod tests {
                 _ => None,
             })
             .expect("snapshot")
+    }
+
+    /// No worker timing: discard the startup snapshot before it dispatches,
+    /// then enqueue exactly the messages under test.
+    fn redraw_test_engine() -> Engine {
+        let engine = Engine::from_lines(vec!["alpha".into(), "beta".into()]);
+        assert!(matches!(
+            engine.msg_rx.try_recv(),
+            Ok(Msg::IndexSnapshot { .. })
+        ));
+        engine
+    }
+
+    #[test]
+    fn tick_dirty_ignores_idle_and_stale_work_but_reports_empty_completion() {
+        let mut engine = redraw_test_engine();
+        assert!(!engine.tick_changed());
+        engine.filename_running = true;
+        engine
+            .msg_tx
+            .send(Msg::FilenameResults {
+                generation: engine.generation.wrapping_add(1),
+                indices: vec![0],
+                strong: 1,
+                error: None,
+            })
+            .unwrap();
+        assert!(!engine.tick_changed());
+        assert!(engine.status().searching);
+        engine
+            .msg_tx
+            .send(Msg::FilenameResults {
+                generation: engine.generation,
+                indices: vec![],
+                strong: 0,
+                error: None,
+            })
+            .unwrap();
+        assert!(engine.tick_changed());
+        assert!(!engine.status().searching);
+        assert!(engine.results().is_empty());
+        assert!(!engine.tick_changed());
+    }
+
+    #[test]
+    fn tick_dirty_reports_same_count_replacements_and_search_errors() {
+        let mut engine = redraw_test_engine();
+        for index in [0, 1] {
+            engine
+                .msg_tx
+                .send(Msg::FilenameResults {
+                    generation: engine.generation,
+                    indices: vec![index],
+                    strong: 1,
+                    error: None,
+                })
+                .unwrap();
+            assert!(engine.tick_changed());
+            assert_eq!(engine.results().len(), 1);
+            assert_eq!(
+                engine.results()[0].path,
+                if index == 0 { "alpha" } else { "beta" }
+            );
+            assert!(!engine.tick_changed());
+        }
+        engine
+            .msg_tx
+            .send(Msg::ContentError {
+                generation: engine.generation.wrapping_add(1),
+                error: "stale".into(),
+            })
+            .unwrap();
+        assert!(!engine.tick_changed());
+        engine
+            .msg_tx
+            .send(Msg::ContentError {
+                generation: engine.generation,
+                error: "invalid pattern".into(),
+            })
+            .unwrap();
+        assert!(engine.tick_changed());
+        assert_eq!(engine.status().error.as_deref(), Some("invalid pattern"));
+        engine.content_cancel = Some(Arc::new(AtomicBool::new(false)));
+        engine
+            .msg_tx
+            .send(Msg::ContentDone {
+                generation: engine.generation,
+            })
+            .unwrap();
+        assert!(engine.tick_changed());
+        assert!(!engine.status().searching);
+        assert!(!engine.tick_changed());
+    }
+
+    #[test]
+    fn tick_dirty_reports_index_progress_failure_and_empty_snapshot() {
+        let mut engine = redraw_test_engine();
+        engine.status.indexing = true;
+        for changed in [true, false] {
+            engine
+                .msg_tx
+                .send(Msg::IndexProgress {
+                    count: 10,
+                    expected: Some(100),
+                })
+                .unwrap();
+            assert_eq!(engine.tick_changed(), changed);
+        }
+        engine
+            .msg_tx
+            .send(Msg::IndexError {
+                error: "synthetic failure".into(),
+            })
+            .unwrap();
+        assert!(engine.tick_changed());
+        assert!(!engine.status().indexing);
+        assert!(!engine.tick_changed());
+        // Calc mode avoids dispatching real matcher work in this fixture.
+        engine.mode = Mode::Calc;
+        *engine.snapshot.lock().unwrap() = Some((Arc::new(PathStore::empty()), false));
+        assert!(engine.tick_changed());
+        assert_eq!(engine.status().indexed, 0);
+        assert!(!engine.tick_changed());
+    }
+
+    #[test]
+    fn tick_dirty_reports_streamed_hits_and_semantic_completion() {
+        let mut engine = redraw_test_engine();
+        engine.mode = Mode::Content;
+        for (generation, expected) in [(1, false), (0, true)] {
+            engine
+                .msg_tx
+                .send(Msg::ContentHit {
+                    generation,
+                    hit: content::ContentMatch {
+                        path: "synthetic".into(),
+                        line_number: 1,
+                        line: "match".into(),
+                    },
+                })
+                .unwrap();
+            assert_eq!(engine.tick_changed(), expected);
+        }
+        assert_eq!(engine.results.len(), 1);
+        engine.results.clear();
+        engine.status.matches = 0;
+        engine.mode = Mode::Semantic;
+        engine.semantic_running = true;
+        for (generation, expected) in [(1, false), (0, true)] {
+            engine
+                .msg_tx
+                .send(Msg::SemanticResults {
+                    generation,
+                    rows: Vec::new(),
+                    error: None,
+                })
+                .unwrap();
+            assert_eq!(engine.tick_changed(), expected);
+        }
+        assert!(!engine.status().searching);
+        assert!(engine.results.is_empty());
+        assert!(!engine.tick_changed());
     }
 
     #[test]

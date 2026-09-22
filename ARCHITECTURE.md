@@ -49,6 +49,8 @@ src/
   util.rs      private directory/file creation, human sizes, unix time
   tui/
     mod.rs     App state, event loop, terminal probe
+    redraw.rs  visible-change scheduling, toast expiry, transfer/age tracking
+    paste.rs   bounded, sanitized batch insertion for query and saved filter
     rows.rs    result row rendering
     preview.rs preview worker + pane
     chrome.rs  input, wrapped help, status, gauge, toasts, menu
@@ -131,6 +133,9 @@ documents are sampled across at most 256 chunks. `SemStore::query_filtered`
 checks document predicates before scoring and truncation; `query` remains
 an unfiltered wrapper. Interactive and headless semantic queries use the
 filtered API, so restrictive filters do not depend on fixed over-fetching.
+Vector scoring checks a whole slice and dispatches the owned-f16, mmap-f16 or
+legacy-f32 decoder once per vector. Scalar accumulation order, finite-score
+handling, filtering and tie order remain unchanged; scoring adds no allocation.
 
 Normal `--index-semantic` runs walk roots and refresh path metadata before
 reuse decisions. Additional source timestamp checks catch edits newer than
@@ -153,7 +158,7 @@ would silently eat all keyboard input (found the hard way, in a PTY test).
 ## The engine's threads
 
 ```
-UI thread (tui/)                   engine.tick() drains msg_rx every frame
+UI thread (tui/)                   engine.tick_changed() drains msg_rx every poll
   │ set_query(input)
   ▼
 Engine ──── job_tx ────▶ search worker (latest job wins) ── msg_tx ──▶ results
@@ -210,6 +215,15 @@ Neovim intentionally suspends the TUI until exit.
 
 ## Result rendering
 
+The event loop retains a 50 ms polling cadence for worker results and debounce
+but renders only when dirty. `Engine::tick_changed()` reports accepted results
+and status transitions, including zero-hit completion; `tick()` retains its
+unit-returning API. Input, resize, foreground-editor return and accepted
+preview/metadata/action updates invalidate the frame. Transfer atomics, toast
+expiry and visible relative-age labels are checked independently of drawing.
+Age checks visit only the last whole-row viewport plus selected metadata.
+Inert mouse motion/release/drag does not trigger redraws.
+
 The TUI retains a lightweight global row/header/fold map for selection and
 mouse hit testing. It computes the whole-row viewport before constructing
 text, badges and highlights, so expensive formatting scales with terminal
@@ -217,6 +231,16 @@ height rather than result count. Global and local ListState offsets are kept
 separate. Partially fitting two-line rows are neither drawn nor clickable.
 Mouse-wheel result navigation clamps at the list ends; keyboard navigation
 continues to wrap.
+
+## Query editing and paste
+
+Home/End/Delete provide editing fallbacks only when the effective keymap has
+no binding. The terminal guard enables bracketed paste on entry/re-entry and
+disables it on cleanup, including panic and foreground-editor paths. Paste
+normalizes line breaks/tabs, strips controls and inserts one UTF-8-safe batch
+with a 64 KiB total-query budget. It refreshes the query once, edits the saved
+picker's filter when active, and cannot accept a result or transfer destination.
+Other modal popups ignore paste.
 
 ## Previews
 
@@ -334,8 +358,12 @@ freshness. `--doctor` remains the terminal-probe diagnostic.
   budget in release mode.
 - `tests/load_fuzz.rs` mutates valid index/semantic stores and feeds
   arbitrary bytes to the loaders, asserting they never panic.
-- `tests/smoke.exp` drives the real TUI in a PTY (typing, results, clean
-  exit and `--no-history --pick` state isolation). CI runs it on macOS and
+- `tests/semantic_perf_test.rs` compares exact scalar-oracle scores and ranking
+  across owned/mapped storage and includes an ignored synthetic query benchmark.
+- Scheduler tests advance controlled timestamps, verify async invalidation and
+  count idle frames without sleeping or requiring a real terminal.
+- `tests/smoke.exp` drives the real TUI in a PTY (typing, batch paste, results,
+  clean exit and `--no-history --pick` state isolation). CI runs it on macOS and
   Linux, alongside the engine's real watcher integration.
 - CI checks the locked default and semantic builds with exactly Rust 1.90.0,
   in addition to current-stable tests, clippy, formatting and all-feature

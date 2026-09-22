@@ -48,15 +48,18 @@ impl App {
         }
     }
 
-    pub(super) fn poll_action(&mut self) {
-        let Some(job) = &self.action_job else { return };
+    pub(super) fn poll_action(&mut self) -> bool {
+        let Some(job) = &self.action_job else {
+            return false;
+        };
         let message = match job.rx.try_recv() {
             Ok(message) => message,
-            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => "error: action worker stopped".into(),
         };
         drop(self.action_job.take());
         self.set_message(message);
+        true
     }
 
     pub(super) fn copy_selected(&mut self) {
@@ -105,5 +108,39 @@ impl App {
             }
             message
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_poll_dirty_reports_completion_and_disconnection_once() {
+        for disconnected in [false, true] {
+            let mut app = App::new(Engine::from_lines(Vec::new()));
+            let (tx, rx) = mpsc::channel();
+            app.action_job = Some(ActionJob {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                worker: None,
+            });
+            assert!(!app.poll_action());
+            if !disconnected {
+                tx.send("synthetic action complete".into()).unwrap();
+            }
+            drop(tx);
+            assert!(app.poll_action());
+            assert!(app.action_job.is_none());
+            assert_eq!(
+                app.message.as_ref().unwrap().0,
+                if disconnected {
+                    "error: action worker stopped"
+                } else {
+                    "synthetic action complete"
+                }
+            );
+            assert!(!app.poll_action());
+        }
     }
 }

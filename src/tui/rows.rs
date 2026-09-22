@@ -364,8 +364,12 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
                 Slot::Fold => {
+                    let shortcut = app
+                        .keymap
+                        .shortcut(crate::keymap::Action::FoldToggle)
+                        .map_or_else(String::new, |key| format!(" · {key} show"));
                     return ListItem::new(Span::styled(
-                        format!("▸ {hidden} weaker matches hidden · ctrl-x show"),
+                        format!("▸ {hidden} weaker matches hidden{shortcut}"),
                         dim,
                     ));
                 }

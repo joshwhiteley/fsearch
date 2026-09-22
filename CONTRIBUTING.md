@@ -75,7 +75,8 @@ tests/smoke.exp target/debug/fsearch
 ```
 
 The smoke script isolates configuration, cache and state directories, and
-checks both interactive search and a `--no-history --pick` session. Linux CI
+checks interactive search, bracketed-paste setup/cleanup, single-line query
+normalization and a `--no-history --pick` session. Linux CI
 also exercises live watcher updates through `tests/engine_test.rs`.
 Parser/preview mutation tests must remain bounded and must not open or
 alter a contributor's documents.
@@ -115,6 +116,8 @@ Run these separately, without competing builds or benchmark processes:
 cargo test --locked --release --test matcher_perf_test -- --ignored --nocapture
 cargo test --locked --release --test cache_perf_test -- --ignored --nocapture
 cargo test --locked --lib tui::tests::result_redraw_benchmark -- --ignored --exact --nocapture
+RAYON_NUM_THREADS=4 cargo test --locked --release --test semantic_perf_test -- --ignored --nocapture --test-threads=1
+cargo test --locked --lib tui::redraw::tests::idle_minute_renders_once_instead_of_1200_times -- --exact --nocapture
 ```
 
 The matcher fixture uses one million synthetic paths with broad/sparse regexes
@@ -136,6 +139,32 @@ Representative local before/after timings on Apple M5 Pro, Rust 1.95.0:
 The last result demonstrates viewport-bounded formatting, not a guarantee
 for real-terminal/image-protocol performance. Cheap global slot bookkeeping
 still scales with result count.
+
+The semantic fixture compares owned f16, mmap f16 and legacy f32 stores with
+64/384-dimensional synthetic vectors, broad and 1-in-97 filters, and zero,
+small and full result limits. Regular tests check exact score bits and ranking
+against an independent scalar oracle, including malformed ranges and nonfinite
+values. Repeat timings with fixed Rayon thread counts and back-to-back binaries.
+
+On the same machine, paired release runs for 16,384 documents × 4 chunks,
+384 dimensions and top-20 broad queries gave:
+
+| Storage | Threads | Before | After |
+|---|---:|---:|---:|
+| mmap f16 | 4 | 7.35 ms | 4.79 ms |
+| legacy f32 | 4 | 7.25 ms | 4.06 ms |
+| mmap f16 | 1 | 26.43 ms | 19.08 ms |
+| legacy f32 | 1 | 26.29 ms | 14.43 ms |
+
+Each value averages two process medians (11 samples × 3 queries), ordered
+old/new/new/old after warm-up. Unrelated host CPU load remained active. Owned
+storage and restrictive-filter timings were mixed; these are mapped broad-query
+improvements, not a universal speedup or embedding/model benchmark.
+
+The deterministic idle test advances 1,200 polling timestamps over a synthetic
+minute with zero or 2,000 unchanged rows: one frame instead of 1,200. This
+checks scheduling, not CPU usage. Separate tests cover timer/worker updates;
+real relative-age transitions and other visible changes still redraw.
 
 ## Good first areas
 

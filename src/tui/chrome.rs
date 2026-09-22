@@ -9,7 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
-use std::time::Duration;
+use std::time::Instant;
 
 const QUERY_HINTS: &[(&str, &str)] = &[
     (">", "grep in files"),
@@ -21,9 +21,35 @@ const QUERY_HINTS: &[(&str, &str)] = &[
     ("changed:7d", ""),
     ("larger:100mb", ""),
     ("dir:", "folders"),
-    ("ctrl-r", "regex"),
-    ("tab", "preview"),
 ];
+
+fn query_hints(app: &App) -> Vec<(String, String)> {
+    let syntax = if app.engine.is_filter() {
+        // Piped records are not indexed documents: >, ?, and = are literal
+        // text here, and preview/file-metadata hints would promise no-op modes.
+        &[
+            ("'word", "exact"),
+            ("^word", "prefix"),
+            ("word$", "suffix"),
+            ("!word", "exclude"),
+        ][..]
+    } else {
+        QUERY_HINTS
+    };
+    let mut hints: Vec<_> = syntax
+        .iter()
+        .map(|(key, label)| (key.to_string(), label.to_string()))
+        .collect();
+    if let Some(key) = app.keymap.shortcut(crate::keymap::Action::RegexToggle) {
+        hints.push((key, "regex".into()));
+    }
+    if !app.engine.is_filter()
+        && let Some(key) = app.keymap.shortcut(crate::keymap::Action::PreviewLayout)
+    {
+        hints.push((key, "preview".into()));
+    }
+    hints
+}
 
 /// Below this total height the wrapped query-hint rows are dropped so the
 /// results list keeps its space.
@@ -211,10 +237,6 @@ fn help_lines(items: &[(String, String)], width: u16, theme: &Theme) -> Vec<Line
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let query_items: Vec<(String, String)> = QUERY_HINTS
-        .iter()
-        .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
-        .collect();
     // on short terminals hint rows are dropped before they starve the body
     let input_height = {
         let requested = if app.theme.borders == BorderKind::None {
@@ -225,7 +247,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         requested.min(screen.height.saturating_sub(2).max(1))
     };
     let query_help = if app.editor.input.is_empty() && screen.height >= QUERY_HINTS_MIN_HEIGHT {
-        help_lines(&query_items, screen.width, &app.theme)
+        help_lines(&query_hints(app), screen.width, &app.theme)
     } else {
         Vec::new()
     };
@@ -294,12 +316,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_status(frame, app, status_area);
     // floating toast under the menu popup so the menu stays on top
-    match &app.message {
-        Some((_, at)) if at.elapsed() < Duration::from_millis(2500) => {
-            draw_toast(frame, app, body);
-        }
-        Some(_) => app.message = None, // expired
-        None => {}
+    // The event loop expires toasts even while idle; retain this guard for
+    // callers that render a standalone frame without running the loop.
+    app.expire_message(Instant::now());
+    if app.message.is_some() {
+        draw_toast(frame, app, body);
     }
     if app.menu.is_some() {
         draw_menu(frame, app, body);
@@ -319,7 +340,10 @@ const HELP_GROUPS: &[&str] = &["navigation", "open & actions", "view", "query mo
 
 /// Text editing keys are handled before the keymap and can never be bound;
 /// the overlay says so instead of listing them as actions.
-const HELP_EDITING_NOTE: &str = "editing is fixed: typing · backspace · ←/→ · ctrl-a/e/w/d";
+const HELP_EDITING_NOTES: &[&str] = &[
+    "editing is fixed: typing · backspace · ←/→ · ctrl-a/e/w/d",
+    "unmapped home/end/delete edit · paste inserts text",
+];
 
 fn wrapped_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     let width = width.max(1);
@@ -381,7 +405,9 @@ fn help_overlay_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(""));
-    lines.extend(wrapped_lines(HELP_EDITING_NOTE, width, dim));
+    for note in HELP_EDITING_NOTES {
+        lines.extend(wrapped_lines(note, width, dim));
+    }
     lines
 }
 
@@ -592,9 +618,11 @@ pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
 /// indices) with `highlight` and everything else with `plain`.
 /// "just now", "5m ago", "3h ago", "12d ago", "2y ago"
 pub(super) fn human_age(modified: std::time::SystemTime) -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(modified)
-        .map_or(0, |d| d.as_secs());
+    human_age_at(modified, std::time::SystemTime::now())
+}
+
+pub(super) fn human_age_at(modified: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    let secs = now.duration_since(modified).map_or(0, |d| d.as_secs());
     match secs {
         s if s < 60 => "just now".to_string(),
         s if s < 3600 => format!("{}m ago", s / 60),

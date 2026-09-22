@@ -29,7 +29,7 @@ impl SavedPicker {
         }
     }
 
-    fn filter(&mut self, entries: &[(String, String)]) {
+    pub(super) fn filter(&mut self, entries: &[(String, String)]) {
         let needle = self.editor.input.to_lowercase();
         self.matches = entries
             .iter()

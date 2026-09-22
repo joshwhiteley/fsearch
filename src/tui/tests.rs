@@ -420,6 +420,7 @@ fn terminal_guard_restores_on_early_error_after_partial_setup() {
     let mut bytes = String::new();
     output.read_to_string(&mut bytes).unwrap();
     assert!(bytes.contains("\x1b[?1000l"), "mouse capture disabled");
+    assert!(bytes.contains("\x1b[?2004l"), "bracketed paste disabled");
     assert!(bytes.contains("\x1b[?1049l"), "alternate screen left");
     assert!(bytes.contains("\x1b[?25h"), "cursor restored");
 }
@@ -606,6 +607,58 @@ fn renders_input_and_status() {
     let text = buffer_text(&terminal);
     assert!(text.contains("notes"));
     assert!(text.contains("fuzzy"));
+}
+
+#[test]
+fn query_hints_use_effective_bindings_and_filter_mode_semantics() {
+    let mut app = test_app();
+    app.keymap = crate::keymap::Keymap::from_config(&std::collections::HashMap::from([
+        ("regex_toggle".into(), vec!["f8".into()]),
+        ("preview_layout".into(), vec!["f9".into()]),
+    ]));
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("f8 regex"));
+    assert!(text.contains("f9 preview"));
+    assert!(!text.contains("ctrl-r regex"));
+    assert!(!text.contains("tab preview"));
+
+    let mut filter = test_filter_app();
+    terminal.draw(|frame| draw(frame, &mut filter)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("'word exact"));
+    assert!(text.contains("!word exclude"));
+    assert!(!text.contains("grep in files"));
+    assert!(!text.contains("semantic"));
+    assert!(!text.contains("tab preview"));
+}
+
+#[test]
+fn fold_hint_uses_remapped_shortcut_and_omits_stolen_binding() {
+    let mut app = test_filter_app();
+    app.editor.input = "alpha".into();
+    app.refresh_query();
+    tick_until(&mut app, |app| !app.engine.status().searching);
+    assert_eq!(app.engine.strong_count(), 1);
+    app.engine
+        .inject_results_for_test(vec![test_row("alpha"), test_row("weak")]);
+    app.keymap = crate::keymap::Keymap::from_config(&std::collections::HashMap::from([(
+        "fold_toggle".into(),
+        vec!["f10".into()],
+    )]));
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(buffer_text(&terminal).contains("f10 show"));
+    assert!(!buffer_text(&terminal).contains("ctrl-x show"));
+    app.keymap = crate::keymap::Keymap::from_config(&std::collections::HashMap::from([
+        ("fold_toggle".into(), vec!["f10".into()]),
+        ("help".into(), vec!["f10".into()]),
+    ]));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("weaker matches hidden"));
+    assert!(!text.contains("f10 show"));
 }
 
 #[test]
@@ -1115,6 +1168,41 @@ fn ctrl_r_toggles_regex_mode() {
     assert!(!app.regex_mode);
     app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
     assert!(app.regex_mode);
+}
+
+#[test]
+fn standard_home_end_and_delete_edit_the_query_on_unicode_boundaries() {
+    let mut app = test_filter_app();
+    app.editor.input = "aé界b".into();
+    app.editor.input_cursor = app.editor.input.len();
+    app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    assert_eq!(app.editor.input_cursor, 0);
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+    assert_eq!(app.editor.input, "a界b");
+    assert_eq!(app.editor.input_cursor, 1);
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert_eq!(app.editor.input_cursor, app.editor.input.len());
+    app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+    assert_eq!(app.editor.input, "a界b", "delete at end is harmless");
+}
+
+#[test]
+fn explicit_home_end_delete_remappings_still_take_precedence() {
+    let mut app = test_filter_app();
+    app.keymap = crate::keymap::Keymap::from_config(&std::collections::HashMap::from([(
+        "clear_query".into(),
+        vec!["home".into(), "end".into(), "delete".into()],
+    )]));
+    for code in [KeyCode::Home, KeyCode::End, KeyCode::Delete] {
+        app.editor.input = "abcdef".into();
+        app.editor.input_cursor = 3;
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert!(
+            app.editor.input.is_empty(),
+            "configured {code:?} action must win"
+        );
+    }
 }
 
 #[test]

@@ -148,6 +148,11 @@ fsearch found 500: Spotlight doesn't index hidden files or many dev trees,
 and its coverage silently depends on per-volume indexing state. fsearch's
 index is yours: predictable, inspectable, rebuildable with `--reindex`.
 
+The interactive UI redraws only after visible changes, while continuing to
+poll background work every 50 ms. Toast expiry, transfer progress and visible
+relative timestamps still update. See [focused performance checks](CONTRIBUTING.md#focused-performance-checks)
+for reproducible synthetic rendering, cache and scoring measurements.
+
 ## When to use something else
 
 - **fzf / television** — arbitrary-list filtering is covered
@@ -177,8 +182,14 @@ set `quiet = []` to disable smart filtering. Border style is
 `selection_bg`, `match_fg` and `section` accept hex overrides.
 
 Command keys are remappable via a `[keys]` section — each command takes one
-spec string or a list of them. Text editing keys (typing, backspace, cursor
-movement, ctrl-a/e/w/d) are fixed and can't be rebound.
+spec string or a list of them. Typing, Backspace, Left/Right and Ctrl-A/E/W/D
+are fixed editing keys. Home, End and Delete also edit the query unless
+explicitly mapped to a command. Shortcut hints follow your effective bindings.
+
+In terminals supporting bracketed paste, pasted text is inserted as one edit,
+not executed as keystrokes. Newlines and tabs become spaces; controls are
+removed. Paste has a 64 KiB total-query budget and reports truncation. It also
+works in the saved-search filter without accepting a result or destination.
 
     [keys]
     quit = "ctrl-q"

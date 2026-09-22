@@ -5,8 +5,8 @@ use crate::highlight::{self, Appearance};
 use crate::matcher::Highlighter;
 use crate::theme::Theme;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -1055,13 +1055,13 @@ impl App {
         }
     }
 
-    fn poll_transfer(&mut self) {
+    fn poll_transfer(&mut self) -> bool {
         let Some(job) = &self.transfer_job else {
-            return;
+            return false;
         };
         let result = match job.rx.try_recv() {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => Err(()),
         };
         let job = self.transfer_job.take().unwrap();
@@ -1083,6 +1083,7 @@ impl App {
                 "error: transfer worker stopped; check destination for partial results".into(),
             ),
         }
+        true
     }
 
     fn save_session(&self, path: &std::path::Path, remember: bool, clean_exit: bool) {
@@ -1216,9 +1217,19 @@ impl App {
             self.set_message("cancelling transfer after current file".into());
             return true;
         }
-        // text editing is fixed and handled before the keymap, so those keys
-        // can never be rebound (see fsearch::keymap::is_editing_key)
+        // Reserved editing keys precede the keymap. Home/End/Delete are
+        // convenience fallbacks only: existing explicit bindings still win.
         match key.code {
+            KeyCode::Home if self.keymap.lookup(key.code, key.modifiers).is_none() => {
+                self.editor.cursor_start();
+            }
+            KeyCode::End if self.keymap.lookup(key.code, key.modifiers).is_none() => {
+                self.editor.cursor_end();
+            }
+            KeyCode::Delete if self.keymap.lookup(key.code, key.modifiers).is_none() => {
+                self.editor.delete_forward();
+                self.refresh_query();
+            }
             KeyCode::Left => self.editor.cursor_left(),
             KeyCode::Right if self.editor.input_cursor < self.editor.input.len() => {
                 self.editor.cursor_right();
@@ -1710,7 +1721,8 @@ impl App {
 
     /// Applies preview results that arrived since the last tick. Stale
     /// generations and superseded selections are dropped.
-    fn poll_preview(&mut self) {
+    fn poll_preview(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(result) = self.preview.rx.try_recv() {
             if self.preview_layout == PreviewLayout::Hidden || self.engine.mode() == Mode::Calc {
                 continue;
@@ -1726,6 +1738,7 @@ impl App {
             {
                 continue;
             }
+            changed = true;
             self.preview.content = match result.payload {
                 PreviewPayload::Lines(lines) => PreviewContent::Lines(lines),
                 PreviewPayload::Image(img) => {
@@ -1753,15 +1766,16 @@ impl App {
                 }
             };
         }
+        changed
     }
 
     /// Queue/poll selection metadata without filesystem I/O on the UI thread,
     /// including when the preview is hidden. Filter/calc rows are not paths.
-    fn refresh_status(&mut self) {
+    fn refresh_status(&mut self) -> bool {
         let path = (!self.engine.is_filter() && self.engine.mode() != Mode::Calc)
             .then(|| self.visible_selected_row().map(|row| row.path.clone()))
             .flatten();
-        self.status.refresh(path);
+        self.status.refresh(path)
     }
 }
 
@@ -1918,7 +1932,7 @@ impl TerminalGuard {
         self.active = true;
         let result = (|| {
             enable_raw_mode()?;
-            execute!(self.tty, EnterAlternateScreen)?;
+            execute!(self.tty, EnterAlternateScreen, EnableBracketedPaste)?;
             if self.mouse {
                 execute!(self.tty, EnableMouseCapture)?;
             }
@@ -1979,6 +1993,7 @@ fn open_in_nvim(
 
 fn cleanup_terminal(tty: &mut impl std::io::Write, mouse: bool) {
     // Separate commands: a partial failure must not suppress later cleanup.
+    let _ = execute!(tty, DisableBracketedPaste);
     if mouse {
         let _ = execute!(tty, DisableMouseCapture);
     }
@@ -2059,37 +2074,46 @@ pub fn run(
         app.editor.input_cursor = app.editor.input.len();
         app.engine.set_query(&app.editor.input, app.regex_mode);
     }
+    let mut redraw = redraw::Redraw::new();
     let result = loop {
-        app.engine.tick();
+        redraw.mark(app.engine.tick_changed());
         app.restore_selection_anchor();
         // side effects stay out of the draw pass: apply worker results,
         // issue new preview loads, and stat the selected path here
-        app.poll_transfer();
-        app.poll_action();
-        app.poll_preview();
+        redraw.mark(app.poll_transfer());
+        redraw.mark(app.poll_action());
+        redraw.mark(app.poll_preview());
         app.load_preview();
-        app.refresh_status();
+        redraw.mark(app.refresh_status());
         let len = app.visible_len();
         if app.selected >= len && len > 0 {
             app.selected = len - 1;
         }
-        if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
+        if redraw.take_dirty(&mut app, Instant::now())
+            && let Err(e) = terminal.draw(|f| draw(f, &mut app))
+        {
             break Err(e.into());
         }
-        match event::poll(Duration::from_millis(50)) {
+        // Continue servicing workers and debounce deadlines even when no
+        // frame is needed. Input still wakes this poll immediately.
+        match event::poll(redraw::POLL_INTERVAL) {
             Ok(true) => {
                 match event::read() {
                     Ok(Event::Key(key)) if key.is_press() => {
+                        redraw.mark(true);
                         if !app.handle_key(key) {
                             break Ok(());
                         }
                     }
                     // only ever fires when mouse capture is on
                     Ok(Event::Mouse(m)) => {
+                        redraw.mark(redraw::mouse_changes_ui(m.kind));
                         if !app.handle_mouse(m) {
                             break Ok(());
                         }
                     }
+                    Ok(Event::Paste(text)) => redraw.mark(app.handle_paste(&text)),
+                    Ok(Event::Resize(_, _) | Event::FocusGained) => redraw.mark(true),
                     Ok(_) => {}
                     Err(e) => break Err(e.into()),
                 }
@@ -2098,6 +2122,8 @@ pub fn run(
             Err(e) => break Err(e.into()),
         }
         if let Some((path, line)) = app.nvim_request.take() {
+            // Foreground editors leave the terminal buffers invalidated.
+            redraw.mark(true);
             match open_in_nvim(&mut terminal, &mut guard, &path, line) {
                 Ok(Ok(())) => {
                     app.engine.record_open(&path);
@@ -2125,7 +2151,9 @@ pub fn run(
 mod action_job;
 mod chrome;
 mod metadata;
+mod paste;
 mod preview;
+mod redraw;
 mod rows;
 mod saved;
 #[cfg(test)]
