@@ -431,11 +431,16 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
     let entries = app.menu_entries();
     let selected = selected.min(entries.len().saturating_sub(1));
     app.menu = Some(selected);
+    let title = app.visible_selected_row().map_or_else(
+        || "actions".to_string(),
+        |row| format!("actions · {}", super::rows::shorten_home(&row.path)),
+    );
     let max_label = entries
         .iter()
-        .map(|entry| entry.label.chars().count())
+        .map(|entry| Line::from(entry.label.as_str()).width())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(Line::from(title.as_str()).width());
     let width = max_label.saturating_add(4).min(u16::MAX as usize) as u16;
     let width = width.min(body.width);
     let height = (entries.len() as u16 + 2).min(body.height);
@@ -450,7 +455,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, body: Rect) {
         .iter()
         .map(|entry| ListItem::new(format!(" {}", entry.label)))
         .collect();
-    let block = themed_block("actions", &app.theme);
+    let block = themed_block(&title, &app.theme);
     let inner = block.inner(area);
     let list = List::new(items)
         .block(block)
@@ -554,7 +559,7 @@ pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     // readline-style horizontal scroll: once the edit cursor would leave
     // the visible row, shift the query left so the cursor stays one cell
     // inside the right edge
-    let cursor_col = app.editor.input[..app.editor.input_cursor].chars().count();
+    let cursor_col = Line::from(&app.editor.input[..app.editor.input_cursor]).width();
     let width = inner.width as usize;
     if width == 0 {
         app.editor.input_scroll = 0;
@@ -565,7 +570,12 @@ pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         if cursor_col >= app.editor.input_scroll + width {
             app.editor.input_scroll = cursor_col + 1 - width;
         }
-        let max_skip = app.editor.input.chars().count().saturating_sub(width);
+        // Include the insertion cell after the final character. Without it,
+        // a full viewport puts the cursor on top of the last character.
+        let max_skip = Line::from(app.editor.input.as_str())
+            .width()
+            .saturating_add(1)
+            .saturating_sub(width);
         app.editor.input_scroll = app.editor.input_scroll.min(max_skip);
     }
     let input = Paragraph::new(Line::from(query_spans(&app.editor.input, app.theme.accent)))

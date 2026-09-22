@@ -67,6 +67,343 @@ fn wait_for_transfer(app: &mut App) {
 }
 
 #[test]
+fn home_itself_renders_in_rows_and_preview_without_slicing_original_name() {
+    let home = dirs::home_dir().unwrap();
+    let mut app = test_app();
+    app.engine
+        .inject_results_for_test(vec![file_row(&format!("{}/", home.display()))]);
+    let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+    for density in [Density::Comfy, Density::Compact] {
+        app.density = density;
+        terminal
+            .draw(|f| super::rows::draw_results(f, &mut app, Rect::new(0, 0, 50, 10)))
+            .unwrap();
+        assert!(buffer_text(&terminal).contains("~/"));
+    }
+    terminal
+        .draw(|f| super::preview::draw_preview(f, &mut app, Rect::new(0, 0, 50, 10)))
+        .unwrap();
+    assert!(buffer_text(&terminal).contains("~/"));
+}
+
+#[test]
+fn action_popup_captures_all_mouse_events_and_freezes_commands_and_targets() {
+    let mut app = mouse_state();
+    let mut row = file_row("/original/main.rs");
+    row.line_number = Some(29);
+    app.engine
+        .inject_results_for_test(vec![row, file_row("/other/file.txt")]);
+    app.open_menu();
+    let entries = app.menu_entries();
+    let trash = entries
+        .iter()
+        .position(|e| e.label == "move to trash")
+        .unwrap();
+    let nvim = entries
+        .iter()
+        .position(|e| e.label == "open in nvim")
+        .unwrap();
+    for (x, y) in [(2, 5), (42, 5), (90, 30)] {
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.selected, 0);
+            assert_eq!(app.preview.scroll, 0);
+            assert!(app.menu.is_some());
+        }
+    }
+    // Arrival of a non-source result would remove the nvim entry and change
+    // the meaning of every subsequent menu index without a frozen menu.
+    app.engine
+        .inject_results_for_test(vec![file_row("/new/file.pdf")]);
+    assert_eq!(app.menu_entries(), entries);
+    assert_eq!(
+        app.menu_entries()[trash].command,
+        super::MenuCommand::BuiltIn(super::BuiltInAction::Trash)
+    );
+    assert_eq!(
+        app.visible_selected_row().unwrap().path,
+        "/original/main.rs"
+    );
+    app.run_menu_action(nvim);
+    assert_eq!(
+        app.nvim_request,
+        Some(("/original/main.rs".into(), Some(29)))
+    );
+    assert!(app.menu_snapshot.is_none());
+    assert_eq!(app.visible_selected_row().unwrap().path, "/new/file.pdf");
+}
+
+#[test]
+fn popup_preview_header_metadata_body_and_title_keep_the_frozen_target() {
+    let mut app = test_app();
+    let mut original = file_row("/original/a.rs");
+    original.meta = Some(FileMeta { size: 3, mtime: 0 });
+    app.engine.inject_results_for_test(vec![original]);
+    let (requests, request_rx) = std::sync::mpsc::channel();
+    let (replies, reply_rx) = std::sync::mpsc::channel();
+    app.preview.tx = requests;
+    app.preview.rx = reply_rx;
+    app.open_menu();
+    app.load_preview();
+    let request = request_rx.try_recv().unwrap();
+    let mut replacement = file_row("/replacement/b.txt");
+    replacement.meta = Some(FileMeta {
+        size: 5000,
+        mtime: 0,
+    });
+    app.engine.inject_results_for_test(vec![replacement]);
+    replies
+        .send(super::PreviewResult {
+            generation: request.generation,
+            path: request.path,
+            line_number: request.line_number,
+            payload: super::PreviewPayload::Lines(vec![Line::from("original body")]),
+        })
+        .unwrap();
+    app.load_preview();
+    app.poll_preview();
+    assert!(request_rx.try_recv().is_err());
+    assert_eq!(app.visible_selected_row().unwrap().path, "/original/a.rs");
+    let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
+    terminal
+        .draw(|f| super::preview::draw_preview(f, &mut app, Rect::new(0, 0, 70, 15)))
+        .unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("/original/a.rs"));
+    assert!(text.contains("original body"));
+    assert!(text.contains("3 B"));
+    assert!(!text.contains("b.txt"));
+    terminal
+        .draw(|f| super::chrome::draw_menu(f, &mut app, Rect::new(0, 0, 70, 15)))
+        .unwrap();
+    assert!(buffer_text(&terminal).contains("actions · /original/a.rs"));
+    app.close_menu();
+    app.load_preview();
+    assert_eq!(request_rx.try_recv().unwrap().path, "/replacement/b.txt");
+}
+
+#[test]
+fn marked_move_uses_popup_targets_not_later_results_or_marks() {
+    let mut app = test_app();
+    app.engine.inject_results_for_test(vec![
+        file_row("/original/a.txt"),
+        file_row("/original/b.txt"),
+    ]);
+    app.marks = ["/original/a.txt".into(), "/original/b.txt".into()].into();
+    app.open_menu();
+    let entry = app
+        .menu_entries()
+        .iter()
+        .position(|e| e.label == "move marked to…")
+        .unwrap();
+    app.engine
+        .inject_results_for_test(vec![file_row("/new/c.txt")]);
+    app.marks = ["/new/c.txt".into()].into();
+    app.run_menu_action(entry);
+    assert_eq!(
+        app.destination_picker.as_ref().unwrap().paths,
+        ["/original/a.txt", "/original/b.txt"]
+    );
+}
+
+#[test]
+fn action_worker_is_bounded_responsive_and_reports_completion_and_failure() {
+    let mut app = test_app();
+    let ui = std::thread::current().id();
+    let (started, started_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    app.start_action(move |_| {
+        assert_ne!(ui, std::thread::current().id());
+        started.send(()).unwrap();
+        release_rx.recv().unwrap();
+        "error: injected backend failure".into()
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    app.start_action(|_| panic!("a second action must not be queued"));
+    assert!(app.message.as_ref().unwrap().0.contains("already running"));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    assert_eq!(app.editor.input, "x");
+    app.poll_action();
+    assert!(app.action_job.is_some());
+    release.send(()).unwrap();
+    wait_for_action(&mut app);
+    assert_eq!(
+        app.message.as_ref().unwrap().0,
+        "error: injected backend failure"
+    );
+    app.start_action(|_| "copied: test path".into());
+    wait_for_action(&mut app);
+    assert_eq!(app.message.as_ref().unwrap().0, "copied: test path");
+    app.start_action(|_| panic!("injected worker panic"));
+    wait_for_action(&mut app);
+    assert!(app.message.as_ref().unwrap().0.contains("worker stopped"));
+}
+
+fn wait_for_action(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while app.action_job.is_some() {
+        app.poll_action();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn action_shutdown_kills_and_reaps_an_actual_blocked_child_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let mut app = test_app();
+    let worker_path = pid_file.clone();
+    app.start_action(move |cancel| {
+        let result = crate::actions::checked_command_cancellable(
+            std::process::Command::new("sh")
+                .args(["-c", "echo $$ > \"$1\"; exec sleep 10", "sh"])
+                .arg(worker_path),
+            None,
+            Duration::from_secs(10),
+            cancel,
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        "cancelled".into()
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let start = Instant::now();
+    drop(app.action_job.take());
+    assert!(start.elapsed() < Duration::from_secs(1));
+    // Observing process absence cannot accidentally reap it on our behalf.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+#[test]
+fn action_shutdown_requests_cancellation_and_joins_current_worker() {
+    let mut app = test_app();
+    let (finished, finished_rx) = std::sync::mpsc::channel();
+    app.start_action(move |cancel| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        finished.send(()).unwrap();
+        "cancelled".into()
+    });
+    drop(app.action_job.take());
+    finished_rx.try_recv().unwrap();
+}
+
+#[test]
+fn selection_metadata_loads_with_previews_hidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("selected");
+    std::fs::write(&file, b"abc").unwrap();
+    let mut app = test_app();
+    app.preview_layout = PreviewLayout::Hidden;
+    app.engine
+        .inject_results_for_test(vec![file_row(file.to_str().unwrap())]);
+    app.load_preview();
+    assert!(app.preview.for_key.is_none());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while app.status.meta.is_none() {
+        app.refresh_status();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(app.status.meta.unwrap().1, 3);
+    app.engine.inject_results_for_test(Vec::new());
+    app.refresh_status();
+    assert!(app.status.meta.is_none());
+}
+
+#[test]
+fn query_cursor_uses_terminal_cells_and_reserves_an_insertion_cell() {
+    for (input, width, scroll, cursor_x) in [
+        ("界a", 12, 0, 4),
+        ("e\u{301}x", 12, 0, 3),
+        ("abcdef", 8, 1, 6), // six text cells fill the six-cell viewport
+        ("界界界", 8, 1, 6),
+        ("e\u{301}abcde", 8, 1, 6),
+    ] {
+        let mut app = test_app();
+        app.editor.input = input.into();
+        app.editor.input_cursor = input.len();
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!(app.editor.input_scroll, scroll, "{input}");
+        assert_eq!(cursor.x, cursor_x, "{input}");
+        assert_eq!(
+            terminal.backend().buffer()[(cursor.x, cursor.y)].symbol(),
+            " ",
+            "cursor must sit after the text: {input}"
+        );
+    }
+}
+
+#[test]
+fn content_highlight_cache_survives_repeated_frames() {
+    let mut app = test_app();
+    app.preview_layout = PreviewLayout::Hidden;
+    app.editor.input = ">needle".into();
+    app.engine.set_query(&app.editor.input, false);
+    let mut row = file_row("/a/b.txt");
+    row.line = Some("a needle here".into());
+    row.line_number = Some(7);
+    app.engine.inject_results_for_test(vec![row]);
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    let first = terminal.backend().buffer().clone();
+    assert!(app.highlights.content.is_some());
+    for _ in 0..3 {
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(app.highlights.content.is_some());
+        assert_eq!(terminal.backend().buffer(), &first);
+    }
+}
+
+#[test]
+fn filter_and_failed_exits_do_not_replace_ordinary_session_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.toml");
+    crate::session::save(&path, "full", "compact");
+    let original = std::fs::read(&path).unwrap();
+    let app = test_filter_app();
+    app.save_session(&path, true, true);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let app = test_app();
+    app.save_session(&path, true, false);
+    app.save_session(&path, false, true);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    app.save_session(&path, true, true);
+    let state = crate::session::load(&path);
+    assert_eq!(state.preview_layout.as_deref(), Some("side"));
+    assert_eq!(state.density.as_deref(), Some("comfy"));
+}
+
+#[test]
 fn terminal_guard_restores_on_early_error_after_partial_setup() {
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut output = tempfile::tempfile().unwrap();

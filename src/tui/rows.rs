@@ -287,25 +287,11 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                     accent,
                 )));
             }
-            let (shown, trimmed_chars) = match &home {
-                Some(h) if r.path.starts_with(h.as_str()) => {
-                    (format!("~{}", &r.path[h.len()..]), h.chars().count())
-                }
-                _ => (r.path.clone(), 0),
-            };
+            let (shown, trimmed_chars) = shorten_home_with(&r.path, home.as_deref());
             // split the shown path at the name boundary: the final component
             // (trailing '/' kept for directories) is the hero, the rest is
             // the dim parent
-            let name = {
-                let stem = r.path.trim_end_matches('/');
-                let last = stem.rsplit('/').next().unwrap_or("");
-                if r.path.ends_with('/') {
-                    format!("{last}/")
-                } else {
-                    last.to_string()
-                }
-            };
-            let parent = shown[..shown.len() - name.len()].to_string();
+            let (parent, name) = display_path_parts(&shown);
             let name_chars = name.chars().count();
             let name_width = Span::raw(name.clone()).width();
             let parent_chars = shown.chars().count() - name_chars;
@@ -397,8 +383,8 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                     // boundary (the parent starts at index 0 of `shown`)
                     let (in_name, in_parent): (Vec<u32>, Vec<u32>) = match highlighter.as_mut() {
                         Some(hl) => {
-                            let shift = if trimmed_chars > 0 {
-                                trimmed_chars - 1
+                            let replacement_chars = if trimmed_chars > 0 {
+                                shown.chars().count() - (r.path.chars().count() - trimmed_chars)
                             } else {
                                 0
                             };
@@ -406,7 +392,7 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                                 .positions(&r.path)
                                 .into_iter()
                                 .filter(|&p| p as usize >= trimmed_chars)
-                                .map(|p| (p as usize - shift) as u32)
+                                .map(|p| (p as usize - trimmed_chars + replacement_chars) as u32)
                                 .collect();
                             positions
                                 .into_iter()
@@ -562,6 +548,7 @@ pub(super) fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     app.highlights.fuzzy = highlighter;
+    app.highlights.content = content_re;
     let block = themed_block("results", &app.theme);
     app.hit_test.results_area = block.inner(area);
     let list = List::new(display_items)
@@ -694,17 +681,38 @@ fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect, status: &EngineSta
 
 /// `path` with a home-directory prefix shortened to `~`; unchanged otherwise.
 pub(super) fn shorten_home(path: &str) -> String {
-    match dirs::home_dir() {
-        Some(h) => {
-            let h = h.to_string_lossy();
-            if path.starts_with(h.as_ref()) {
-                format!("~{}", &path[h.len()..])
-            } else {
-                path.to_string()
-            }
-        }
-        None => path.to_string(),
+    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    shorten_home_with(path, home.as_deref()).0
+}
+
+/// Require a complete component, not a sibling sharing the home's prefix.
+/// The removed character count maps fuzzy highlights onto the display path.
+fn shorten_home_with(path: &str, home: Option<&str>) -> (String, usize) {
+    // A root home replaces the leading slash with `~/`, not `~`.
+    if home == Some("/") && path.starts_with('/') {
+        return (format!("~{path}"), 1);
     }
+    if let Some(home) = home
+        .map(|h| h.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+        && let Some(rest) = path.strip_prefix(home)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        let shown = if rest.is_empty() {
+            "~/".into()
+        } else {
+            format!("~{rest}")
+        };
+        return (shown, home.chars().count());
+    }
+    (path.to_string(), 0)
+}
+
+/// Split the *displayed* path: the home itself is `~/`, not its original
+/// basename. Both sides come from the same string, so UTF-8 slicing is safe.
+pub(super) fn display_path_parts(shown: &str) -> (String, String) {
+    let name = path_name(shown);
+    (shown[..shown.len() - name.len()].to_string(), name)
 }
 
 /// Final path component, trailing '/' kept for directories.
@@ -737,6 +745,32 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn home_shortening_is_component_aware_and_splits_displayed_utf8() {
+        for home in ["/Users/al", "/Users/名字", "/home/é"] {
+            for path in [home.to_string(), format!("{home}/")] {
+                let (shown, removed) = shorten_home_with(&path, Some(home));
+                assert_eq!(shown, "~/");
+                assert_eq!(removed, home.chars().count());
+                assert_eq!(display_path_parts(&shown), ("".into(), "~/".into()));
+            }
+            for suffix in ["bert/file.txt", "é/名字/", "-backup/é"] {
+                let path = format!("{home}{suffix}");
+                assert_eq!(shorten_home_with(&path, Some(home)), (path.clone(), 0));
+                let (parent, name) = display_path_parts(&path);
+                assert_eq!(format!("{parent}{name}"), path);
+            }
+            let (shown, _) = shorten_home_with(&format!("{home}/目录/é.txt"), Some(home));
+            assert_eq!(
+                display_path_parts(&shown),
+                ("~/目录/".into(), "é.txt".into())
+            );
+        }
+        assert_eq!(display_path_parts("/"), ("".into(), "/".into()));
+        assert_eq!(shorten_home_with("/file", Some("/")), ("~/file".into(), 1));
+        assert_eq!(shorten_home_with("/", Some("/")), ("~/".into(), 1));
+    }
 
     #[test]
     fn empty_state_distinguishes_busy_errors_and_no_matches() {

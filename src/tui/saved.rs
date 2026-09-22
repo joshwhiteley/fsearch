@@ -68,7 +68,7 @@ impl App {
         if !self.saved_searches_enabled() {
             return;
         }
-        self.menu = None;
+        self.close_menu();
         self.help.open = false;
         self.help.scroll = 0;
         self.hit_test.last_click = None;
