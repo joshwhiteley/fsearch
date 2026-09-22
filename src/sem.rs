@@ -335,15 +335,14 @@ impl VectorStorage {
                 let bytes = mmap.get(byte_start..byte_end)?;
                 match format {
                     VectorFormat::F16 => {
-                        for (bytes, &q) in bytes.chunks_exact(2).zip(query) {
-                            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                        for (bytes, &q) in bytes.as_chunks::<2>().0.iter().zip(query) {
+                            let bits = u16::from_le_bytes(*bytes);
                             score += f16::from_bits(bits).to_f32() * q;
                         }
                     }
                     VectorFormat::F32 => {
-                        for (bytes, &q) in bytes.chunks_exact(4).zip(query) {
-                            let value =
-                                f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        for (bytes, &q) in bytes.as_chunks::<4>().0.iter().zip(query) {
+                            let value = f32::from_le_bytes(*bytes);
                             score += value * q;
                         }
                     }
