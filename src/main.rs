@@ -3,7 +3,12 @@ use fsearch::{config, engine::Engine, index, tui, walker};
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::time::Instant;
 
+#[global_allocator]
+static PDF_ALLOCATOR: fsearch::pdf_process::PdfAllocator =
+    fsearch::pdf_process::PdfAllocator::new();
+
 fn main() {
+    fsearch::pdf_process::dispatch(&PDF_ALLOCATOR);
     // The PDF and Office parsers are panic-guarded at their call sites; keep
     // the default hook from printing contained parser failures as crashes
     let default_hook = std::panic::take_hook();
