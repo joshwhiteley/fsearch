@@ -168,6 +168,14 @@ fn list_searches() {
     let mut searches: Vec<_> = config.searches.iter().collect();
     searches.sort_by_key(|(name, _)| *name);
     for (name, query) in searches {
+        let (name, query) = if std::io::stdout().is_terminal() {
+            (
+                fsearch::output::escape_controls(name),
+                fsearch::output::escape_controls(query),
+            )
+        } else {
+            (name.clone(), query.clone())
+        };
         write_stdout(&format!("{name}\t{query}\n"));
     }
 }
@@ -258,6 +266,11 @@ fn biggest(n: usize, format: OutputFormat) {
                 store.get(i)
             )
         };
+        let line = if format == OutputFormat::Text && std::io::stdout().is_terminal() {
+            fsearch::output::escape_controls(&line)
+        } else {
+            line
+        };
         write_stdout(&format!("{line}\n"));
     }
 }
@@ -272,8 +285,13 @@ fn print_search(query: &str, invocation: &Invocation) {
         pdf_cache: fsearch::pdf::default_cache_dir(),
     };
     // write_stdout survives broken pipes (`fsearch -p q | head` must exit 0)
+    let terminal = std::io::stdout().is_terminal();
     let result = fsearch::query::search(&store, &query, &opts, &mut |hit| {
-        write_stdout(&fsearch::output::hit(hit, invocation.format));
+        write_stdout(&fsearch::output::hit_for_terminal(
+            hit,
+            invocation.format,
+            terminal,
+        ));
     });
     let matched = match result {
         Ok(any) => any,
@@ -323,13 +341,21 @@ fn run_filter(initial_query: &str, invocation: &Invocation) {
         None,
         std::collections::HashMap::new(),
     ) {
-        Ok(Some(picked)) => write_stdout(&fsearch::output::selection(&picked, invocation.format)),
+        Ok(Some(picked)) => write_selection(&picked, invocation.format),
         Ok(None) => std::process::exit(1), // nothing chosen: signal like grep
         Err(e) => {
             eprintln!("fsearch: {e:#}");
             std::process::exit(2);
         }
     }
+}
+
+fn write_selection(value: &str, format: OutputFormat) {
+    write_stdout(&fsearch::output::selection_for_terminal(
+        value,
+        format,
+        std::io::stdout().is_terminal(),
+    ));
 }
 
 fn run_ui(ui_mode: tui::UiMode, initial_query: &str, invocation: &Invocation) {
@@ -369,7 +395,7 @@ fn run_ui(ui_mode: tui::UiMode, initial_query: &str, invocation: &Invocation) {
         action_warning,
         saved_searches,
     ) {
-        Ok(Some(picked)) => write_stdout(&fsearch::output::selection(&picked, invocation.format)),
+        Ok(Some(picked)) => write_selection(&picked, invocation.format),
         Ok(None) => {
             if ui_mode == tui::UiMode::Pick {
                 // nothing chosen: signal it like grep does

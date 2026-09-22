@@ -70,8 +70,29 @@ pub fn load(path: &str, max_bytes: u64) -> Result<DynamicImage, String> {
 const SVG_EDGE: f32 = 1600.0;
 
 fn rasterize_svg(data: &[u8]) -> Result<DynamicImage, String> {
-    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default())
-        .map_err(|e| e.to_string())?;
+    // Never let the renderer read external files (including symlinks/FIFOs),
+    // or decode embedded images through decoders that bypass our raster limits.
+    let referenced_image = std::sync::atomic::AtomicBool::new(false);
+    let options = resvg::usvg::Options {
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_string: Box::new(|_, _| {
+                referenced_image.store(true, std::sync::atomic::Ordering::Relaxed);
+                None
+            }),
+            resolve_data: Box::new(|_, _, _| {
+                referenced_image.store(true, std::sync::atomic::Ordering::Relaxed);
+                None
+            }),
+        },
+        ..Default::default()
+    };
+    // from_data also accepts gzip without an expanded-size budget. SVGZ is
+    // not a supported extension; require plain UTF-8 XML even for .svg files.
+    let xml = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+    let tree = resvg::usvg::Tree::from_str(xml, &options).map_err(|e| e.to_string())?;
+    if referenced_image.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("SVG previews do not support external or embedded images".into());
+    }
     let size = tree.size();
     let scale = SVG_EDGE / size.width().max(size.height());
     let (w, h) = (
@@ -139,6 +160,65 @@ mod tests {
         // the rect actually rendered
         let px = img.to_rgba8().get_pixel(100, 100).0;
         assert_eq!(px, [0, 255, 0, 255]);
+    }
+
+    fn svg_with_image(href: &str) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2"><image width="2" height="2" xlink:href="{href}"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn svg_external_files_and_symlinks_are_not_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("external.png");
+        image::RgbaImage::new(1, 1).save(&path).unwrap();
+        assert!(rasterize_svg(svg_with_image(path.to_str().unwrap()).as_bytes()).is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.png");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(rasterize_svg(svg_with_image(link.to_str().unwrap()).as_bytes()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn svg_fifo_reference_never_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe.png");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated temporary path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let xml = svg_with_image(path.to_str().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(rasterize_svg(xml.as_bytes())).unwrap());
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn svg_embedded_images_are_rejected_before_decode() {
+        // No embedded-image decoder may run, regardless of declared MIME,
+        // dimensions, or whether the data is another nested SVG.
+        for href in [
+            "data:image/png;base64,aW52YWxpZA==",
+            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'/%3E",
+        ] {
+            assert!(rasterize_svg(svg_with_image(href).as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn gzip_disguised_as_svg_is_rejected_without_decompression() {
+        use std::io::Write;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>")
+            .unwrap();
+        assert!(rasterize_svg(&gzip.finish().unwrap()).is_err());
     }
 
     #[test]
