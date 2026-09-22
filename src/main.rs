@@ -247,8 +247,12 @@ fn load_index(config: &config::Config) -> fsearch::index::PathStore {
             eprintln!("fsearch: invalid exclude pattern: {e:#}");
             std::process::exit(1);
         });
-        let (entries, _) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
-        let _ = index::save(&entries, &cache);
+        let (entries, stats) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
+        if stats.complete() {
+            let _ = index::save(&entries, &cache);
+        } else {
+            eprintln!("fsearch: index walk incomplete ({} errors); searching partial results without saving a replacement cache", stats.skipped);
+        }
         fsearch::index::PathStore::from_entries(&entries)
     })
 }
@@ -474,7 +478,13 @@ fn index_semantic() {
     // Refresh discovery and stat metadata before deciding what can be reused.
     // A cached path snapshot cannot establish semantic document freshness.
     let excludes = walker::build_exclude_set(&config.excludes).unwrap_or_else(|e| fail(e));
-    let (entries, _) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
+    let (entries, stats) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
+    if !stats.complete() {
+        fail(format!(
+            "index walk incomplete ({} errors); existing path and semantic indexes were not replaced",
+            stats.skipped
+        ));
+    }
     index::save(&entries, &index::default_cache_path()).unwrap_or_else(|e| fail(e));
     let store = index::PathStore::from_entries(&entries);
     if let Some(prior) = &mut prior {
@@ -581,6 +591,12 @@ fn reindex() {
     };
     let start = Instant::now();
     let (entries, stats) = walker::collect_sorted(&config.roots, &excludes, config.index_apps);
+    if !stats.complete() {
+        fail(format!(
+            "index walk incomplete ({} errors); existing index was not replaced",
+            stats.skipped
+        ));
+    }
     let cache = index::default_cache_path();
     if let Err(e) = index::save(&entries, &cache) {
         eprintln!("fsearch: writing {}: {e}", cache.display());
