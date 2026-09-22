@@ -9,9 +9,9 @@ use crate::walker::FileMeta;
 use crate::{config::Config, index, walker};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 pub const FILENAME_LIMIT: usize = 500;
@@ -173,6 +173,14 @@ enum Msg {
     },
 }
 
+type WarmSemantic = (Box<dyn sem::Embedder + Send>, sem::SemStore);
+
+fn release_semantic_store(
+    ready: &mut Option<WarmSemantic>,
+) -> Option<Box<dyn sem::Embedder + Send>> {
+    ready.take().map(|(embedder, _)| embedder)
+}
+
 struct SemJob {
     generation: u64,
     query: String,
@@ -217,8 +225,42 @@ struct FilenameJob {
     lines: bool,
 }
 
+type PendingSnapshot = Arc<Mutex<Option<(Arc<PathStore>, bool)>>>;
+
+/// Retain only the newest unpublished snapshot when the UI is busy.
+struct IndexPublisher {
+    tx: Sender<Msg>,
+    snapshot: PendingSnapshot,
+    /// Incomplete startup baselines must never overwrite a usable disk cache.
+    save_allowed: bool,
+}
+
+impl IndexPublisher {
+    fn send(&self, msg: Msg) -> Result<(), mpsc::SendError<Msg>> {
+        match msg {
+            Msg::IndexSnapshot { store, indexing } => {
+                *self.snapshot.lock().unwrap() = Some((store, indexing));
+                Ok(())
+            }
+            msg @ Msg::IndexError { .. } => {
+                // An error may be consumed before the pending cached snapshot;
+                // do not let that late snapshot revive the indexing spinner.
+                if let Some((_, indexing)) = self.snapshot.lock().unwrap().as_mut() {
+                    *indexing = false;
+                }
+                self.tx.send(msg)
+            }
+            msg => self.tx.send(msg),
+        }
+    }
+}
+
 pub struct Engine {
     msg_rx: Receiver<Msg>,
+    snapshot: PendingSnapshot,
+    shutdown: Arc<AtomicBool>,
+    indexer: Option<std::thread::JoinHandle<()>>,
+    content_rx: Option<Receiver<Msg>>,
     msg_tx: Sender<Msg>,
     job_tx: Sender<FilenameJob>,
     store: Arc<PathStore>,
@@ -232,6 +274,7 @@ pub struct Engine {
     index_error: Option<String>,
     mode: Mode,
     generation: u64,
+    current_generation: Arc<AtomicU64>,
     query: String,
     strong: usize,
     max_content_filesize: u64,
@@ -258,6 +301,14 @@ pub struct Engine {
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
 const WATCH_SAVE_EVERY: Duration = Duration::from_secs(60);
+
+fn walk_failure(result: std::thread::Result<walker::WalkStats>) -> Option<String> {
+    match result {
+        Ok(stats) if stats.complete() => None,
+        Ok(stats) => Some(format!("index walk incomplete ({} errors)", stats.skipped)),
+        Err(_) => Some("index walk failed".to_string()),
+    }
+}
 
 fn cache_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
@@ -292,20 +343,24 @@ fn start_watcher(roots: &[std::path::PathBuf]) -> (Option<WatcherStream>, usize)
         Err(_) => return (None, roots.len()),
     };
     let mut failed = 0usize;
+    let mut watching = 0usize;
     for root in roots {
+        // Never follow a configured symlink root that the walker ignores.
+        if std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
         if watcher
             .watch(root, notify::RecursiveMode::Recursive)
             .is_err()
         {
             failed += 1;
+        } else {
+            watching += 1;
         }
     }
     // a watcher that watches nothing is worse than none: it only burns the
     // event thread; callers surface the failure count instead
-    (
-        (failed < roots.len()).then_some((watcher, event_rx)),
-        failed,
-    )
+    ((watching > 0).then_some((watcher, event_rx)), failed)
 }
 
 #[derive(Default)]
@@ -346,22 +401,32 @@ fn disjoint_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     disjoint
 }
 
+fn is_app_entry(path: &std::path::Path, app_dirs: &[PathBuf]) -> bool {
+    path.extension().is_some_and(|e| e == "app")
+        && app_dirs.iter().any(|root| {
+            path.strip_prefix(root)
+                .is_ok_and(|p| (1..=2).contains(&p.components().count()))
+        })
+}
+
 fn sort_unique_entries(entries: &mut Vec<(String, FileMeta)>) {
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.mtime.cmp(&a.1.mtime)));
+    entries.dedup_by(|a, b| a.0 == b.0);
     entries.sort_unstable_by(walker::mtime_cmp);
-    let mut seen = HashSet::new();
-    entries.retain(|(path, _)| seen.insert(path.clone()));
 }
 
 /// Folds filesystem events into newest-first snapshots. Lost events rebuild
 /// all configured roots, using the same excludes and app policy as startup.
+#[allow(clippy::too_many_arguments)]
 fn watch_loop(
     event_rx: &Receiver<notify::Result<notify::Event>>,
     excludes: &globset::GlobSet,
     cache_path: &std::path::Path,
-    indexer_tx: &Sender<Msg>,
+    indexer_tx: &IndexPublisher,
     mut current: Vec<(String, FileMeta)>,
     roots: &[PathBuf],
-    index_apps: bool,
+    app_dirs: &[PathBuf],
+    shutdown: &AtomicBool,
 ) {
     let roots = disjoint_paths(roots.iter().cloned());
     let mut last_save = Instant::now();
@@ -371,14 +436,25 @@ fn watch_loop(
     let mut our_stamp = cache_mtime(cache_path);
     loop {
         // block until something happens, then debounce-collect the burst
-        let Ok(first) = event_rx.recv() else { return };
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = match event_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         let mut batch = WatchBatch::default();
         batch.absorb(first);
         let deadline = Instant::now() + WATCH_DEBOUNCE;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match event_rx.recv_timeout(left) {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            match event_rx.recv_timeout(left.min(Duration::from_millis(50))) {
                 Ok(res) => batch.absorb(res),
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
 
@@ -397,19 +473,82 @@ fn watch_loop(
                 fronts.push(entry);
             }
         };
+        let app_refresh = !batch.rescan
+            && batch
+                .touched
+                .iter()
+                .any(|p| app_dirs.iter().any(|d| p.starts_with(d)));
+        if app_refresh {
+            let (apps, stats) = walker::collect_apps(app_dirs, shutdown);
+            if stats.complete() {
+                for (path, _) in &current {
+                    if !path.ends_with('/') && is_app_entry(std::path::Path::new(path), app_dirs) {
+                        gone.insert(path.clone());
+                    }
+                }
+                for entry in apps {
+                    gone.insert(entry.0.clone());
+                    fronts.push(entry);
+                }
+            } else {
+                let _ = indexer_tx.send(Msg::IndexError {
+                    error: "application walk incomplete; retaining previous entries".into(),
+                });
+            }
+            // Bundle events refresh the file-like app entry, never its contents.
+            batch.touched.retain(|p| {
+                roots.iter().any(|r| p.starts_with(r))
+                    && !p.ancestors().any(|a| is_app_entry(a, app_dirs))
+            });
+        }
         if batch.rescan {
-            current = walker::collect_sorted(&roots, excludes, index_apps).0;
+            let (mut entries, mut stats) =
+                walker::collect_cancellable(&roots, excludes, false, shutdown);
+            let (apps, app_stats) = walker::collect_apps(app_dirs, shutdown);
+            entries.extend(apps);
+            stats.skipped += app_stats.skipped;
+            stats.cancelled |= app_stats.cancelled;
+            if !stats.complete() {
+                let _ = indexer_tx.send(Msg::IndexError {
+                    error: format!(
+                        "live index walk incomplete ({} errors); retaining previous index",
+                        stats.skipped
+                    ),
+                });
+                continue;
+            }
+            sort_unique_entries(&mut entries);
+            current = entries;
             batch.touched.clear();
         }
-        for path in disjoint_paths(batch.touched) {
+        // Events may name a child beneath a directory replaced with a symlink.
+        // Re-stat ancestors too: symlink_metadata on the leaf alone would follow
+        // that parent and introduce paths the walker never traverses.
+        let touched = batch.touched.into_iter().map(|path| {
+            path.ancestors()
+                .find(|p| {
+                    roots.iter().chain(app_dirs).any(|r| p.starts_with(r))
+                        && std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+                })
+                .map_or_else(|| path.clone(), std::path::Path::to_path_buf)
+        });
+        for path in disjoint_paths(touched) {
             if excludes.is_match(&path) {
                 continue;
             }
             let s = path.to_string_lossy().into_owned();
-            if path.is_file() {
-                // Replace stale metadata; final sorting uses the real mtime,
-                // not the event order (a copied file can have an old mtime).
-                let std_meta = std::fs::metadata(&path).ok();
+            let std_meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => Some(meta),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    let _ = indexer_tx.send(Msg::IndexError {
+                        error: format!("live index metadata: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if std_meta.as_ref().is_some_and(|m| m.is_file()) {
+                // Replace stale metadata, using real mtime rather than event order.
                 let meta = FileMeta {
                     mtime: std_meta
                         .as_ref()
@@ -423,17 +562,29 @@ fn watch_loop(
                 // replaced inside one debounce burst): prune the old subtree
                 // so no ghost children survive
                 gone_dir_prefixes.push(format!("{s}/"));
-            } else if path.is_dir() {
+            } else if std_meta.as_ref().is_some_and(|m| m.is_dir()) {
                 // a directory appeared or changed: replace its prior state —
                 // a recreated dir must not keep stale children — then index
                 // what exists now
+                let (entries, stats) = walker::collect_cancellable(
+                    std::slice::from_ref(&path),
+                    excludes,
+                    false,
+                    shutdown,
+                );
+                if !stats.complete() {
+                    let _ = indexer_tx.send(Msg::IndexError {
+                        error: format!(
+                            "live subtree walk incomplete ({} errors); retaining previous entries",
+                            stats.skipped
+                        ),
+                    });
+                    continue;
+                }
                 gone_dir_prefixes.push(format!("{s}/"));
                 gone.insert(s.clone());
-                let (entries, _) =
-                    walker::collect_sorted(std::slice::from_ref(&path), excludes, false);
                 // collect_sorted skips the walk root, so re-add the dir
                 // itself with fresh metadata
-                let std_meta = std::fs::metadata(&path).ok();
                 let meta = FileMeta {
                     mtime: std_meta
                         .as_ref()
@@ -457,18 +608,24 @@ fn watch_loop(
         if !batch.rescan && fronts.is_empty() && gone.is_empty() {
             continue;
         }
-        let mut next: Vec<(String, FileMeta)> = Vec::with_capacity(current.len() + fronts.len());
-        next.extend(fronts);
-        next.extend(
-            current
-                .iter()
-                .filter(|(p, _)| {
-                    !gone.contains(p) && !gone_dir_prefixes.iter().any(|d| p.starts_with(d))
-                })
-                .cloned(),
-        );
+        // Sort only changes and merge by moving strings, not cloning the index.
+        current.retain(|(p, _)| {
+            !gone.contains(p) && !gone_dir_prefixes.iter().any(|d| p.starts_with(d))
+        });
+        sort_unique_entries(&mut fronts);
+        let mut next = Vec::with_capacity(current.len() + fronts.len());
+        let mut old = current.into_iter().peekable();
+        let mut new = fronts.into_iter().peekable();
+        while let (Some(a), Some(b)) = (old.peek(), new.peek()) {
+            if walker::mtime_cmp(a, b).is_le() {
+                next.push(old.next().unwrap());
+            } else {
+                next.push(new.next().unwrap());
+            }
+        }
+        next.extend(old);
+        next.extend(new);
         current = next;
-        sort_unique_entries(&mut current);
         if indexer_tx
             .send(Msg::IndexSnapshot {
                 store: Arc::new(PathStore::from_entries(&current)),
@@ -478,7 +635,7 @@ fn watch_loop(
         {
             return; // engine dropped
         }
-        if last_save.elapsed() >= WATCH_SAVE_EVERY {
+        if indexer_tx.save_allowed && last_save.elapsed() >= WATCH_SAVE_EVERY {
             last_save = Instant::now();
             if cache_mtime(cache_path) == our_stamp {
                 match index::save(&current, cache_path) {
@@ -495,7 +652,11 @@ fn watch_loop(
 }
 
 /// The single filename search worker: always process only the newest job.
-fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
+fn spawn_search_worker(
+    job_rx: Receiver<FilenameJob>,
+    tx: Sender<Msg>,
+    current_generation: Arc<AtomicU64>,
+) {
     let worker_tx = tx;
     std::thread::spawn(move || {
         while let Ok(mut job) = job_rx.recv() {
@@ -503,15 +664,17 @@ fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
                 job = newer;
             }
             let matched = if job.lines {
-                matcher::search_lines(
+                matcher::search_lines_generation(
                     &job.store,
                     &job.query,
                     job.mode,
                     FILENAME_LIMIT,
                     &job.filters,
+                    job.generation,
+                    &current_generation,
                 )
             } else {
-                matcher::search_boosted(
+                matcher::search_boosted_generation(
                     &job.store,
                     &job.query,
                     job.mode,
@@ -519,10 +682,13 @@ fn spawn_search_worker(job_rx: Receiver<FilenameJob>, tx: Sender<Msg>) {
                     &job.boosts,
                     &job.filters,
                     &job.quiet,
+                    job.generation,
+                    &current_generation,
                 )
             };
             let (indices, strong, error) = match matched {
-                Ok(r) => (r.indices, r.strong, None),
+                Ok(Some(r)) => (r.indices, r.strong, None),
+                Ok(None) => continue,
                 Err(e) => (Vec::new(), 0, Some(format!("invalid pattern: {e}"))),
             };
             if worker_tx
@@ -551,19 +717,27 @@ impl Engine {
         let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
 
         // filename search worker: always process only the newest job
-        spawn_search_worker(job_rx, msg_tx.clone());
+        let current_generation = Arc::new(AtomicU64::new(0));
+        spawn_search_worker(job_rx, msg_tx.clone(), current_generation.clone());
 
-        // indexer: cached paths first, then a fresh walk, then save
-        let indexer_tx = msg_tx.clone();
+        // indexer: cached paths first, then a checked fresh walk, then save
+        let snapshot = Arc::new(Mutex::new(None));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let mut indexer_tx = IndexPublisher {
+            tx: msg_tx.clone(),
+            snapshot: snapshot.clone(),
+            save_allowed: true,
+        };
         let max_content_filesize = config.max_content_filesize;
         let unified = config.unified;
         let remember_history = config.remember_history;
-        std::thread::spawn(move || {
-            let cached = index::load(&cache_path);
+        let indexer = std::thread::spawn(move || {
+            let cached = index::load(&cache_path).map(Arc::new);
             let expected = cached.as_ref().map(|c| c.len());
-            if let Some(cached) = cached {
+            if let Some(cached) = cached.as_ref() {
                 let _ = indexer_tx.send(Msg::IndexSnapshot {
-                    store: Arc::new(cached),
+                    store: cached.clone(),
                     indexing: true,
                 });
             }
@@ -581,7 +755,17 @@ impl Engine {
             // arm the watcher before walking: events raised mid-walk sit in
             // the channel and are folded in afterwards (re-stat makes them
             // idempotent), so nothing slips through the startup window
-            let (watcher, watch_failures) = start_watcher(&config.roots);
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let app_dirs = if config.index_apps {
+                walker::default_app_dirs()
+            } else {
+                Vec::new()
+            };
+            let mut watch_roots = config.roots.clone();
+            watch_roots.extend(app_dirs.iter().filter(|p| p.exists()).cloned());
+            let (watcher, watch_failures) = start_watcher(&disjoint_paths(watch_roots));
             if watch_failures > 0 {
                 let noun = if watch_failures == 1 { "root" } else { "roots" };
                 let _ = indexer_tx.send(Msg::IndexError {
@@ -592,8 +776,9 @@ impl Engine {
             let roots = disjoint_paths(config.roots.iter().cloned());
             let walk_excludes = excludes.clone();
             let index_apps = config.index_apps;
+            let walk_stop = stop.clone();
             let walk_thread = std::thread::spawn(move || {
-                walker::walk(&roots, &walk_excludes, index_apps, &path_tx)
+                walker::walk_cancellable(&roots, &walk_excludes, index_apps, &path_tx, &walk_stop)
             });
             // the index is ordered newest-first, so head-of-list results,
             // regex hits (index order) and fuzzy score ties all favor recency
@@ -614,17 +799,48 @@ impl Engine {
                     });
                 }
             }
-            let _ = walk_thread.join();
-            sort_unique_entries(&mut fresh);
-            let _ = indexer_tx.send(Msg::IndexSnapshot {
-                store: Arc::new(PathStore::from_entries(&fresh)),
-                indexing: false,
-            });
-            if let Err(error) = index::save(&fresh, &cache_path) {
-                let _ = indexer_tx.send(Msg::IndexError {
-                    error: format!("saving index: {error}"),
-                });
+            let walked = walk_thread.join();
+            if stop.load(Ordering::Relaxed) {
+                return;
             }
+            if let Some(error) = walk_failure(walked) {
+                indexer_tx.save_allowed = false;
+                if let Some(cached) = cached.as_ref() {
+                    // Keep a usable warm baseline, including for later watcher batches.
+                    fresh = (0..cached.len())
+                        .map(|i| (cached.get(i).to_string(), cached.meta(i)))
+                        .collect();
+                    sort_unique_entries(&mut fresh);
+                } else {
+                    // A cold partial walk is still useful, but is never persisted
+                    // as a complete replacement. Keep its failure visible.
+                    sort_unique_entries(&mut fresh);
+                    let _ = indexer_tx.send(Msg::IndexSnapshot {
+                        store: Arc::new(PathStore::from_entries(&fresh)),
+                        indexing: false,
+                    });
+                }
+                let disposition = if cached.is_some() {
+                    "retaining previous index"
+                } else {
+                    "showing partial results"
+                };
+                let _ = indexer_tx.send(Msg::IndexError {
+                    error: format!("{error}; {disposition}"),
+                });
+            } else {
+                sort_unique_entries(&mut fresh);
+                let _ = indexer_tx.send(Msg::IndexSnapshot {
+                    store: Arc::new(PathStore::from_entries(&fresh)),
+                    indexing: false,
+                });
+                if let Err(error) = index::save(&fresh, &cache_path) {
+                    let _ = indexer_tx.send(Msg::IndexError {
+                        error: format!("saving index: {error}"),
+                    });
+                }
+            }
+            drop(cached);
             if let Some((_watcher, event_rx)) = watcher {
                 // _watcher must stay alive for events to keep flowing
                 watch_loop(
@@ -634,7 +850,8 @@ impl Engine {
                     &indexer_tx,
                     fresh,
                     &config.roots,
-                    config.index_apps,
+                    &app_dirs,
+                    &stop,
                 );
             }
         });
@@ -647,6 +864,10 @@ impl Engine {
         );
         Engine {
             msg_rx,
+            snapshot,
+            shutdown,
+            indexer: Some(indexer),
+            content_rx: None,
             msg_tx,
             job_tx,
             store: Arc::new(PathStore::empty()),
@@ -660,6 +881,7 @@ impl Engine {
             index_error: None,
             mode: Mode::Fuzzy,
             generation: 0,
+            current_generation,
             query: String::new(),
             strong: 0,
             max_content_filesize,
@@ -685,7 +907,8 @@ impl Engine {
     pub fn from_lines(lines: Vec<String>) -> Engine {
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         let (job_tx, job_rx) = mpsc::channel::<FilenameJob>();
-        spawn_search_worker(job_rx, msg_tx.clone());
+        let current_generation = Arc::new(AtomicU64::new(0));
+        spawn_search_worker(job_rx, msg_tx.clone(), current_generation.clone());
         // entries in INPUT order (no recency sort): each line is a "path"
         let entries: Vec<(String, FileMeta)> = lines
             .into_iter()
@@ -702,6 +925,10 @@ impl Engine {
         let boosts = Arc::new(HashMap::new());
         Engine {
             msg_rx,
+            snapshot: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            indexer: None,
+            content_rx: None,
             msg_tx,
             job_tx,
             store,
@@ -715,6 +942,7 @@ impl Engine {
             index_error: None,
             mode: Mode::Fuzzy,
             generation: 0,
+            current_generation,
             query: String::new(),
             strong: 0,
             max_content_filesize: 0,
@@ -782,6 +1010,12 @@ impl Engine {
             .unwrap_or(0);
     }
 
+    fn advance_generation(&mut self) {
+        self.generation += 1;
+        self.current_generation
+            .store(self.generation, Ordering::Relaxed);
+    }
+
     pub fn set_query(&mut self, input: &str, regex_mode: bool) {
         // Old-generation replies cannot settle work for the new query.
         self.filename_running = false;
@@ -797,7 +1031,7 @@ impl Engine {
                 pattern
             };
             self.filters = query_filters;
-            self.generation += 1;
+            self.advance_generation();
             self.mode = mode;
             self.query = query.clone();
             self.status.error = None;
@@ -810,7 +1044,7 @@ impl Engine {
         if mode == Mode::Calc {
             // the calculator is synchronous and takes the raw expression —
             // no filter tokens, no worker round-trip
-            self.generation += 1;
+            self.advance_generation();
             self.mode = mode;
             self.query = query.clone();
             self.status.error = None;
@@ -839,7 +1073,7 @@ impl Engine {
             pattern
         };
         self.filters = query_filters;
-        self.generation += 1;
+        self.advance_generation();
         self.mode = mode;
         self.query = query.clone();
         self.status.error = None;
@@ -885,9 +1119,17 @@ impl Engine {
     }
 
     pub fn tick(&mut self) {
-        self.fire_due_content_search();
-        self.fire_due_semantic_search();
-        while let Ok(msg) = self.msg_rx.try_recv() {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .map(|(store, indexing)| Msg::IndexSnapshot { store, indexing });
+        while let Some(msg) = snapshot
+            .take()
+            .or_else(|| self.msg_rx.try_recv().ok())
+            .or_else(|| self.content_rx.as_ref().and_then(|rx| rx.try_recv().ok()))
+        {
             match msg {
                 Msg::IndexSnapshot { store, indexing } => {
                     self.store = store;
@@ -897,8 +1139,20 @@ impl Engine {
                         // the startup walk (fresh or re-walk) is done
                         self.status.walk = None;
                     }
+                    if self.mode == Mode::Content && !self.query.is_empty() {
+                        self.advance_generation();
+                        self.cancel_content();
+                        self.results.clear();
+                        self.status.matches = 0;
+                        // Preserve an existing debounce; active searches restart now.
+                        let at = self
+                            .pending_content
+                            .take()
+                            .map_or_else(|| Instant::now() - CONTENT_DEBOUNCE, |(_, at)| at);
+                        self.pending_content = Some((self.query.clone(), at));
+                    }
                     if matches!(self.mode, Mode::Fuzzy | Mode::Regex) {
-                        self.generation += 1;
+                        self.advance_generation();
                         self.semantic_running = false;
                         self.pending_semantic = None;
                         self.dispatch_filename();
@@ -922,7 +1176,14 @@ impl Engine {
                     // (possibly none) and stop the "indexing" spinner
                     self.status.indexing = false;
                     self.status.walk = None;
-                    self.index_error = Some(error);
+                    match self.index_error.as_mut() {
+                        Some(previous) if previous.contains(&error) => {}
+                        Some(previous) if previous.len() + error.len() < 4096 => {
+                            previous.push_str("; ");
+                            previous.push_str(&error);
+                        }
+                        _ => self.index_error = Some(error),
+                    }
                 }
                 Msg::FilenameResults {
                     generation,
@@ -1017,6 +1278,9 @@ impl Engine {
                 }
             }
         }
+        // Drain index changes before choosing the content-search scope.
+        self.fire_due_content_search();
+        self.fire_due_semantic_search();
     }
 
     pub fn results(&self) -> &[ResultRow] {
@@ -1105,58 +1369,55 @@ impl Engine {
         let (pattern, _) = self.pending_content.take().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         self.content_cancel = Some(cancel.clone());
-        // scope the grep with any ext:/path: filters from the query
-        // candidates are indices into the store; the store Arc is passed
-        // along so the search thread resolves paths without materializing
-        // a full Vec<String> of path clones per query
-        let f = &self.filters;
-        let indices: Vec<usize> = (0..self.store.len())
-            .filter(|&i| {
-                f.is_empty()
-                    || (f.matches(self.store.get(i)) && f.matches_meta(&self.store.meta(i)))
-            })
-            .collect();
+        // Scope candidates on the worker, not the UI thread. Hits flow directly
+        // through one bounded queue; there is no unbounded relay channel.
+        let filters = self.filters.clone();
         let store = self.store.clone();
-        let tx = self.msg_tx.clone();
+        let (tx, rx) = mpsc::sync_channel(content::QUEUE_CAPACITY);
+        self.content_rx = Some(rx);
         let generation = self.generation;
         let max = self.max_content_filesize;
         let pdf_cache = self.pdf_cache.clone();
         std::thread::spawn(move || {
-            let (hit_tx, hit_rx) = mpsc::channel::<ContentMatch>();
-            let search_cancel = cancel.clone();
-            let pattern2 = pattern.clone();
-            let searcher = std::thread::spawn(move || {
-                content::search(
+            let searched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut indices = Vec::new();
+                for i in 0..store.len() {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    if filters.is_empty()
+                        || (filters.matches(store.get(i)) && filters.matches_meta(&store.meta(i)))
+                    {
+                        indices.push(i);
+                    }
+                }
+                content::search_with_sink(
                     &indices,
                     |i| store.get(i),
-                    &pattern2,
+                    &pattern,
                     max,
                     &pdf_cache,
-                    &search_cancel,
-                    &hit_tx,
+                    &cancel,
+                    CONTENT_LIMIT,
+                    |hit| {
+                        content::send_cancellable(&tx, Msg::ContentHit { generation, hit }, &cancel)
+                    },
                 )
-            });
-            for hit in hit_rx {
-                if tx.send(Msg::ContentHit { generation, hit }).is_err() {
-                    cancel.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
-            // an invalid content pattern surfaces as a typed error so the
-            // filename channel stays pure filename results
-            let error = match searcher.join() {
+            }));
+            let error = match searched {
                 Ok(Ok(())) => None,
                 Ok(Err(e)) => Some(format!("invalid pattern: {e}")),
                 Err(_) => Some("content search failed".to_string()),
             };
             if let Some(error) = error {
-                let _ = tx.send(Msg::ContentError { generation, error });
+                content::send_cancellable(&tx, Msg::ContentError { generation, error }, &cancel);
             }
-            let _ = tx.send(Msg::ContentDone { generation });
+            content::send_cancellable(&tx, Msg::ContentDone { generation }, &cancel);
         });
     }
 
     fn cancel_content(&mut self) {
+        self.content_rx = None;
         if let Some(flag) = self.content_cancel.take() {
             flag.store(true, Ordering::Relaxed);
         }
@@ -1198,7 +1459,7 @@ impl Engine {
             // loading is expensive); creation *failures* are not cached —
             // the next job retries
             let mut spare: Option<Box<dyn sem::Embedder + Send>> = None;
-            let mut ready: Option<(Box<dyn sem::Embedder + Send>, sem::SemStore)> = None;
+            let mut ready: Option<WarmSemantic> = None;
             // mtime of the store file when `ready` was loaded; a different
             // mtime means another process rebuilt or migrated the index
             let mut loaded_stamp: Option<std::time::SystemTime> = None;
@@ -1214,7 +1475,7 @@ impl Engine {
                 if ready.is_some() && last_check.elapsed() >= Duration::from_secs(1) {
                     last_check = Instant::now();
                     if cache_mtime(&sem::default_store_path()) != loaded_stamp {
-                        ready = None;
+                        spare = release_semantic_store(&mut ready);
                     }
                 }
                 let mut broken: Option<String> = None;
@@ -1314,9 +1575,39 @@ impl Engine {
     }
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.cancel_content();
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.current_generation.store(u64::MAX, Ordering::Relaxed);
+        if let Some(indexer) = self.indexer.take() {
+            let _ = indexer.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_store_reload_preserves_the_warm_embedder() {
+        struct CountingEmbedder(usize);
+        impl sem::Embedder for CountingEmbedder {
+            fn dim(&self) -> usize {
+                1
+            }
+            fn embed(&mut self, _: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                self.0 += 1;
+                Ok(vec![vec![self.0 as f32]])
+            }
+        }
+        let mut ready: Option<WarmSemantic> =
+            Some((Box::new(CountingEmbedder(7)), sem::SemStore::new(1)));
+        let mut warm = release_semantic_store(&mut ready).unwrap();
+        assert!(ready.is_none());
+        assert_eq!(warm.embed(&[]).unwrap(), vec![vec![8.0]]);
+    }
 
     #[test]
     fn semantic_snippets_reject_grown_files_and_cap_normal_lines() {
@@ -1353,6 +1644,26 @@ mod tests {
         excludes: &globset::GlobSet,
         apps: bool,
     ) -> Vec<Msg> {
+        watch_messages_with_apps(
+            current,
+            events,
+            roots,
+            excludes,
+            &if apps {
+                walker::default_app_dirs()
+            } else {
+                Vec::new()
+            },
+        )
+    }
+
+    fn watch_messages_with_apps(
+        current: Vec<(String, FileMeta)>,
+        events: Vec<notify::Result<notify::Event>>,
+        roots: &[PathBuf],
+        excludes: &globset::GlobSet,
+        app_dirs: &[PathBuf],
+    ) -> Vec<Msg> {
         let dir = tempfile::tempdir().unwrap();
         let (event_tx, event_rx) = mpsc::channel();
         for event in events {
@@ -1360,7 +1671,13 @@ mod tests {
         }
         // No timing or OS watcher dependency: EOF ends the debounce burst.
         drop(event_tx);
-        let (index_tx, index_rx) = mpsc::channel();
+        let (tx, index_rx) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(None));
+        let index_tx = IndexPublisher {
+            tx,
+            snapshot: snapshot.clone(),
+            save_allowed: true,
+        };
         watch_loop(
             &event_rx,
             excludes,
@@ -1368,10 +1685,15 @@ mod tests {
             &index_tx,
             current,
             roots,
-            apps,
+            app_dirs,
+            &AtomicBool::new(false),
         );
         drop(index_tx);
-        index_rx.into_iter().collect()
+        let mut messages: Vec<_> = index_rx.into_iter().collect();
+        if let Some((store, indexing)) = snapshot.lock().unwrap().take() {
+            messages.push(Msg::IndexSnapshot { store, indexing });
+        }
+        messages
     }
 
     fn snapshot_entries(messages: &[Msg]) -> Vec<(String, FileMeta)> {
@@ -1386,6 +1708,240 @@ mod tests {
                 _ => None,
             })
             .expect("snapshot")
+    }
+
+    #[test]
+    fn snapshots_precede_due_content_dispatch_and_restart_completed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.txt");
+        let new = dir.path().join("new.txt");
+        std::fs::write(&old, "needle\n").unwrap();
+        std::fs::write(&new, "needle\n").unwrap();
+        let mut engine = Engine::from_lines(vec![old.to_string_lossy().into_owned()]);
+        engine.tick();
+        engine.filter = false;
+        engine.max_content_filesize = 1024;
+        engine.set_query(">needle", false);
+        engine.pending_content = Some(("needle".into(), Instant::now() - CONTENT_DEBOUNCE));
+        let new_store = Arc::new(PathStore::from_entries(&[(
+            new.to_string_lossy().into_owned(),
+            FileMeta::default(),
+        )]));
+        *engine.snapshot.lock().unwrap() = Some((new_store, false));
+        engine.tick();
+        wait_for(&mut engine, |e| !e.status().searching);
+        assert_eq!(engine.results.len(), 1);
+        assert_eq!(engine.results[0].path, new.to_string_lossy());
+        let old_store = Arc::new(PathStore::from_entries(&[(
+            old.to_string_lossy().into_owned(),
+            FileMeta::default(),
+        )]));
+        *engine.snapshot.lock().unwrap() = Some((old_store, false));
+        engine.tick();
+        wait_for(&mut engine, |e| !e.status().searching);
+        assert_eq!(engine.results.len(), 1);
+        assert_eq!(engine.results[0].path, old.to_string_lossy());
+    }
+
+    #[test]
+    fn snapshot_replaces_blocked_content_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..10)
+            .map(|i| {
+                let path = dir.path().join(format!("{i}.txt"));
+                std::fs::write(&path, "needle\n".repeat(20)).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        let mut engine = Engine::from_lines(paths);
+        engine.tick();
+        engine.filter = false;
+        engine.max_content_filesize = 1024;
+        engine.set_query(">needle", false);
+        engine.pending_content = Some(("needle".into(), Instant::now() - CONTENT_DEBOUNCE));
+        engine.tick();
+        let old_cancel = engine.content_cancel.as_ref().unwrap().clone();
+        std::thread::sleep(Duration::from_millis(30));
+        *engine.snapshot.lock().unwrap() = Some((Arc::new(PathStore::empty()), false));
+        engine.tick();
+        assert!(old_cancel.load(Ordering::Relaxed));
+        wait_for(&mut engine, |e| !e.status().searching);
+        assert!(engine.results.is_empty());
+    }
+
+    #[test]
+    fn walker_join_failures_are_not_successful_empty_walks() {
+        assert_eq!(
+            walk_failure(Err(Box::new("injected panic"))).as_deref(),
+            Some("index walk failed")
+        );
+        assert!(walk_failure(Ok(walker::WalkStats::default())).is_none());
+    }
+
+    #[test]
+    fn pending_snapshots_are_coalesced() {
+        let (tx, _rx) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(None));
+        let publisher = IndexPublisher {
+            tx,
+            snapshot: snapshot.clone(),
+            save_allowed: true,
+        };
+        let first = Arc::new(PathStore::empty());
+        let weak = Arc::downgrade(&first);
+        publisher
+            .send(Msg::IndexSnapshot {
+                store: first,
+                indexing: true,
+            })
+            .unwrap();
+        publisher
+            .send(Msg::IndexSnapshot {
+                store: Arc::new(PathStore::empty()),
+                indexing: false,
+            })
+            .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(!snapshot.lock().unwrap().as_ref().unwrap().1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_prunes_symlinks_and_does_not_follow_symlink_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("hidden.txt"), "x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let stale = format!("{}/old.txt", link.display());
+        for event_path in [&link, &link.join("hidden.txt")] {
+            let messages = watch_messages(
+                vec![(stale.clone(), FileMeta::default())],
+                vec![Ok(
+                    notify::Event::new(notify::EventKind::Any).add_path(event_path.clone())
+                )],
+                &[dir.path().to_path_buf()],
+                &walker::build_exclude_set(&[]).unwrap(),
+                false,
+            );
+            assert!(snapshot_entries(&messages).is_empty());
+        }
+        let file_link = dir.path().join("file.txt");
+        std::os::unix::fs::symlink(outside.path().join("hidden.txt"), &file_link).unwrap();
+        let messages = watch_messages(
+            Vec::new(),
+            vec![Ok(
+                notify::Event::new(notify::EventKind::Any).add_path(file_link)
+            )],
+            &[dir.path().to_path_buf()],
+            &walker::build_exclude_set(&[]).unwrap(),
+            false,
+        );
+        assert!(snapshot_entries(&messages).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_allows_symlinked_parents_above_configured_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("root")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let root = alias.join("root");
+        let file = root.join("new.txt");
+        std::fs::write(&file, "x").unwrap();
+        let messages = watch_messages(
+            Vec::new(),
+            vec![Ok(
+                notify::Event::new(notify::EventKind::Any).add_path(file.clone())
+            )],
+            &[root],
+            &walker::build_exclude_set(&[]).unwrap(),
+            false,
+        );
+        assert_eq!(snapshot_entries(&messages)[0].0, file.to_string_lossy());
+    }
+
+    #[test]
+    fn watcher_refreshes_application_entries_without_trailing_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("Utilities/New.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        let excludes = walker::build_exclude_set(&["*.app".into()]).unwrap();
+        let stale = dir.path().join("Old.app").to_string_lossy().into_owned();
+        let messages = watch_messages_with_apps(
+            vec![(stale, FileMeta::default())],
+            vec![Ok(
+                notify::Event::new(notify::EventKind::Any).add_path(app.join("Contents"))
+            )],
+            &[],
+            &excludes,
+            &[dir.path().to_path_buf()],
+        );
+        let entries = snapshot_entries(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, app.to_string_lossy());
+        assert_eq!(entries[0].1.size, 0);
+    }
+
+    #[test]
+    fn failed_rescan_keeps_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = watch_messages(
+            vec![("/cached.txt".into(), FileMeta::default())],
+            vec![Ok(
+                notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+            )],
+            &[dir.path().join("missing")],
+            &walker::build_exclude_set(&[]).unwrap(),
+            false,
+        );
+        assert!(messages.iter().any(|m| matches!(m, Msg::IndexError { .. })));
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, Msg::IndexSnapshot { .. }))
+        );
+    }
+
+    #[test]
+    fn idle_watcher_shutdown_and_engine_drop_join_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("index");
+        let (event_tx, event_rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            watch_loop(
+                &event_rx,
+                &walker::build_exclude_set(&[]).unwrap(),
+                &cache,
+                &IndexPublisher {
+                    tx,
+                    snapshot,
+                    save_allowed: true,
+                },
+                Vec::new(),
+                &[],
+                &[],
+                &worker_stop,
+            );
+            done_tx.send(()).unwrap();
+        });
+        let mut engine = Engine::from_lines(Vec::new());
+        engine.shutdown = stop;
+        engine.indexer = Some(worker);
+        drop(engine);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            event_tx
+                .send(Ok(notify::Event::new(notify::EventKind::Any)))
+                .is_err()
+        );
     }
 
     #[test]
