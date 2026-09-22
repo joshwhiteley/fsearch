@@ -1,5 +1,161 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_BACKGROUND_CHILDREN: usize = 64;
+
+/// One bounded reaper for detached launches, rather than one thread per child
+/// (or dropped Child handles, which leave zombies on Unix).
+fn background_children() -> &'static Arc<Mutex<Vec<Child>>> {
+    static CHILDREN: OnceLock<Arc<Mutex<Vec<Child>>>> = OnceLock::new();
+    CHILDREN.get_or_init(|| {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let worker = Arc::clone(&children);
+        std::thread::spawn(move || {
+            loop {
+                reap_finished(&mut worker.lock().unwrap());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        children
+    })
+}
+
+fn reap_finished(children: &mut Vec<Child>) {
+    children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+}
+
+fn spawn_background(command: &mut Command) -> std::io::Result<()> {
+    let mut children = background_children().lock().unwrap();
+    reap_finished(&mut children);
+    if children.len() >= MAX_BACKGROUND_CHILDREN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "too many background actions still running",
+        ));
+    }
+    children.push(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    Ok(())
+}
+
+/// Bound both stdin writes and execution. Every error/timeout kills and reaps
+/// the child. Nonblocking pipe writes avoid hanging on a clipboard backend
+/// that starts successfully but never reads its input.
+fn checked_command(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    checked_command_cancellable(command, input, timeout, &AtomicBool::new(false))
+}
+
+fn check_cancelled(cancel: &AtomicBool) -> std::io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "action cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn checked_command_cancellable(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
+    check_cancelled(cancel)?;
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let result = (|| {
+        let deadline = Instant::now() + timeout;
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                // SAFETY: stdin owns this live descriptor for both calls.
+                let flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
+                if flags == -1
+                    || unsafe {
+                        libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    } == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bounded clipboard writes require Unix",
+            ));
+            let mut remaining = input;
+            while !remaining.is_empty() {
+                check_cancelled(cancel)?;
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "action timed out writing stdin",
+                    ));
+                }
+                match stdin.write(remaining) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => remaining = &remaining[n..],
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // EOF is required by clipboard programs before they can exit.
+            drop(stdin);
+        }
+        loop {
+            check_cancelled(cancel)?;
+            if let Some(status) = child.try_wait()? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "action exited with {status}"
+                    )))
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "action timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
 
 use crate::config::CustomAction;
 
@@ -28,12 +184,7 @@ pub fn reveal_args(path: &str) -> (&'static str, Vec<String>) {
 }
 
 fn run(args: (&'static str, Vec<String>)) -> std::io::Result<()> {
-    Command::new(args.0)
-        .args(&args.1)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+    spawn_background(Command::new(args.0).args(&args.1))
 }
 
 /// Turns a result path into an absolute path without requiring it to exist.
@@ -126,13 +277,7 @@ pub fn run_custom_with_line(
     let Some((program, args)) = args.split_first() else {
         return Err(std::io::Error::other("custom action has no command"));
     };
-    Command::new(program)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .map(|_| ())
+    spawn_background(Command::new(program).args(args))
 }
 
 pub fn has_paths_placeholder(cmd: &[String]) -> bool {
@@ -142,19 +287,7 @@ pub fn has_paths_placeholder(cmd: &[String]) -> bool {
 /// Runs a destructive action synchronously so a non-zero exit is reported to
 /// the caller instead of being presented as a successful trash operation.
 fn run_checked(args: (&'static str, Vec<String>)) -> std::io::Result<()> {
-    let status = Command::new(args.0)
-        .args(&args.1)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "{} exited with {status}",
-            args.0
-        )))
-    }
+    checked_command(Command::new(args.0).args(&args.1), None, COMMAND_TIMEOUT)
 }
 
 pub fn open(path: &str) -> std::io::Result<()> {
@@ -184,17 +317,13 @@ pub fn quick_look(path: &str) -> std::io::Result<()> {
     // permission for the terminal; fails silently without it.
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("osascript")
-            .args([
-                "-e",
-                "delay 0.3",
-                "-e",
-                "tell application \"System Events\" to set frontmost of \
+        let _ = spawn_background(Command::new("osascript").args([
+            "-e",
+            "delay 0.3",
+            "-e",
+            "tell application \"System Events\" to set frontmost of \
                  first application process whose name is \"qlmanage\" to true",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        ]));
     }
     Ok(())
 }
@@ -220,6 +349,16 @@ pub fn trash_args(path: &str) -> (&'static str, Vec<String>) {
 /// Moves the file to the system trash (recoverable).
 pub fn trash(path: &str) -> std::io::Result<()> {
     run_checked(trash_args(path))
+}
+
+pub(crate) fn trash_with_cancel(path: &str, cancel: &AtomicBool) -> std::io::Result<()> {
+    let args = trash_args(path);
+    checked_command_cancellable(
+        Command::new(args.0).args(&args.1),
+        None,
+        COMMAND_TIMEOUT,
+        cancel,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,30 +666,38 @@ const CLIPBOARD_COMMANDS: &[&[&str]] = &[
 ];
 
 pub fn copy(path: &str) -> std::io::Result<()> {
+    copy_with_commands(path, CLIPBOARD_COMMANDS, CLIPBOARD_TIMEOUT)
+}
+
+pub(crate) fn copy_with_cancel(path: &str, cancel: &AtomicBool) -> std::io::Result<()> {
+    copy_with_commands_cancellable(path, CLIPBOARD_COMMANDS, CLIPBOARD_TIMEOUT, cancel)
+}
+
+fn copy_with_commands(input: &str, commands: &[&[&str]], timeout: Duration) -> std::io::Result<()> {
+    copy_with_commands_cancellable(input, commands, timeout, &AtomicBool::new(false))
+}
+
+fn copy_with_commands_cancellable(
+    input: &str,
+    commands: &[&[&str]],
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
     let mut last_err = std::io::Error::other("no clipboard tool found");
-    for cmd in CLIPBOARD_COMMANDS {
-        match Command::new(cmd[0])
-            .args(&cmd[1..])
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            Ok(mut child) => {
-                child
-                    .stdin
-                    .as_mut()
-                    .expect("clipboard stdin is piped")
-                    .write_all(path.as_bytes())?;
-                let status = child.wait()?;
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other(format!(
-                        "{} exited with {status}",
-                        cmd[0]
-                    )))
-                };
+    for cmd in commands {
+        match checked_command_cancellable(
+            Command::new(cmd[0]).args(&cmd[1..]),
+            Some(input.as_bytes()),
+            timeout,
+            cancel,
+        ) {
+            Ok(()) => return Ok(()),
+            // A present backend may be unusable (e.g. no Wayland session).
+            // Retry after execution, write, and timeout failures as well.
+            Err(error) => {
+                check_cancelled(cancel)?;
+                last_err = error;
             }
-            Err(e) => last_err = e,
         }
     }
     Err(last_err)
@@ -559,6 +706,149 @@ pub fn copy(path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn assert_reaped(pid: u32) {
+        // kill(0) observes existence without reaping the child itself.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+                return;
+            }
+            assert!(Instant::now() < deadline, "child {pid} was not reaped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_launches_are_reaped_without_waiting_on_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid");
+        spawn_background(
+            Command::new("sh")
+                .args(["-c", "echo $$ > \"$1\"", "sh"])
+                .arg(&path),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_commands_timeout_and_reap_even_when_stdin_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        for input in [None, Some(vec![b'x'; 2 * 1024 * 1024])] {
+            let path = dir.path().join("pid");
+            let start = Instant::now();
+            let error = checked_command(
+                Command::new("sh")
+                    .args(["-c", "echo $$ > \"$1\"; exec sleep 10", "sh"])
+                    .arg(&path),
+                input.as_deref(),
+                Duration::from_millis(150),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let pid = std::fs::read_to_string(&path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_reaped(pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_interrupts_blocked_clipboard_and_prevents_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let fallback_file = dir.path().join("fallback");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let pid_path = pid_file.clone();
+        let fallback_path = fallback_file.clone();
+        let worker = std::thread::spawn(move || {
+            copy_with_commands_cancellable(
+                &"x".repeat(2 * 1024 * 1024),
+                &[
+                    &[
+                        "sh",
+                        "-c",
+                        "echo $$ > \"$1\"; exec sleep 10",
+                        "sh",
+                        pid_path.to_str().unwrap(),
+                    ],
+                    &[
+                        "sh",
+                        "-c",
+                        "echo ran > \"$1\"; cat >/dev/null",
+                        "sh",
+                        fallback_path.to_str().unwrap(),
+                    ],
+                ],
+                Duration::from_secs(10),
+                &worker_cancel,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let cancelled_at = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert_reaped(pid);
+        assert!(!fallback_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_retries_spawn_execution_write_and_timeout_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clipboard");
+        let input = "hello".repeat(40_000);
+        // Exercise the same backend loop on macOS as on Linux, without
+        // touching PATH or the user's actual clipboard.
+        let backends: &[&[&str]] = &[
+            &["fsearch-nonexistent-clipboard-backend"],
+            &["sh", "-c", "cat >/dev/null; exit 7"],
+            &["sh", "-c", "exec 0<&-; exit 8"],
+            &["sh", "-c", "exec sleep 10"],
+            &["sh", "-c", "cat > \"$1\"", "sh", output.to_str().unwrap()],
+        ];
+        copy_with_commands(&input, backends, Duration::from_secs(1)).unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), input);
+        let error = copy_with_commands("value", &[&["sh", "-c", "exit 9"]], Duration::from_secs(1))
+            .unwrap_err();
+        assert!(error.to_string().contains("exited"));
+    }
 
     #[test]
     fn inserted_placeholders_stay_literal_and_line_is_additive() {

@@ -1,3 +1,4 @@
+pub use self::metadata::StatusCache;
 use crate::actions;
 use crate::engine::{Engine, Mode, ResultRow};
 use crate::highlight::{self, Appearance};
@@ -19,7 +20,7 @@ use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const PREVIEW_BYTES: usize = 64 * 1024;
 const PREVIEW_SCROLL_PAGE: usize = 20;
@@ -152,8 +153,8 @@ pub struct Editor {
     pub input: String,
     /// Byte offset of the edit cursor, always on a char boundary.
     pub input_cursor: usize,
-    /// Char offset of the first visible input character; shifts once the
-    /// edit cursor would leave the query row.
+    /// Display-cell offset of the visible input; shifts once the edit
+    /// cursor would leave the query row.
     pub input_scroll: usize,
 }
 
@@ -297,13 +298,6 @@ pub struct Highlights {
     pub(crate) content: Option<regex::Regex>,
 }
 
-/// Cached stat of the status line's selected path (is_file, size, mtime),
-/// refreshed outside the draw pass.
-pub struct StatusCache {
-    pub path: String,
-    pub meta: Option<(bool, u64, Option<SystemTime>)>,
-}
-
 /// Modal help overlay: the open flag plus scroll offset; `area` records
 /// where it was last drawn so mouse clicks can hit-test inside vs outside.
 pub struct HelpModal {
@@ -345,6 +339,15 @@ enum MenuCommand {
 struct MenuEntry {
     label: String,
     command: MenuCommand,
+}
+
+/// Freeze both commands and their target identities at popup-open time.
+/// Engine reranking, arriving results, or a changed fold cannot retarget an
+/// action while the user is deciding which command to invoke.
+struct MenuSnapshot {
+    entries: Vec<MenuEntry>,
+    selected: Option<ResultRow>,
+    marked: Vec<ResultRow>,
 }
 
 fn run_batch<F>(paths: &[String], mut action: F) -> BatchOutcome
@@ -411,6 +414,7 @@ pub struct App {
     pub picked: Option<String>,
     /// Open actions popup: Some(selected entry index).
     pub menu: Option<usize>,
+    menu_snapshot: Option<MenuSnapshot>,
     /// Command keybindings (configurable via `[keys]` in config.toml).
     pub keymap: crate::keymap::Keymap,
     /// Results list scroll state (selection + visual offset); persisted so
@@ -444,6 +448,7 @@ pub struct App {
     /// Temporarily replaces the normal query with a directory-only search.
     pub destination_picker: Option<DestinationPicker>,
     pub transfer_job: Option<TransferJob>,
+    action_job: Option<action_job::ActionJob>,
 }
 
 impl App {
@@ -495,6 +500,7 @@ impl App {
             ui_mode: UiMode::Open,
             picked: None,
             menu: None,
+            menu_snapshot: None,
             keymap: crate::keymap::Keymap::default(),
             list_state: ListState::default(),
             menu_area: Rect::default(),
@@ -533,10 +539,7 @@ impl App {
                 content_input: String::new(),
                 content: None,
             },
-            status: StatusCache {
-                path: String::new(),
-                meta: None,
-            },
+            status: StatusCache::new(),
             help: HelpModal {
                 open: false,
                 scroll: 0,
@@ -549,6 +552,7 @@ impl App {
             nvim_request: None,
             destination_picker: None,
             transfer_job: None,
+            action_job: None,
         }
     }
 
@@ -564,6 +568,9 @@ impl App {
     /// visible marks. Clear remains available for marks hidden by a filter or
     /// the weaker-match fold.
     fn menu_entries(&self) -> Vec<MenuEntry> {
+        if let Some(snapshot) = &self.menu_snapshot {
+            return snapshot.entries.clone();
+        }
         let mut entries = Vec::new();
         if self.custom_actions_enabled()
             && let Some(path) = self.visible_selected_row().map(|row| row.path.as_str())
@@ -633,6 +640,9 @@ impl App {
     /// The focused row only counts when it belongs to the currently visible
     /// result set. A folded weak row must not be actionable.
     fn visible_selected_row(&self) -> Option<&ResultRow> {
+        if let Some(snapshot) = &self.menu_snapshot {
+            return snapshot.selected.as_ref();
+        }
         (self.selected < self.visible_len())
             .then(|| self.engine.results().get(self.selected))
             .flatten()
@@ -641,6 +651,9 @@ impl App {
     /// Paths of currently-visible marked rows in display order, deduplicated
     /// because content search can return several hits for one path.
     fn visible_marked(&self) -> Vec<String> {
+        if let Some(snapshot) = &self.menu_snapshot {
+            return snapshot.marked.iter().map(|row| row.path.clone()).collect();
+        }
         let mut seen = HashSet::new();
         self.engine
             .results()
@@ -664,9 +677,48 @@ impl App {
         self.visible_marked().len()
     }
 
+    fn open_menu(&mut self) {
+        self.close_menu();
+        self.capture_menu();
+        self.menu = Some(0);
+    }
+
+    fn capture_menu(&mut self) {
+        if self.menu_snapshot.is_some() {
+            return;
+        }
+        let marked = self.visible_marked();
+        let snapshot = MenuSnapshot {
+            entries: self.menu_entries(),
+            selected: self.visible_selected_row().cloned(),
+            marked: marked
+                .iter()
+                .filter_map(|path| {
+                    self.engine
+                        .results()
+                        .iter()
+                        .take(self.visible_len())
+                        .find(|row| &row.path == path)
+                        .cloned()
+                })
+                .collect(),
+        };
+        self.menu_snapshot = Some(snapshot);
+    }
+
+    fn close_menu(&mut self) {
+        self.menu = None;
+        self.menu_snapshot = None;
+        self.menu_area = Rect::default();
+        self.menu_inner = Rect::default();
+        self.menu_offset = 0;
+        self.hit_test.last_click = None;
+    }
+
     fn run_menu_action(&mut self, entry: usize) {
+        self.capture_menu();
         let Some(action) = self.menu_entries().get(entry).cloned() else {
-            self.menu = None;
+            self.close_menu();
             return;
         };
         self.menu = None;
@@ -678,11 +730,15 @@ impl App {
                     .map(|row| (row.path.clone(), row.line_number));
             }
             MenuCommand::BuiltIn(BuiltInAction::Reveal) => self.act(actions::reveal, "revealed"),
-            MenuCommand::BuiltIn(BuiltInAction::Copy) => self.act(actions::copy, "copied"),
+            MenuCommand::BuiltIn(BuiltInAction::Copy) => self.copy_selected(),
             MenuCommand::BuiltIn(BuiltInAction::QuickLook) => {
                 self.act(actions::quick_look, "quick look")
             }
-            MenuCommand::BuiltIn(BuiltInAction::Trash) => self.act(actions::trash, "trashed"),
+            MenuCommand::BuiltIn(BuiltInAction::Trash) => {
+                if let Some(path) = self.visible_selected_row().map(|row| row.path.clone()) {
+                    self.trash_async(vec![path]);
+                }
+            }
             MenuCommand::BuiltIn(BuiltInAction::OpenMarked) => self.open_marked(),
             MenuCommand::BuiltIn(BuiltInAction::CopyMarked) => self.copy_marked(),
             MenuCommand::BuiltIn(BuiltInAction::TrashMarked) => self.trash_marked(),
@@ -695,6 +751,7 @@ impl App {
             MenuCommand::Custom(index) => self.run_custom_action(index),
             MenuCommand::ClearMarks => self.clear_marks(),
         }
+        self.close_menu();
     }
 
     fn set_message(&mut self, message: String) {
@@ -716,6 +773,14 @@ impl App {
     }
 
     fn matched_line(&self, path: &str) -> Option<u64> {
+        if let Some(snapshot) = &self.menu_snapshot {
+            return snapshot
+                .selected
+                .as_ref()
+                .filter(|row| row.path == path)
+                .or_else(|| snapshot.marked.iter().find(|row| row.path == path))
+                .and_then(|row| row.line_number);
+        }
         self.visible_selected_row()
             .filter(|row| row.path == path)
             .or_else(|| {
@@ -835,23 +900,18 @@ impl App {
     /// Copies the visible marked paths to the clipboard, newline-joined.
     fn copy_marked(&mut self) {
         let paths = self.visible_marked();
-        let message = if paths.is_empty() {
-            "no visible marked files".to_string()
+        if paths.is_empty() {
+            self.set_message("no visible marked files".into());
         } else {
-            match actions::copy(&paths.join("\n")) {
-                Ok(()) => format!("copied {} paths", paths.len()),
-                Err(error) => format!("error copying {} paths: {error}", paths.len()),
-            }
-        };
-        self.set_message(message);
+            self.copy_async(paths.join("\n"), format!("copied {} paths", paths.len()));
+        }
     }
 
     /// Moves every visible marked row to the trash, continuing after failures
     /// and reporting the first failure with the success count.
     fn trash_marked(&mut self) {
         let paths = self.visible_marked();
-        let outcome = run_batch(&paths, actions::trash);
-        self.set_message(batch_summary("trashed", paths.len(), &outcome));
+        self.trash_async(paths);
     }
 
     fn transfer_summary(verb: &str, outcome: &actions::TransferOutcome, total: usize) -> String {
@@ -1025,6 +1085,14 @@ impl App {
         }
     }
 
+    fn save_session(&self, path: &std::path::Path, remember: bool, clean_exit: bool) {
+        // Filter mode uses a special hidden-preview default; never let that
+        // overwrite an ordinary file-search session's layout or density.
+        if remember && clean_exit && !self.engine.is_filter() {
+            crate::session::save(path, self.preview_layout.key(), self.density.key());
+        }
+    }
+
     fn configure_history(&mut self, enabled: bool) {
         self.history.enabled = enabled;
         self.history.pos = None;
@@ -1121,7 +1189,7 @@ impl App {
         if let Some(selected) = self.menu {
             let entries = self.menu_entries();
             match key.code {
-                KeyCode::Esc | KeyCode::Left => self.menu = None,
+                KeyCode::Esc | KeyCode::Left => self.close_menu(),
                 KeyCode::Down => self.menu = Some((selected + 1) % entries.len()),
                 KeyCode::Up => {
                     self.menu = Some((selected + entries.len() - 1) % entries.len());
@@ -1201,7 +1269,7 @@ impl App {
             crate::keymap::Action::Open => return self.activate_selected(),
             crate::keymap::Action::Menu => {
                 if !self.engine.is_filter() && self.visible_selected_row().is_some() {
-                    self.menu = Some(0);
+                    self.open_menu();
                 }
             }
             crate::keymap::Action::QuickLook => {
@@ -1209,7 +1277,7 @@ impl App {
                     self.act(actions::quick_look, "quick look");
                 }
             }
-            crate::keymap::Action::CopyPath => self.act(actions::copy, "copied"),
+            crate::keymap::Action::CopyPath => self.copy_selected(),
             crate::keymap::Action::Reveal => {
                 if !self.engine.is_filter() {
                     self.act(actions::reveal, "revealed");
@@ -1379,10 +1447,7 @@ impl App {
         };
         // the calculator's "path" is the result — enter copies it
         if self.engine.mode() == Mode::Calc {
-            self.set_message(match actions::copy(&path) {
-                Ok(()) => format!("copied: {path}"),
-                Err(error) => format!("error: {error}"),
-            });
+            self.copy_async(path.clone(), format!("copied: {path}"));
             return;
         }
         let enter_action = use_enter_action
@@ -1472,6 +1537,25 @@ impl App {
             }
             return true;
         }
+        // All mouse events belong to the popup, regardless of pointer pane.
+        // In particular, wheel events must not move the underlying target.
+        if let Some(selected) = self.menu {
+            let len = self.menu_entries().len();
+            match ev.kind {
+                MouseEventKind::ScrollDown if len > 0 => self.menu = Some((selected + 1) % len),
+                MouseEventKind::ScrollUp if len > 0 => self.menu = Some((selected + len - 1) % len),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.menu_inner.contains(point) {
+                        let entry = self.menu_offset + (point.y - self.menu_inner.y) as usize;
+                        self.run_menu_action(entry);
+                    } else {
+                        self.close_menu();
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
         match ev.kind {
             MouseEventKind::ScrollDown => {
                 if self.hit_test.results_area.contains(point) {
@@ -1487,21 +1571,10 @@ impl App {
                     self.preview.scroll = self.preview.scroll.saturating_sub(3);
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                // a left click outside the popup closes it; one on an entry
-                // activates that entry (border rows just close)
-                if self.menu.is_some() {
-                    if self.menu_inner.contains(point) {
-                        let entry = self.menu_offset + (point.y - self.menu_inner.y) as usize;
-                        self.run_menu_action(entry);
-                    } else {
-                        self.menu = None;
-                    }
-                    return true;
-                }
-                if self.hit_test.results_area.contains(point) {
-                    return self.click_results(ev.row);
-                }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.hit_test.results_area.contains(point) =>
+            {
+                return self.click_results(ev.row);
             }
             _ => {}
         }
@@ -1662,20 +1735,13 @@ impl App {
         }
     }
 
-    /// Refreshes the status line's stat cache when the selection changed.
-    /// Runs in the event loop so the draw pass never touches the filesystem.
+    /// Queue/poll selection metadata without filesystem I/O on the UI thread,
+    /// including when the preview is hidden. Filter/calc rows are not paths.
     fn refresh_status(&mut self) {
-        let Some(path) = self.visible_selected_row().map(|row| row.path.clone()) else {
-            self.status.path.clear();
-            self.status.meta = None;
-            return;
-        };
-        if self.status.path != path {
-            self.status.path = path.clone();
-            self.status.meta = std::fs::metadata(&path)
-                .ok()
-                .map(|meta| (meta.is_file(), meta.len(), meta.modified().ok()));
-        }
+        let path = (!self.engine.is_filter() && self.engine.mode() != Mode::Calc)
+            .then(|| self.visible_selected_row().map(|row| row.path.clone()))
+            .flatten();
+        self.status.refresh(path);
     }
 }
 
@@ -1979,6 +2045,7 @@ pub fn run(
         // side effects stay out of the draw pass: apply worker results,
         // issue new preview loads, and stat the selected path here
         app.poll_transfer();
+        app.poll_action();
         app.poll_preview();
         app.load_preview();
         app.refresh_status();
@@ -2021,21 +2088,23 @@ pub fn run(
             }
         }
     };
-    // Cancel before dropping the job; join only waits for the current file.
-    drop(app.transfer_job.take());
+    // Restore terminal state before joining any worker. Actions kill/reap
+    // their current subprocess on cancellation; transfers finish the current
+    // filesystem operation before stopping between files.
     guard.restore();
-    if remember_session && result.is_ok() {
-        // only a clean quit updates the saved settings; errors leave them alone
-        crate::session::save(
-            &crate::session::default_state_path(),
-            app.preview_layout.key(),
-            app.density.key(),
-        );
-    }
+    drop(app.action_job.take());
+    drop(app.transfer_job.take());
+    app.save_session(
+        &crate::session::default_state_path(),
+        remember_session,
+        result.is_ok(),
+    );
     result.map(|_| app.picked)
 }
 
+mod action_job;
 mod chrome;
+mod metadata;
 mod preview;
 mod rows;
 mod saved;

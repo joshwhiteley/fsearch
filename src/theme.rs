@@ -250,6 +250,7 @@ pub fn resolve_config(cfg: &crate::config::ThemeConfig) -> Theme {
         theme.section = Some(color);
     }
     match cfg.borders.as_deref() {
+        Some("sharp") => theme.borders = BorderKind::Sharp,
         Some("rounded") => theme.borders = BorderKind::Rounded,
         Some("none") => theme.borders = BorderKind::None,
         _ => {} // unknown → keep the preset's border style
@@ -294,6 +295,16 @@ mod tests {
         assert_eq!(t.dim, Color::Rgb(0xa9, 0xb1, 0xd6));
         assert_eq!(t.selection_bg, Some(Color::Rgb(0x28, 0x34, 0x57)));
         assert_eq!(t.match_fg, Some(Color::Rgb(0x7a, 0xa2, 0xf7)));
+    }
+
+    #[test]
+    fn explicit_sharp_overrides_forge_rounded_default() {
+        let cfg = crate::config::ThemeConfig {
+            preset: "forge".into(),
+            borders: Some("sharp".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_config(&cfg).borders, BorderKind::Sharp);
     }
 
     #[test]

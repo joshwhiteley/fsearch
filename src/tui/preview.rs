@@ -1,5 +1,5 @@
 use super::chrome::themed_block;
-use super::rows::{kind_label, path_name, row_age, shorten_home};
+use super::rows::{display_path_parts, kind_label, row_age, shorten_home};
 use super::{App, PREVIEW_BYTES};
 use crate::highlight::{self, Appearance};
 use crate::images;
@@ -568,7 +568,7 @@ pub(super) fn directory_listing(path: &str, accent: Color) -> Vec<Line<'static>>
 /// kind:, changed:, ...) turn yellow. Concatenating the span contents
 /// reproduces `input` exactly, so the cursor math below stays valid.
 fn preview_meta(app: &App) -> Option<FileMeta> {
-    let row = app.engine.results().get(app.selected)?;
+    let row = app.visible_selected_row()?;
     if let Some(m) = row.meta {
         return Some(m);
     }
@@ -591,10 +591,9 @@ pub fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     // 2-line header: dim parent path + bold filename, then a dim
     // kind · size · age line (with pixel dims for images, line count for text)
-    if let Some(row) = app.engine.results().get(app.selected) {
+    if let Some(row) = app.visible_selected_row() {
         let shown = shorten_home(&row.path);
-        let name = path_name(&row.path);
-        let parent = shown[..shown.len() - name.len()].to_string();
+        let (parent, name) = display_path_parts(&shown);
         let dim = Style::default().fg(app.theme.dim);
         let bold = Style::default().add_modifier(Modifier::BOLD);
         frame.render_widget(
