@@ -4,7 +4,9 @@ use crate::quiet::Quiet;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilenameMode {
@@ -67,6 +69,37 @@ pub fn search_boosted(
             lines: false,
         },
         quiet,
+        None,
+    )
+    .map(|result| result.expect("uncancelled search cannot be cancelled"))
+}
+
+/// Like [`search_boosted`], but drops work when a newer engine generation is
+/// published. The existing search functions remain synchronous and unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn search_boosted_generation(
+    store: &PathStore,
+    query: &str,
+    mode: FilenameMode,
+    limit: usize,
+    boosts: &HashMap<String, u32>,
+    filters: &Filters,
+    quiet: &Quiet,
+    generation: u64,
+    current_generation: &AtomicU64,
+) -> Result<Option<Ranked>, String> {
+    search_with_scope(
+        store,
+        query,
+        mode,
+        limit,
+        boosts,
+        MatchScope {
+            filters,
+            lines: false,
+        },
+        quiet,
+        Some((generation, current_generation)),
     )
 }
 
@@ -90,6 +123,32 @@ pub fn search_lines(
             lines: true,
         },
         &Quiet::new(Vec::new()),
+        None,
+    )
+    .map(|result| result.expect("uncancelled search cannot be cancelled"))
+}
+
+pub fn search_lines_generation(
+    store: &PathStore,
+    query: &str,
+    mode: FilenameMode,
+    limit: usize,
+    filters: &Filters,
+    generation: u64,
+    current_generation: &AtomicU64,
+) -> Result<Option<Ranked>, String> {
+    search_with_scope(
+        store,
+        query,
+        mode,
+        limit,
+        &HashMap::new(),
+        MatchScope {
+            filters,
+            lines: true,
+        },
+        &Quiet::new(Vec::new()),
+        Some((generation, current_generation)),
     )
 }
 
@@ -99,6 +158,7 @@ struct MatchScope<'a> {
     lines: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_with_scope(
     store: &PathStore,
     query: &str,
@@ -107,19 +167,31 @@ fn search_with_scope(
     boosts: &HashMap<String, u32>,
     scope: MatchScope<'_>,
     quiet: &Quiet,
-) -> Result<Ranked, String> {
+    generation: Option<(u64, &AtomicU64)>,
+) -> Result<Option<Ranked>, String> {
     let filters = scope.filters;
+    if cancelled(generation) {
+        return Ok(None);
+    }
     // a `/` in the query, a path: filter, or dir: means the user is
     // navigating paths on purpose — quiet demotion switches off
     let path_intent = query.contains('/') || !filters.path_terms.is_empty() || filters.dirs_only;
     let demote = (!quiet.is_empty() && !path_intent).then_some(quiet);
     if query.is_empty() {
-        return Ok(head_with_boosts(store, limit, boosts, scope, demote));
+        return Ok(head_with_boosts(
+            store, limit, boosts, scope, demote, generation,
+        ));
     }
     match mode {
-        FilenameMode::Fuzzy => Ok(fuzzy(store, query, limit, boosts, scope, demote)),
-        FilenameMode::Regex => regex_filter(store, query, limit, boosts, scope),
+        FilenameMode::Fuzzy => Ok(fuzzy(
+            store, query, limit, boosts, scope, demote, generation,
+        )),
+        FilenameMode::Regex => regex_filter(store, query, limit, boosts, scope, generation),
     }
+}
+
+fn cancelled(generation: Option<(u64, &AtomicU64)>) -> bool {
+    generation.is_some_and(|(job, current)| current.load(Ordering::Acquire) != job)
 }
 
 fn passes(store: &PathStore, i: usize, scope: MatchScope<'_>) -> bool {
@@ -162,7 +234,8 @@ fn head_with_boosts(
     boosts: &HashMap<String, u32>,
     scope: MatchScope<'_>,
     demote: Option<&Quiet>,
-) -> Ranked {
+    generation: Option<(u64, &AtomicU64)>,
+) -> Option<Ranked> {
     // frecency-boosted entries first (opening something is an explicit
     // signal, quiet or not), then plain entries newest-first; quiet paths
     // sink into a trailing block behind the weaker-matches fold, which
@@ -170,10 +243,17 @@ fn head_with_boosts(
     let mut out: Vec<usize> = Vec::new();
     let mut in_boosted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if !boosts.is_empty() {
-        let mut boosted: Vec<(u32, usize)> = (0..store.len())
-            .filter(|&i| passes(store, i, scope))
-            .filter_map(|i| boosts.get(store.get(i)).map(|&b| (b, i)))
-            .collect();
+        let mut boosted: Vec<(u32, usize)> = Vec::new();
+        for i in 0..store.len() {
+            if i % CHUNK == 0 && cancelled(generation) {
+                return None;
+            }
+            if passes(store, i, scope)
+                && let Some(&b) = boosts.get(store.get(i))
+            {
+                boosted.push((b, i));
+            }
+        }
         boosted.sort_by_key(|&(b, i)| (std::cmp::Reverse(b), i));
         out.extend(boosted.iter().map(|&(_, i)| i));
         in_boosted.extend(out.iter().copied());
@@ -181,6 +261,9 @@ fn head_with_boosts(
     let mut normal: Vec<usize> = Vec::new();
     let mut quiet_tail: Vec<usize> = Vec::new();
     for i in 0..store.len() {
+        if i % CHUNK == 0 && cancelled(generation) {
+            return None;
+        }
         if normal.len() >= limit {
             break;
         }
@@ -199,10 +282,10 @@ fn head_with_boosts(
     let strong = out.len().min(limit);
     out.extend(quiet_tail);
     out.truncate(limit);
-    Ranked {
+    Some(Ranked {
         indices: out,
         strong,
-    }
+    })
 }
 
 fn apply_boost_order(hits: &mut [usize], store: &PathStore, boosts: &HashMap<String, u32>) {
@@ -266,6 +349,96 @@ fn last_two_segments(path: &str) -> Option<&str> {
     Some(&path[pair_start..])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Candidate {
+    score: u32,
+    index: usize,
+    quiet: bool,
+}
+
+/// The heap keeps the worst retained candidate at its top. This bounds the
+/// ranking allocation to the requested result count while the final sort
+/// still uses the exact old score/index order.
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.quiet
+            .cmp(&other.quiet)
+            .then_with(|| other.score.cmp(&self.score))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct TopK {
+    cap: usize,
+    heap: BinaryHeap<Candidate>,
+}
+
+impl TopK {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            heap: BinaryHeap::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, candidate: Candidate) {
+        if self.cap == 0 {
+            return;
+        }
+        if self.heap.len() < self.cap {
+            self.heap.push(candidate);
+        } else if self.heap.peek().is_some_and(|worst| candidate < *worst) {
+            let _ = self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        for candidate in other.heap {
+            self.push(candidate);
+        }
+    }
+
+    fn into_sorted(self) -> Vec<Candidate> {
+        let mut candidates = self.heap.into_vec();
+        candidates.sort_unstable_by(|a, b| {
+            a.quiet
+                .cmp(&b.quiet)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        candidates
+    }
+}
+
+struct FuzzyAccum {
+    matcher: Matcher,
+    buf: Vec<char>,
+    top: TopK,
+    processed: usize,
+    cancelled: bool,
+}
+
+impl FuzzyAccum {
+    fn new(limit: usize) -> Self {
+        let mut cfg = Config::DEFAULT;
+        cfg.set_match_paths();
+        Self {
+            matcher: Matcher::new(cfg),
+            buf: Vec::new(),
+            top: TopK::new(limit),
+            processed: 0,
+            cancelled: false,
+        }
+    }
+}
+
 fn fuzzy(
     store: &PathStore,
     query: &str,
@@ -273,37 +446,44 @@ fn fuzzy(
     boosts: &HashMap<String, u32>,
     scope: MatchScope<'_>,
     demote: Option<&Quiet>,
-) -> Ranked {
+    generation: Option<(u64, &AtomicU64)>,
+) -> Option<Ranked> {
     let filters = scope.filters;
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let multi_word = query.split_whitespace().count() > 1;
-    let mut scored: Vec<(u32, usize)> = (0..store.len())
+    let accumulated = (0..store.len())
         .into_par_iter()
         .with_min_len(CHUNK)
         .fold(
-            || {
-                let mut cfg = Config::DEFAULT;
-                cfg.set_match_paths();
-                (Matcher::new(cfg), Vec::new(), Vec::new())
-            },
-            |(mut matcher, mut buf, mut acc), i| {
+            || FuzzyAccum::new(limit),
+            |mut acc, i| {
+                if acc.cancelled {
+                    return acc;
+                }
+                if acc.processed % CHUNK == 0 && cancelled(generation) {
+                    acc.cancelled = true;
+                    return acc;
+                }
+                acc.processed += 1;
                 if passes_fuzzy(store, i, scope) {
                     let path = store.get(i);
                     let is_dir = !scope.lines && path.ends_with('/');
-                    if let Some(score) = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)
+                    if let Some(score) =
+                        pattern.score(Utf32Str::new(path, &mut acc.buf), &mut acc.matcher)
                     {
                         // A directory is useful only when its own name matches,
                         // rather than merely inheriting a match from an ancestor.
                         // Path-intent and dir: queries retain full-path matching.
                         let name = last_segment(path);
-                        let name_score = pattern.score(Utf32Str::new(name, &mut buf), &mut matcher);
+                        let name_score =
+                            pattern.score(Utf32Str::new(name, &mut acc.buf), &mut acc.matcher);
                         if is_dir
                             && !filters.dirs_only
                             && filters.path_terms.is_empty()
                             && !query.contains('/')
                             && name_score.is_none()
                         {
-                            return (matcher, buf, acc);
+                            return acc;
                         }
                         // a query that also matches within the filename alone is far more
                         // likely what the user meant than letters scattered across the path;
@@ -315,7 +495,8 @@ fn fuzzy(
                         let pair_bonus = if multi_word && !is_dir {
                             last_two_segments(path)
                                 .and_then(|pair| {
-                                    pattern.score(Utf32Str::new(pair, &mut buf), &mut matcher)
+                                    pattern
+                                        .score(Utf32Str::new(pair, &mut acc.buf), &mut acc.matcher)
                                 })
                                 .map_or(0, |pair_score| pair_score / 2)
                         } else {
@@ -329,52 +510,60 @@ fn fuzzy(
                         if demote.is_some_and(|q| q.is_quiet(path)) {
                             total = total * 2 / 5;
                         }
-                        acc.push((total, i));
+                        acc.top.push(Candidate {
+                            score: total,
+                            index: i,
+                            quiet: demote.is_some_and(|q| q.is_quiet(path)),
+                        });
                     }
                 }
-                (matcher, buf, acc)
+                acc
             },
         )
-        .map(|(_, _, acc)| acc)
-        .reduce(Vec::new, |mut a, mut b| {
-            a.append(&mut b);
-            a
-        });
-    scored.par_sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        .reduce(
+            || FuzzyAccum::new(limit),
+            |mut a, b| {
+                a.cancelled |= b.cancelled;
+                a.top.merge(b.top);
+                a
+            },
+        );
+    if accumulated.cancelled || cancelled(generation) {
+        return None;
+    }
+    let scored = accumulated.top.into_sorted();
     // Because filename matches score roughly double (change 1), a "best / 2"
     // floor self-regulates: when a real filename match exists, scattered
     // path-only matches fall below it and disappear; when nothing matches the
     // filename, all candidates score within range of each other and survive.
-    let floor_strong = |scored: &[(u32, usize)]| {
+    let floor_strong = |scored: &[Candidate]| {
         let mut s = 0;
-        if let Some(&(best, _)) = scored.first() {
-            let floor = best / 2;
-            s = scored.partition_point(|&(v, _)| v >= floor);
+        if let Some(&best) = scored.first() {
+            let floor = best.score / 2;
+            s = scored.partition_point(|candidate| candidate.score >= floor);
             s = s.max(MIN_KEEP.min(scored.len()));
         }
         s
     };
-    // Quiet paths fold behind the weak-match row whenever a louder,
-    // non-quiet match exists — regardless of MIN_KEEP. This keeps log and
-    // app-internal churn out of the default view while staying reachable
-    // via ctrl-x. Path-intent queries (demote = None) skip this entirely.
-    let mut strong;
-    if let Some(q) = demote {
-        // stable partition: non-quiet first, score order preserved within
-        scored.sort_by_key(|&(_, i)| q.is_quiet(store.get(i)));
-        let nq = scored.partition_point(|&(_, i)| !q.is_quiet(store.get(i)));
-        if nq > 0 && nq < scored.len() {
-            strong = floor_strong(&scored[..nq]);
+    // The top-k comparator already performs the stable quiet partition. The
+    // selected prefix is sufficient to compute the visible fold: if more
+    // candidates existed, truncating to `limit` would cap `strong` there too.
+    let non_quiet = scored.partition_point(|candidate| !candidate.quiet);
+    let strong = if demote.is_some() {
+        if non_quiet > 0 {
+            floor_strong(&scored[..non_quiet])
         } else {
-            strong = floor_strong(&scored);
+            floor_strong(&scored)
         }
     } else {
-        strong = floor_strong(&scored);
+        floor_strong(&scored)
     }
-    scored.truncate(limit);
-    strong = strong.min(scored.len());
-    let indices = scored.into_iter().map(|(_, i)| i).collect();
-    Ranked { indices, strong }
+    .min(scored.len());
+    let indices = scored
+        .into_iter()
+        .map(|candidate| candidate.index)
+        .collect();
+    Some(Ranked { indices, strong })
 }
 
 fn regex_filter(
@@ -383,7 +572,8 @@ fn regex_filter(
     limit: usize,
     boosts: &HashMap<String, u32>,
     scope: MatchScope<'_>,
-) -> Result<Ranked, String> {
+    generation: Option<(u64, &AtomicU64)>,
+) -> Result<Option<Ranked>, String> {
     let smart_case_insensitive = !query.chars().any(|c| c.is_uppercase());
     let re = regex::RegexBuilder::new(query)
         .case_insensitive(smart_case_insensitive)
@@ -392,16 +582,23 @@ fn regex_filter(
     let mut hits: Vec<usize> = (0..store.len())
         .into_par_iter()
         .with_min_len(CHUNK)
-        .filter(|&i| passes(store, i, scope) && re.is_match(store.get(i)))
+        .filter(|&i| {
+            (i % CHUNK != 0 || !cancelled(generation))
+                && passes(store, i, scope)
+                && re.is_match(store.get(i))
+        })
         .collect();
+    if cancelled(generation) {
+        return Ok(None);
+    }
     hits.sort_unstable();
     apply_boost_order(&mut hits, store, boosts);
     hits.truncate(limit);
     let strong = hits.len();
-    Ok(Ranked {
+    Ok(Some(Ranked {
         indices: hits,
         strong,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -825,6 +1022,135 @@ mod tests {
                 .indices
                 .len(),
             5
+        );
+    }
+
+    #[test]
+    fn bounded_fuzzy_order_matches_full_sort_oracle() {
+        let mut owned: Vec<String> = (0..240)
+            .map(|i| match i % 6 {
+                0 => format!("/docs/project-{i}/report-{i}.md"),
+                1 => format!("/Users/j/Library/state/report-{i}.json"),
+                2 => format!("/misc/archive/re-pair-{i}.txt"),
+                3 => format!("/docs/é/{i}/résumé-{i}.md"),
+                4 => format!("/noise-{i}/support/notes.txt"),
+                _ => format!("/docs/report-{i}.bak/"),
+            })
+            .collect();
+        owned.extend([
+            "/docs/report-final.md".to_string(),
+            "/Users/j/Library/report-final.json".to_string(),
+            "/docs/project-final/README.md".to_string(),
+        ]);
+        let path_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let store = paths(&path_refs);
+        let mut boosts = HashMap::new();
+        boosts.insert("/docs/report-final.md".to_string(), 50);
+        boosts.insert("/misc/archive/re-pair-2.txt".to_string(), 50);
+        let quiet = Quiet::default();
+        let actual = search_boosted(
+            &store,
+            "report",
+            FilenameMode::Fuzzy,
+            17,
+            &boosts,
+            &Filters::default(),
+            &quiet,
+        )
+        .unwrap();
+
+        let pattern = Pattern::parse("report", CaseMatching::Smart, Normalization::Smart);
+        let mut cfg = Config::DEFAULT;
+        cfg.set_match_paths();
+        let mut matcher = Matcher::new(cfg);
+        let mut buf = Vec::new();
+        let mut scored = Vec::new();
+        for i in 0..store.len() {
+            let filters = Filters::default();
+            if !passes_fuzzy(
+                &store,
+                i,
+                MatchScope {
+                    filters: &filters,
+                    lines: false,
+                },
+            ) {
+                continue;
+            }
+            let path = store.get(i);
+            let Some(score) = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher) else {
+                continue;
+            };
+            let name = last_segment(path);
+            let name_score = pattern.score(Utf32Str::new(name, &mut buf), &mut matcher);
+            let is_dir = path.ends_with('/');
+            if is_dir && name_score.is_none() {
+                continue;
+            }
+            let boost = boosts.get(path).copied().unwrap_or(0);
+            let quiet_hit = quiet.is_quiet(path);
+            let mut total = score + name_score.unwrap_or(0) + boost;
+            if quiet_hit {
+                total = total * 2 / 5;
+            }
+            scored.push(Candidate {
+                score: total,
+                index: i,
+                quiet: quiet_hit,
+            });
+        }
+        scored.sort_unstable_by(|a, b| {
+            a.quiet
+                .cmp(&b.quiet)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        let non_quiet = scored.partition_point(|candidate| !candidate.quiet);
+        let floor = |candidates: &[Candidate]| {
+            candidates
+                .partition_point(|candidate| {
+                    candidate.score >= candidates.first().map_or(0, |best| best.score / 2)
+                })
+                .max(MIN_KEEP.min(candidates.len()))
+        };
+        let strong = if non_quiet > 0 {
+            floor(&scored[..non_quiet])
+        } else {
+            floor(&scored)
+        };
+        scored.truncate(17);
+        let expected = Ranked {
+            indices: scored.iter().map(|candidate| candidate.index).collect(),
+            strong: strong.min(scored.len()),
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stale_generation_is_cancelled_without_changing_legacy_api() {
+        let store = paths(&["/a/report.txt", "/b/report.txt"]);
+        let current = AtomicU64::new(2);
+        assert!(
+            search_boosted_generation(
+                &store,
+                "report",
+                FilenameMode::Fuzzy,
+                10,
+                &HashMap::new(),
+                &Filters::default(),
+                &Quiet::new(Vec::new()),
+                1,
+                &current,
+            )
+            .unwrap()
+            .is_none()
+        );
+        current.store(1, Ordering::Release);
+        assert!(
+            !search(&store, "report", FilenameMode::Fuzzy, 10)
+                .unwrap()
+                .indices
+                .is_empty()
         );
     }
 }
