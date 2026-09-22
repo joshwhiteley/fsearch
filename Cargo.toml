@@ -63,7 +63,7 @@ tar = { version = "0.4", default-features = false }
 terminal-colorsaurus = "1"
 toml = "1"
 two-face = "0.5"
-zip = { version = "7", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [features]
 # Sharper cell-art image previews for terminals without a graphics protocol.
