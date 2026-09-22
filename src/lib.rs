@@ -4,6 +4,7 @@ pub mod cellart;
 pub mod cli;
 pub mod config;
 pub mod content;
+mod document_cache;
 pub mod engine;
 pub mod filters;
 pub mod frecency;
@@ -16,6 +17,8 @@ pub mod matcher;
 pub mod office;
 pub mod output;
 pub mod pdf;
+#[doc(hidden)]
+pub mod pdf_process;
 pub mod query;
 pub mod quiet;
 pub mod sem;

@@ -1,14 +1,11 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// PDF extraction reads and parses the whole file; skip anything larger.
 pub const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Upper bound on cached extracted texts; oldest entries are evicted.
-pub const MAX_PDF_CACHE_FILES: usize = 4096;
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub const MAX_PDF_CACHE_FILES: usize = crate::document_cache::MAX_FILES;
 
 pub fn is_pdf_path(path: &str) -> bool {
     Path::new(path)
@@ -48,36 +45,30 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
     path.hash(&mut hasher);
     let key = format!("{:016x}-{mtime}-{}.txt", hasher.finish(), meta.len());
     let cached = cache_dir.join(&key);
-    if let Ok(text) = std::fs::read_to_string(&cached) {
+    crate::document_cache::evict(
+        cache_dir,
+        false,
+        crate::document_cache::MAX_TOTAL_BYTES,
+        MAX_PDF_CACHE_FILES,
+    );
+    if let Some(text) = crate::document_cache::read(&cached, crate::document_cache::MAX_ENTRY_BYTES)
+    {
         return Ok(text);
     }
     // failures are cached too, so a PDF that crashes or defeats the parser
     // is attempted once — not re-parsed (and re-panicked) on every search
     let cached_err = cache_dir.join(format!("{key}.err"));
-    if let Ok(msg) = std::fs::read_to_string(&cached_err) {
+    if let Some(msg) =
+        crate::document_cache::read(&cached_err, crate::document_cache::MAX_ERROR_BYTES)
+    {
         return Err(msg);
     }
-    let result = extract(path);
+    let result = crate::pdf_process::extract(path);
     let (target, body) = match &result {
         Ok(text) => (&cached, text.as_str()),
         Err(e) => (&cached_err, e.as_str()),
     };
-    // write to a pid + counter unique temp then rename, so concurrent
-    // threads and instances never observe a half-written cache entry; a
-    // failed write is removed rather than renamed into place, so a disk-full
-    // event can't publish truncated text as a cache hit
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = cache_dir.join(format!(".{key}.{}-{nonce}.tmp", std::process::id()));
-    if let Ok(mut file) = crate::util::create_private_file(&tmp) {
-        use std::io::Write;
-        let written = file
-            .write_all(body.as_bytes())
-            .and_then(|_| std::fs::rename(&tmp, target));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    evict_oldest(cache_dir);
+    crate::document_cache::store(cache_dir, target, body, false);
     result
 }
 
@@ -85,56 +76,20 @@ thread_local! {
     static IN_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// True while [`extract`] is running its panic-guarded parser on this
+/// True while the isolated helper is running its panic-guarded parser on this
 /// thread. Panic hooks check it so caught pdf-extract panics stay silent
 /// instead of spraying over the UI (or tearing the terminal down).
 pub fn in_extract_guard() -> bool {
     IN_GUARD.with(|g| g.get())
 }
 
-/// Keeps the cache from growing without bound: on a miss, removes the oldest
-/// entries (by modified time) until only MAX_PDF_CACHE_FILES remain.
-fn evict_oldest(cache_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return;
-    };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            Some((meta.modified().ok()?, e.path()))
-        })
-        .collect();
-    if files.len() <= MAX_PDF_CACHE_FILES {
-        return;
-    }
-    files.sort_by_key(|(m, _)| *m);
-    let excess = files.len() - MAX_PDF_CACHE_FILES;
-    for (_, path) in files.into_iter().take(excess) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// pdf-extract is known to panic on malformed files; contain that.
-fn extract(path: &str) -> Result<String, String> {
-    use std::io::Read;
-    let file = crate::util::open_regular_file(Path::new(path)).map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    file.take(MAX_PDF_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_PDF_BYTES {
-        return Err("PDF grew beyond the input-size limit".into());
-    }
+pub(crate) fn parse(bytes: &[u8]) -> Result<String, String> {
     IN_GUARD.with(|g| g.set(true));
-    let result = std::panic::catch_unwind(move || {
-        pdf_extract::extract_text_from_mem(&bytes).map_err(|e| e.to_string())
+    let result = std::panic::catch_unwind(|| {
+        pdf_extract::extract_text_from_mem(bytes).map_err(|e| e.to_string())
     });
     IN_GUARD.with(|g| g.set(false));
-    result.unwrap_or_else(|_| Err("pdf parser crashed on this file".to_string()))
+    result.unwrap_or_else(|_| Err("pdf parser crashed on this file".into()))
 }
 
 /// A minimal single-page PDF containing `text`, for tests.

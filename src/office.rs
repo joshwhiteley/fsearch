@@ -8,7 +8,6 @@ use quick_xml::events::{BytesText, Event};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use zip::ZipArchive;
 
 /// Refuse large containers before opening or decompressing them.
@@ -16,8 +15,6 @@ pub const MAX_OFFICE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_ZIP_ENTRIES: usize = 4096;
 const MAX_XML_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_CACHE_FILES: usize = 4096;
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static IN_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -79,11 +76,20 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
         .hash(&mut hasher);
     let key = format!("office-{:016x}-{mtime}-{}.txt", hasher.finish(), meta.len());
     let cached = cache_dir.join(&key);
-    if let Ok(text) = std::fs::read_to_string(&cached) {
+    crate::document_cache::evict(
+        cache_dir,
+        true,
+        crate::document_cache::MAX_TOTAL_BYTES,
+        crate::document_cache::MAX_FILES,
+    );
+    if let Some(text) = crate::document_cache::read(&cached, crate::document_cache::MAX_ENTRY_BYTES)
+    {
         return Ok(text);
     }
     let cached_err = cache_dir.join(format!("{key}.err"));
-    if let Ok(message) = std::fs::read_to_string(&cached_err) {
+    if let Some(message) =
+        crate::document_cache::read(&cached_err, crate::document_cache::MAX_ERROR_BYTES)
+    {
         return Err(message);
     }
 
@@ -101,20 +107,7 @@ pub fn extract_cached(path: &str, cache_dir: &Path) -> Result<String, String> {
         Ok(text) => (&cached, text.as_str()),
         Err(message) => (&cached_err, message.as_str()),
     };
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = cache_dir.join(format!(".{key}.{}-{nonce}.tmp", std::process::id()));
-    // a failed write is removed rather than renamed into place, so a
-    // disk-full event can't publish truncated text as a cache hit
-    if let Ok(mut file) = crate::util::create_private_file(&tmp) {
-        use std::io::Write;
-        let written = file
-            .write_all(body.as_bytes())
-            .and_then(|_| std::fs::rename(&tmp, target));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    evict_oldest(cache_dir);
+    crate::document_cache::store(cache_dir, target, body, true);
     result
 }
 
@@ -306,6 +299,10 @@ fn parse_shared_strings(xml: &[u8]) -> Result<Vec<String>, String> {
             Ok(Event::Text(event)) if in_text => current.push_str(&xml_text(&event)?),
             Ok(Event::CData(event)) if in_text => current.push_str(&xml_cdata(&event)?),
             Ok(Event::GeneralRef(event)) if in_text => current.push_str(&xml_ref(&event)?),
+            Ok(Event::Empty(event)) if local_name(event.name().as_ref()) == b"si" => {
+                // Empty entries still occupy a shared-string index.
+                strings.push(String::new());
+            }
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
                 b"t" => in_text = false,
                 b"si" if in_si => {
@@ -457,31 +454,6 @@ fn local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|b| *b == b':').next().unwrap_or(name)
 }
 
-fn evict_oldest(cache_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return;
-    };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?;
-            if !name.starts_with("office-") || !entry.metadata().ok()?.is_file() {
-                return None;
-            }
-            Some((entry.metadata().ok()?.modified().ok()?, path))
-        })
-        .collect();
-    if files.len() <= MAX_CACHE_FILES {
-        return;
-    }
-    files.sort_by_key(|(modified, _)| *modified);
-    let excess = files.len() - MAX_CACHE_FILES;
-    for (_, path) in files.into_iter().take(excess) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +509,20 @@ mod tests {
         let text = extract_cached(file.to_str().unwrap(), &dir.path().join("cache")).unwrap();
         assert!(text.contains("Annual report\tNeedle inline"));
         assert!(text.contains("Needle value\t42"));
+    }
+
+    #[test]
+    fn empty_shared_strings_preserve_xlsx_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.xlsx");
+        std::fs::write(&file, zip_bytes(&[
+            ("xl/sharedStrings.xml", r#"<sst xmlns:s="x"><si/><si><t>middle</t></si><s:si/><si><t>last</t></si></sst>"#),
+            ("xl/worksheets/sheet1.xml", r#"<worksheet><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c><c t="s"><v>2</v></c><c t="s"><v>3</v></c></row></sheetData></worksheet>"#),
+        ])).unwrap();
+        assert_eq!(
+            extract_cached(file.to_str().unwrap(), &dir.path().join("cache")).unwrap(),
+            "\tmiddle\t\tlast\n"
+        );
     }
 
     #[test]
