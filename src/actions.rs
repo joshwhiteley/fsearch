@@ -845,9 +845,15 @@ mod tests {
         ];
         copy_with_commands(&input, backends, Duration::from_secs(1)).unwrap();
         assert_eq!(std::fs::read_to_string(output).unwrap(), input);
-        let error = copy_with_commands("value", &[&["sh", "-c", "exit 9"]], Duration::from_secs(1))
-            .unwrap_err();
-        assert!(error.to_string().contains("exited"));
+        // Drain stdin first: an immediate exit can race the writer and report
+        // BrokenPipe instead of the exit-status error this assertion targets.
+        let error = copy_with_commands(
+            "value",
+            &[&["sh", "-c", "cat >/dev/null; exit 9"]],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exited"), "{error}");
     }
 
     #[test]
