@@ -131,19 +131,21 @@ fn content(
                     && query_filters.matches_meta(&store.meta(i)))
         })
         .collect();
-    let (tx, rx) = mpsc::channel::<ContentMatch>();
+    let (tx, rx) = mpsc::sync_channel::<ContentMatch>(content::QUEUE_CAPACITY);
     let cancel = AtomicBool::new(false);
-    let result = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
-            let r = content::search(
+            let r = content::search_with_sink(
                 &indices,
                 |i| store.get(i),
                 pattern,
                 opts.max_content_filesize,
                 &opts.pdf_cache,
                 &cancel,
-                &tx,
-            );
+                usize::MAX,
+                |hit| content::send_cancellable(&tx, hit, &cancel),
+            )
+            .map_err(|e| format!("invalid pattern: {e}"));
             drop(tx);
             r
         });
@@ -156,9 +158,11 @@ fn content(
                 line: hit.line,
             });
         }
-        handle.join().expect("content search panicked").map(|_| any)
-    });
-    result.map_err(|e| format!("invalid pattern: {e}"))
+        handle
+            .join()
+            .map_err(|_| "content search failed".to_string())?
+            .map(|_| any)
+    })
 }
 
 fn filename(
@@ -191,6 +195,54 @@ fn filename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content_fixture() -> (tempfile::TempDir, PathStore, Options) {
+        let dir = tempfile::tempdir().unwrap();
+        let entries: Vec<_> = (0..60)
+            .map(|i| {
+                let path = dir.path().join(format!("{i}.txt"));
+                std::fs::write(&path, "needle\n".repeat(20)).unwrap();
+                (path.to_string_lossy().into_owned(), FileMeta::default())
+            })
+            .collect();
+        let opts = Options {
+            max_content_filesize: 1024,
+            quiet: Quiet::new(Vec::new()),
+            pdf_cache: dir.path().join("cache"),
+        };
+        (dir, PathStore::from_entries(&entries), opts)
+    }
+
+    #[test]
+    fn slow_headless_callback_streams_all_hits_without_interactive_cap() {
+        let (_dir, store, opts) = content_fixture();
+        let mut count = 0;
+        assert!(
+            search(&store, ">needle", &opts, &mut |_| {
+                count += 1;
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            })
+            .unwrap()
+        );
+        assert_eq!(count, 1200);
+    }
+
+    #[test]
+    fn panicking_callback_disconnects_blocked_producers() {
+        let (_dir, store, opts) = content_fixture();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = search(&store, ">needle", &opts, &mut |_| {
+                    panic!("callback stopped")
+                });
+            }))
+            .is_err();
+            tx.send(panicked).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+    }
 
     #[test]
     fn filename_search_reports_false_when_only_folded_rows_exist() {

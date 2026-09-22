@@ -4,8 +4,8 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentMatch {
@@ -15,6 +15,26 @@ pub struct ContentMatch {
 }
 
 const PER_FILE_CAP: usize = 20;
+pub const QUEUE_CAPACITY: usize = 64;
+/// Bound retained matching text even for a single enormous source line.
+pub const MAX_LINE_BYTES: usize = 4096;
+
+/// A full queue must not prevent cancellation or shutdown.
+pub(crate) fn send_cancellable<T>(tx: &SyncSender<T>, mut value: T, cancel: &AtomicBool) -> bool {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        match tx.try_send(value) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(v)) => {
+                value = v;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
 
 pub fn search<'a>(
     indices: &[usize],
@@ -25,6 +45,31 @@ pub fn search<'a>(
     cancel: &AtomicBool,
     tx: &Sender<ContentMatch>,
 ) -> Result<(), String> {
+    search_with_sink(
+        indices,
+        resolve,
+        pattern,
+        max_filesize,
+        pdf_cache,
+        cancel,
+        usize::MAX,
+        |hit| tx.send(hit).is_ok(),
+    )
+}
+
+/// Searches with a producer-side global cap and a cancellation-aware sink.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_with_sink<'a>(
+    indices: &[usize],
+    resolve: impl Fn(usize) -> &'a str + Sync,
+    pattern: &str,
+    max_filesize: u64,
+    pdf_cache: &Path,
+    cancel: &AtomicBool,
+    limit: usize,
+    emit: impl Fn(ContentMatch) -> bool + Sync,
+) -> Result<(), String> {
+    let produced = AtomicUsize::new(0);
     let smart_case_insensitive = !pattern.chars().any(|c| c.is_uppercase());
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(smart_case_insensitive)
@@ -33,7 +78,7 @@ pub fn search<'a>(
 
     let office_cache = office::cache_dir_for(pdf_cache);
     indices.par_iter().for_each(|&i| {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || produced.load(Ordering::Relaxed) >= limit {
             return;
         }
         let path = resolve(i);
@@ -52,13 +97,26 @@ pub fn search<'a>(
             if cancel.load(Ordering::Relaxed) || sent >= PER_FILE_CAP {
                 return Ok(false);
             }
+            if produced
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < limit).then(|| n + 1)
+                })
+                .is_err()
+            {
+                return Ok(false);
+            }
+            let line = line.trim_end();
+            let mut end = line.len().min(MAX_LINE_BYTES);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
             let hit = ContentMatch {
                 path: path.to_string(),
                 line_number,
-                line: line.trim_end().to_string(),
+                line: line[..end].to_string(),
             };
             sent += 1;
-            if tx.send(hit).is_err() {
+            if !emit(hit) {
                 cancel.store(true, Ordering::Relaxed);
                 return Ok(false);
             }
@@ -124,6 +182,63 @@ mod tests {
         )?;
         drop(tx);
         Ok(rx.into_iter().collect())
+    }
+
+    #[test]
+    fn producer_limit_and_matching_payload_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..80)
+            .map(|i| {
+                let path = dir.path().join(format!("{i}.txt"));
+                std::fs::write(&path, format!("needle {}\n", "é".repeat(5000)).repeat(20)).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        let hits = AtomicUsize::new(0);
+        search_with_sink(
+            &(0..paths.len()).collect::<Vec<_>>(),
+            |i| paths[i].as_str(),
+            "needle",
+            1_000_000,
+            dir.path(),
+            &AtomicBool::new(false),
+            1000,
+            |hit| {
+                assert!(hit.line.len() <= MAX_LINE_BYTES);
+                assert!(hit.line.starts_with("needle"));
+                hits.fetch_add(1, Ordering::Relaxed);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn a_full_queue_remains_cancellable_with_receiver_alive() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(1).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(send_cancellable(&tx, 2, &worker_cancel))
+                .unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            !done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![1]);
+        worker.join().unwrap();
     }
 
     #[test]

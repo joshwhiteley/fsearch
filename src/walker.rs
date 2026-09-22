@@ -1,7 +1,7 @@
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 /// Per-file metadata carried through the index.
@@ -15,6 +15,13 @@ pub struct FileMeta {
 pub struct WalkStats {
     pub files: u64,
     pub skipped: u64,
+    pub cancelled: bool,
+}
+
+impl WalkStats {
+    pub fn complete(&self) -> bool {
+        self.skipped == 0 && !self.cancelled
+    }
 }
 
 pub fn build_exclude_set(excludes: &[String]) -> anyhow::Result<GlobSet> {
@@ -34,10 +41,14 @@ pub fn mtime_cmp(a: &(String, FileMeta), b: &(String, FileMeta)) -> std::cmp::Or
 /// Emits .app bundles found at depth <= 2 under `dirs` as plain entries
 /// (no trailing slash, real mtime, size 0) so they rank and open like
 /// files — the default excludes never see them and plain queries match.
-fn emit_apps_from(dirs: &[PathBuf], tx: &Sender<(String, FileMeta)>) {
+fn emit_apps_from(dirs: &[PathBuf], tx: &Sender<(String, FileMeta)>, cancel: &AtomicBool) -> u64 {
+    let errors = AtomicU64::new(0);
     let emit = |path: &std::path::Path| {
-        let mtime = std::fs::metadata(path)
+        let mtime = std::fs::symlink_metadata(path)
             .and_then(|m| m.modified())
+            .inspect_err(|_| {
+                errors.fetch_add(1, Ordering::Relaxed);
+            })
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs() as i64);
@@ -47,21 +58,62 @@ fn emit_apps_from(dirs: &[PathBuf], tx: &Sender<(String, FileMeta)>) {
         ));
     };
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                // Standard application roots are optional (e.g. ~/Applications).
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries.filter_map(|e| {
+            e.inspect_err(|_| {
+                errors.fetch_add(1, Ordering::Relaxed);
+            })
+            .ok()
+        }) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let path = entry.path();
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if !entry
+                .file_type()
+                .inspect_err(|_| {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                })
+                .is_ok_and(|t| t.is_dir())
+            {
                 continue;
             }
             if path.extension().is_some_and(|e| e == "app") {
                 emit(&path);
-            } else if let Ok(sub) = std::fs::read_dir(&path) {
+            } else if let Ok(sub) = std::fs::read_dir(&path).inspect_err(|_| {
+                errors.fetch_add(1, Ordering::Relaxed);
+            }) {
                 // one level deeper catches /Applications/Utilities
-                for s in sub.flatten() {
+                for s in sub.filter_map(|e| {
+                    e.inspect_err(|_| {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .ok()
+                }) {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let sp = s.path();
-                    if s.file_type().is_ok_and(|t| t.is_dir())
+                    if s.file_type()
+                        .inspect_err(|_| {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        })
+                        .is_ok_and(|t| t.is_dir())
                         && sp.extension().is_some_and(|e| e == "app")
                     {
                         emit(&sp);
@@ -70,10 +122,28 @@ fn emit_apps_from(dirs: &[PathBuf], tx: &Sender<(String, FileMeta)>) {
             }
         }
     }
+    errors.load(Ordering::Relaxed)
+}
+
+pub(crate) fn collect_apps(
+    dirs: &[PathBuf],
+    cancel: &AtomicBool,
+) -> (Vec<(String, FileMeta)>, WalkStats) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let skipped = emit_apps_from(dirs, &tx, cancel);
+    drop(tx);
+    (
+        rx.into_iter().collect(),
+        WalkStats {
+            skipped,
+            cancelled: cancel.load(Ordering::Relaxed),
+            ..Default::default()
+        },
+    )
 }
 
 /// Where app bundles live; empty off macOS.
-fn default_app_dirs() -> Vec<PathBuf> {
+pub(crate) fn default_app_dirs() -> Vec<PathBuf> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
@@ -110,12 +180,57 @@ pub fn walk(
     apps: bool,
     tx: &Sender<(String, FileMeta)>,
 ) -> WalkStats {
-    if apps {
-        emit_apps_from(&default_app_dirs(), tx);
-    }
-    let mut roots = roots.iter().filter(|r| r.exists());
+    walk_cancellable(roots, excludes, apps, tx, &AtomicBool::new(false))
+}
+
+pub(crate) fn collect_cancellable(
+    roots: &[PathBuf],
+    excludes: &GlobSet,
+    apps: bool,
+    cancel: &AtomicBool,
+) -> (Vec<(String, FileMeta)>, WalkStats) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stats = walk_cancellable(roots, excludes, apps, &tx, cancel);
+    drop(tx);
+    let mut entries: Vec<_> = rx.into_iter().collect();
+    entries.sort_unstable_by(mtime_cmp);
+    (entries, stats)
+}
+
+pub(crate) fn walk_cancellable(
+    roots: &[PathBuf],
+    excludes: &GlobSet,
+    apps: bool,
+    tx: &Sender<(String, FileMeta)>,
+    cancel: &AtomicBool,
+) -> WalkStats {
+    let mut failed = if apps && !cancel.load(Ordering::Relaxed) {
+        emit_apps_from(&default_app_dirs(), tx, cancel)
+    } else {
+        0
+    };
+    let mut roots = roots
+        .iter()
+        .filter(|r| match std::fs::symlink_metadata(r) {
+            Ok(meta) if meta.file_type().is_symlink() => false,
+            Ok(meta) if meta.is_dir() => true,
+            Ok(_) => {
+                failed += 1;
+                false
+            }
+            Err(_) => {
+                failed += 1;
+                false
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_iter();
     let Some(first) = roots.next() else {
-        return WalkStats::default();
+        return WalkStats {
+            skipped: failed,
+            cancelled: cancel.load(Ordering::Relaxed),
+            ..Default::default()
+        };
     };
     let mut builder = WalkBuilder::new(first);
     for root in roots {
@@ -130,12 +245,15 @@ pub fn walk(
         .filter_entry(move |entry| !excludes.is_match(entry.path()));
 
     let files = AtomicU64::new(0);
-    let skipped = AtomicU64::new(0);
+    let skipped = AtomicU64::new(failed);
     builder.build_parallel().run(|| {
         let tx = tx.clone();
         let files = &files;
         let skipped = &skipped;
         Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
             match entry {
                 Ok(e) if e.file_type().is_some() && e.depth() > 0 => {
                     let is_file = e.file_type().is_some_and(|t| t.is_file());
@@ -146,7 +264,13 @@ pub fn walk(
                     if is_file {
                         files.fetch_add(1, Ordering::Relaxed);
                     }
-                    let meta = e.metadata().ok();
+                    let meta = match e.metadata() {
+                        Ok(meta) => Some(meta),
+                        Err(_) => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    };
                     let mtime = meta
                         .as_ref()
                         .and_then(|m| m.modified().ok())
@@ -177,6 +301,7 @@ pub fn walk(
     WalkStats {
         files: files.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed),
+        cancelled: cancel.load(Ordering::Relaxed),
     }
 }
 
@@ -220,7 +345,10 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("Utilities/Deep.app")).unwrap();
         std::fs::write(dir.path().join("note.txt"), "x").unwrap();
         let (tx, rx) = mpsc::channel();
-        emit_apps_from(&[dir.path().to_path_buf()], &tx);
+        assert_eq!(
+            emit_apps_from(&[dir.path().to_path_buf()], &tx, &AtomicBool::new(false)),
+            0
+        );
         drop(tx);
         let mut paths: Vec<String> = rx.into_iter().map(|(p, _)| p).collect();
         paths.sort();
@@ -228,6 +356,40 @@ mod tests {
         assert!(paths[0].ends_with("Foo.app"));
         assert!(paths[1].ends_with("Utilities/Deep.app"));
         assert!(paths.iter().all(|p| !p.ends_with('/')));
+    }
+
+    #[test]
+    fn missing_roots_and_cancelled_walks_are_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let excludes = build_exclude_set(&[]).unwrap();
+        let (entries, stats) = collect_sorted(&[dir.path().join("missing")], &excludes, false);
+        assert!(entries.is_empty());
+        assert_eq!(stats.skipped, 1);
+        assert!(!stats.complete());
+        let (_, stats) = collect_cancellable(
+            &[dir.path().to_path_buf()],
+            &excludes,
+            false,
+            &AtomicBool::new(true),
+        );
+        assert!(stats.cancelled);
+        assert!(!stats.complete());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_files_directories_and_roots_are_not_walked() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("hidden.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link-dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("hidden.txt"),
+            root.path().join("link-file"),
+        )
+        .unwrap();
+        assert!(walk_all(root.path(), &[]).is_empty());
+        assert!(walk_all(&root.path().join("link-dir"), &[]).is_empty());
     }
 
     #[test]

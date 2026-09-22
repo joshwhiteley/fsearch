@@ -522,3 +522,147 @@ fn semantic_restrictive_filter_child() {
     assert_eq!(engine.results()[0].path, "/wanted/answer.md");
     assert_eq!(engine.results()[0].line_number, Some(7));
 }
+
+#[test]
+fn incomplete_refresh_preserves_usable_cache_and_reports_error() {
+    let tree = tempfile::tempdir().unwrap();
+    let aux = tempfile::tempdir().unwrap();
+    let cache = aux.path().join("index.bin");
+    fsearch::index::save(&[("/cached-usable.txt".into(), Default::default())], &cache).unwrap();
+    let previous = std::fs::read(&cache).unwrap();
+    let mut config = config_for(tree.path());
+    config.roots.push(aux.path().join("missing-root"));
+    let mut engine = Engine::new(config, cache.clone(), aux.path().join("history"));
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing
+            && e.status().indexed == 1
+            && e.status()
+                .error
+                .as_ref()
+                .is_some_and(|s| s.contains("incomplete"))
+    });
+    engine.set_query("cached-usable", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        !e.results().is_empty()
+    });
+    assert_eq!(engine.results()[0].path, "/cached-usable.txt");
+    assert!(engine.status().error.is_some());
+    drop(engine);
+    assert_eq!(std::fs::read(cache).unwrap(), previous);
+}
+
+#[test]
+fn cold_incomplete_walk_keeps_discovered_results_without_saving() {
+    let tree = tempfile::tempdir().unwrap();
+    let aux = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("available.txt"), "needle\n").unwrap();
+    let cache = aux.path().join("index.bin");
+    let mut config = config_for(tree.path());
+    config.roots.push(aux.path().join("missing-root"));
+    let mut engine = Engine::new(config, cache.clone(), aux.path().join("history"));
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing
+            && e.status().indexed == 1
+            && e.status()
+                .error
+                .as_ref()
+                .is_some_and(|s| s.contains("incomplete"))
+    });
+    engine.set_query("available", false);
+    wait_until(&mut engine, Duration::from_secs(2), |e| {
+        !e.results().is_empty()
+    });
+    assert!(engine.results()[0].path.ends_with("available.txt"));
+    drop(engine);
+    assert!(!cache.exists());
+}
+
+#[test]
+fn content_query_before_startup_snapshot_eventually_searches_fresh_scope() {
+    let tree = make_tree();
+    let aux = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(
+        config_for(tree.path()),
+        aux.path().join("index"),
+        aux.path().join("history"),
+    );
+    engine.set_query(">needle", false);
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing && !e.status().searching && !e.results().is_empty()
+    });
+    assert!(
+        engine
+            .results()
+            .iter()
+            .any(|r| r.path.ends_with("meeting-notes.md"))
+    );
+}
+
+#[test]
+fn interactive_content_search_caps_hits_and_settles() {
+    let tree = tempfile::tempdir().unwrap();
+    let aux = tempfile::tempdir().unwrap();
+    for i in 0..70 {
+        std::fs::write(tree.path().join(format!("{i}.txt")), "needle\n".repeat(20)).unwrap();
+    }
+    let mut engine = Engine::new(
+        config_for(tree.path()),
+        aux.path().join("index"),
+        aux.path().join("history"),
+    );
+    engine.set_query(">needle", false);
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing
+            && !e.status().searching
+            && e.results().len() == fsearch::engine::CONTENT_LIMIT
+    });
+    engine.tick();
+    assert_eq!(engine.results().len(), 1000);
+    engine.set_query(">nothing-here", false);
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().searching
+    });
+    assert!(engine.results().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_subdirectory_does_not_hide_accessible_cold_results() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root can traverse mode-000 directories, so it cannot exercise this case.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    struct RestorePermissions(std::path::PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let tree = tempfile::tempdir().unwrap();
+    let aux = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("available.txt"), "x").unwrap();
+    let blocked = tree.path().join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("unreadable.txt"), "x").unwrap();
+    let _restore = RestorePermissions(blocked.clone());
+    std::fs::set_permissions(blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let cache = aux.path().join("index");
+    let mut engine = Engine::new(
+        config_for(tree.path()),
+        cache.clone(),
+        aux.path().join("history"),
+    );
+    engine.set_query("available", false);
+    wait_until(&mut engine, Duration::from_secs(5), |e| {
+        !e.status().indexing
+            && !e.results().is_empty()
+            && e.status()
+                .error
+                .as_ref()
+                .is_some_and(|s| s.contains("incomplete"))
+    });
+    assert!(engine.results()[0].path.ends_with("available.txt"));
+    drop(engine);
+    assert!(!cache.exists());
+}
