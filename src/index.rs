@@ -12,7 +12,11 @@ const VERSION: u32 = 3;
 /// and metadata. Loading is a single file read and two table scans — no
 /// per-path allocations, which is what makes million-path startup instant.
 pub struct PathStore {
+    /// The load path keeps the serialized tables and path bytes in this one
+    /// allocation. `arena_start` points at the path arena within it; stores
+    /// built from entries use offset zero.
     arena: Box<[u8]>,
+    arena_start: usize,
     spans: Vec<(u32, u32)>,
     metas: Vec<FileMeta>,
 }
@@ -21,6 +25,7 @@ impl PathStore {
     pub fn empty() -> PathStore {
         PathStore {
             arena: Box::from([]),
+            arena_start: 0,
             spans: Vec::new(),
             metas: Vec::new(),
         }
@@ -40,6 +45,7 @@ impl PathStore {
         }
         PathStore {
             arena: arena.into_boxed_slice(),
+            arena_start: 0,
             spans,
             metas,
         }
@@ -56,7 +62,9 @@ impl PathStore {
     pub fn get(&self, i: usize) -> &str {
         let (off, len) = self.spans[i];
         // Construction/loading validates UTF-8 and every span boundary.
-        unsafe { std::str::from_utf8_unchecked(&self.arena[off as usize..(off + len) as usize]) }
+        let start = self.arena_start + off as usize;
+        let end = start + len as usize;
+        unsafe { std::str::from_utf8_unchecked(&self.arena[start..end]) }
     }
 
     pub fn meta(&self, i: usize) -> FileMeta {
@@ -182,7 +190,8 @@ pub fn load(path: &Path) -> Option<PathStore> {
         });
     }
     Some(PathStore {
-        arena: arena.to_vec().into_boxed_slice(),
+        arena: data.into_boxed_slice(),
+        arena_start: arena_at,
         spans,
         metas,
     })
@@ -207,6 +216,8 @@ mod tests {
         ];
         save(&entries, &file).unwrap();
         let store = load(&file).unwrap();
+        assert_eq!(store.arena.len(), std::fs::read(&file).unwrap().len());
+        assert_eq!(store.arena_start, 20 + entries.len() * (4 + 16));
         assert_eq!(store.len(), 3);
         assert_eq!(store.get(0), "/a/b.txt");
         assert_eq!(store.get(1), "/c/déjà vu.md");
