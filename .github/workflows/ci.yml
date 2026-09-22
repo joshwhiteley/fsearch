@@ -82,6 +82,39 @@ jobs:
       - run: cargo test --locked --all-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  test-native-semantic:
+    name: test (native ONNX runtime + model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FSEARCH_SEM_FAKE: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # fastembed/ort request native API 24. Provision the CPU library explicitly
+      # rather than depending on a runner-installed or fake runtime.
+      - name: Install ONNX Runtime
+        run: |
+          echo "XDG_CACHE_HOME=$RUNNER_TEMP/fsearch-native-cache" >> "$GITHUB_ENV"
+          python -m pip install onnxruntime==1.24.4
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import onnxruntime
+          libraries = list((Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so.*"))
+          assert len(libraries) == 1, libraries
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"ORT_DYLIB_PATH={libraries[0]}\n")
+          PY
+      - name: Initialize native runtime without mutating the environment
+        run: cargo test --locked --features semantic --lib sem::real::native_runtime_initializes_without_environment_mutation -- --ignored --exact
+      - name: Embed text with the real model
+        run: cargo test --locked --features semantic --test native_semantic -- --ignored
+
   audit:
     name: audit
     runs-on: ubuntu-latest
